@@ -69,8 +69,23 @@ result=SUCCESS
 - 项目名: anet（compose name=${COMPOSE_PROJECT_NAME:-anet}）
 - 说明: 切换窗口 <2min；pi-worker 本就 offline，其余节点 SSE 会自动重连
 
+## 旧部署彻底清理（2026-10-08，用户确认测试阶段旧数据不重要、无需观察期）
+- pm2: God Daemon kill → `npm uninstall -g pm2`（77 包，pm2/pm2-dev/pm2-docker/pm2-runtime
+  全移除）→ rm -rf ~/.pm2（dump/logs/pid/sockets）
+- rm -rf ~/.commhub（旧 commhub.db + bak-20261008-213747 + dashboard-runtime 368M +
+  hub.ecosystem.config.cjs）= 回滚路径按用户决定放弃
+- rm -rf /tmp/bunx-1000-@sleep2agi（旧启动器的 commhub-server npm 缓存）
+- rm -rf ~/.anet/server（server/config.json、admin-utok.json、dashboard-3000.json，
+  删除前 lsof 确认无进程占用）
+- 保留: ~/.anet/config.json（现役 CLI 身份 utok/hub）、anet CLI、bun、
+  deploy/compose/data/（现役+pre-compose 热备份快照）、repo 内 deploy/dashboard/
+  （受维护文档资产，非本机安装物）
+- 清理后复验: 容器双 healthy、health 117 sessions=1、/login 200、anet whoami admin、
+  atok REST 200、PM2 进程无、pm2 命令无
+- crontab/systemd: 无任何 anet/commhub/pm2 条目（盘点确认，无需动）
+
 ## 未做/边界
-- 未 git commit（等用户明确要求）；改动含 deploy/compose/*、tests/test-compose-deploy/*、
-  .gitignore、clean-server.md §docker、docs/tests/两份报告
+- 提交留本地待用户推（commit 1=套件+切换 3bf3150c，commit 2=本清理报告）：
+  pixb 凭据对 sleep2agi/agent-network 无推送权限，用户选择自行推送
 - node:20.20.0 / dashboard 是 npm 钉版本安装，不在本仓源码
 - 生产机（vansin, systemd + hub-daemon.sh）未动，按「窄变更」原则另行迁移
