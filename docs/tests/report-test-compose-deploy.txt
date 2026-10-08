@@ -1,0 +1,133 @@
+# test-compose-deploy
+date=2026-10-08T22:55:46+08:00
+source_commit=18a4d8a8
+docker=29.8.0
+L1_PASS compose config
+time="2026-10-08T22:55:46+08:00" level=warning msg="buildx Docker CLI plugin not found: falling back to the classic builder. BuildKit-only build features (multi-arch, secrets, ssh, additional contexts, ...) will not be available"
+ Image anet-hub:compose Building 
+ Image anet-hub:compose Building 
+Sending build context to Docker daemon  529.2kBSending build context to Docker daemon   42.7MBSending build context to Docker daemon  49.58MBSending build context to Docker daemon  52.74MBSending build context to Docker daemon  60.18MBSending build context to Docker daemon  62.29MBSending build context to Docker daemon  64.91MBSending build context to Docker daemon  65.76MB
+Step 1/14 : FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
+ ---> 5ff609364c04
+Step 2/14 : ENV npm_config_audit=false npm_config_fund=false
+ ---> Using cache
+ ---> 519ae28ee9f6
+Step 3/14 : WORKDIR /app
+ ---> Using cache
+ ---> 8a08285b2d6b
+Step 4/14 : COPY server/package.json /app/server/package.json
+ ---> Using cache
+ ---> 19c3bab359e8
+Step 5/14 : RUN cd /app/server && bun install
+ ---> Using cache
+ ---> 5bbf100dd142
+Step 6/14 : COPY server/ /app/server/
+ ---> Using cache
+ ---> 3ea418de9d09
+Step 7/14 : COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
+ ---> Using cache
+ ---> 4339b55f3d01
+Step 8/14 : RUN chmod 755 /usr/local/bin/anet-hub-entrypoint
+ ---> Using cache
+ ---> bb6fe539a338
+Step 9/14 : RUN chown -R bun:bun /app
+ ---> Using cache
+ ---> da879452ecb1
+Step 10/14 : USER bun
+ ---> Using cache
+ ---> 13b6ee77c57b
+Step 11/14 : EXPOSE 9200
+ ---> Using cache
+ ---> 1ff756c4cd54
+Step 12/14 : ENTRYPOINT ["/usr/local/bin/anet-hub-entrypoint"]
+ ---> Using cache
+ ---> 82bfcd698b34
+Step 13/14 : CMD ["bun", "run", "/app/server/bin/commhub.ts"]
+ ---> Using cache
+ ---> 78e79f1dbc26
+Step 14/14 : LABEL com.docker.compose.image.builder=classic
+ ---> Using cache
+ ---> 22cd9786390b
+Successfully built 22cd9786390b
+Successfully tagged anet-hub:compose
+ Image anet-hub:compose Built 
+ Image anet-hub:compose Built 
+ Image anet-dashboard:compose Building 
+ Image anet-dashboard:compose Building 
+Sending build context to Docker daemon  529.2kBSending build context to Docker daemon  45.88MBSending build context to Docker daemon  49.58MBSending build context to Docker daemon  52.74MBSending build context to Docker daemon  60.18MBSending build context to Docker daemon  62.81MBSending build context to Docker daemon  64.91MBSending build context to Docker daemon  65.76MB
+Step 1/11 : FROM node:20.20.0@sha256:65b74d0fb42134c49530a8c34e9f3e4a2fb8e1f99ac4a0eb4e6f314b426183a2
+ ---> 65b74d0fb421
+Step 2/11 : ARG DASH_VERSION=0.6.3-preview.56
+ ---> Using cache
+ ---> b2c9b3be0231
+Step 3/11 : ENV npm_config_audit=false npm_config_fund=false
+ ---> Using cache
+ ---> ca4bcf806a81
+Step 4/11 : WORKDIR /app
+ ---> Using cache
+ ---> c13de4fabee1
+Step 5/11 : RUN npm init -y >/dev/null 2>&1     && npm install --omit=dev --no-audit --no-fund        "@sleep2agi/agent-network-dashboard@${DASH_VERSION}"
+ ---> Using cache
+ ---> 6da954c09658
+Step 6/11 : RUN mkdir -p /home/node/.anet     && printf '{"hub":"http://127.0.0.1:9200"}\n' > /home/node/.anet/config.json     && chown -R node:node /home/node /app
+ ---> Using cache
+ ---> b784acdfe26c
+Step 7/11 : USER node
+ ---> Using cache
+ ---> 50e51b9d1c5c
+Step 8/11 : EXPOSE 3000
+ ---> Using cache
+ ---> 017aaa4fe13d
+Step 9/11 : ENV PORT=3000 HOST=0.0.0.0
+ ---> Using cache
+ ---> 523de7b5de6c
+Step 10/11 : CMD ["./node_modules/.bin/agent-network-dashboard"]
+ ---> Using cache
+ ---> 249a6f2f3a2f
+Step 11/11 : LABEL com.docker.compose.image.builder=classic
+ ---> Using cache
+ ---> 507451c9ab3c
+Successfully built 507451c9ab3c
+Successfully tagged anet-dashboard:compose
+ Image anet-dashboard:compose Built 
+ Image anet-dashboard:compose Built 
+L2_PASS build
+ Network anet-test-compose_default Creating 
+ Network anet-test-compose_default Creating 
+ Network anet-test-compose_default Created 
+ Network anet-test-compose_default Created 
+ Container anet-test-compose-hub-1 Creating 
+ Container anet-test-compose-hub-1 Created 
+ Container anet-test-compose-dashboard-1 Creating 
+ Container anet-test-compose-dashboard-1 Created 
+ Container anet-test-compose-hub-1 Starting 
+ Container anet-test-compose-hub-1 Started 
+ Container anet-test-compose-hub-1 Waiting 
+ Container anet-test-compose-hub-1 Healthy 
+ Container anet-test-compose-dashboard-1 Starting 
+ Container anet-test-compose-dashboard-1 Started 
+L3_PASS hub healthy version=0.9.0-preview.117
+L4_PASS dashboard /login 200
+L5_PASS seed user=u_506cc229bae1 utok+atok+ntok work
+L6_PASS mcp atok=58 ntok=60 (requirements_* + worker tools in list)
+ Container anet-test-compose-dashboard-1 Stopping 
+ Container anet-test-compose-dashboard-1 Stopped 
+ Container anet-test-compose-hub-1 Stopping 
+ Container anet-test-compose-hub-1 Stopped 
+ Container anet-test-compose-hub-1 Recreate 
+ Container anet-test-compose-hub-1 Recreated 
+ Container anet-test-compose-hub-1 Starting 
+ Container anet-test-compose-hub-1 Started 
+ Container anet-test-compose-hub-1 Waiting 
+ Container anet-test-compose-hub-1 Healthy 
+ Container anet-test-compose-dashboard-1 Starting 
+ Container anet-test-compose-dashboard-1 Started 
+L7_PASS migration restore (tar data/ → 新目录 → 同一用户登录)
+ Container anet-test-compose-hub-1 Stopping 
+ Container anet-test-compose-hub-1 Stopped 
+ Container anet-test-compose-hub-1 Recreate 
+ Container anet-test-compose-hub-1 Recreated 
+ Container anet-test-compose-hub-1 Starting 
+ Container anet-test-compose-hub-1 Started 
+L8_PASS vault fail-closed (拒绝启动, health=starting)
+ALL_PASS test-compose-deploy

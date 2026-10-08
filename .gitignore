@@ -19,6 +19,8 @@ docs-site/node_modules/
 .vercel/
 
 # runtime state
+# deploy/compose 的全部运行状态（hub.env 密钥、SQLite、uploads）——备份件按密件对待
+deploy/compose/data/
 .anet/
 .tmp/
 agent-network/tests/docker-e2e/.tmp/

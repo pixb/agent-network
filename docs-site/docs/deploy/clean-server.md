@@ -304,12 +304,13 @@ sudo systemctl status anet-hub anet-node@my-bot
 
 ## 在容器里跑 {#docker}
 
-仓库目前没有受维护的生产 compose 套件，仓库里的 Dockerfile 和 compose 文件用于测试或特定集成。在容器里跑时，把容器当成「带 Node.js 和 Bun 的 Ubuntu」，上面每一步的命令都一样。可以参考 [`tests/Dockerfile`](https://github.com/sleep2agi/agent-network/blob/main/tests/Dockerfile)（Node.js + Bun + anet 的最小集）起步，生产上自行加多阶段构建、镜像 hash 固定和非 root 用户。
+- **推荐：仓库自带受维护的生产 compose 套件 [`deploy/compose/`](https://github.com/sleep2agi/agent-network/tree/main/deploy/compose)**（2026-10-08 起）。Hub 从本仓源码构建进镜像（`oven/bun:1.4.0` 钉 digest）、Dashboard 镜像内 npm 钉版本、双服务非 root、healthcheck、`ANET_HUB_SECRET_VAULT_KEY` 缺失时 fail-closed 拒启。运行/数据汇集/备份/迁移/回滚步骤见该目录 README（含 pm2→compose 迁移清单）；E2E 覆盖见 [`tests/test-compose-deploy/`](https://github.com/sleep2agi/agent-network/tree/main/tests/test-compose-deploy)。
+- **老做法：把容器当成「带 Node.js 和 Bun 的 Ubuntu」**，下面每一步的命令都一样。可参考 [`tests/Dockerfile`](https://github.com/sleep2agi/agent-network/blob/main/tests/Dockerfile)（Node.js + Bun + anet 的最小集）起步，自行加多阶段构建、镜像 hash 固定和非 root 用户。注意：
 
 - **启动顺序不变**：Hub → Dashboard → `anet login` → `anet node create` → `anet project up`，容器化只是把它们分到不同 service。
-- **首次启动慢**：第一次 `anet hub start` 会从 npm 拉固定版本的 `commhub-server`，缓存在 `$HOME/.bun/install/cache`，预热这个目录可以显著提速。
+- **首次启动慢**：第一次 `anet hub start` 会从 npm 拉固定版本的 `commhub-server`，缓存在 `$HOME/.bun/install/cache`，预热这个目录可以显著提速（`deploy/compose` 套件走源码构建，无此步骤）。
 - **容器间互通**：Dashboard 通过 REST + SSE 调 Hub 的 `:9200`，两者要在同一个 docker network，或把 Hub 端口发布到宿主机。容器里的 `localhost` 指容器自己。
-- **持久化**：节点状态在工作目录下的 `.anet/nodes/<alias>/`，Hub 数据在 `~/.commhub/`，都要挂成 volume。
+- **持久化**：`deploy/compose` 套件挂项目内 `data/`（`commhub.db` + `hub.env` + `uploads/`）；老做法节点状态在工作目录下的 `.anet/nodes/<alias>/`，Hub 数据在 `~/.commhub/`，都要挂 volume。
 - **不要让节点进程当 PID 1**：用 `tini` 这类 init 包一层，否则 SIGTERM 会跳过节点的离线通知。
 
 ## 故障排查表

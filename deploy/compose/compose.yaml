@@ -1,0 +1,80 @@
+# 生产 compose 套件 —— Git 权威，runbook 见同目录 README.md
+#
+# 设计要点：
+#   - 源码构建 hub（server/ 在本仓库），dashboard 不在本仓库 → npm 钉版本构建。
+#   - 全部状态收敛在 ${COMPOSE_DATA_DIR:-./data} 一个目录：备份=拷这个目录，
+#     迁移=整个项目目录拷走 + docker compose up -d。
+#   - restart: unless-stopped 取代 pm2 自愈；hub healthcheck 是就绪判据。
+#   - env_file required:false —— 缺 data/hub.env 时容器起来后由 entrypoint
+#     fail-closed 拒启（给出比 compose 报错更清楚的恢复指引）。
+#
+# 端口/数据目录可用环境变量覆盖（compose 自动读同目录 .env；shell 环境优先）：
+#   HUB_PORT / DASH_PORT / COMPOSE_DATA_DIR
+# 测试套件（tests/test-compose-deploy/）正是靠这个在不动生产端口的前提下并行跑。
+
+name: ${COMPOSE_PROJECT_NAME:-anet}
+
+services:
+  hub:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.hub
+    image: anet-hub:compose
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${HUB_PORT:-9200}:9200"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "9200"
+      COMMHUB_DB: /data/commhub.db
+      COMMHUB_UPLOADS_DIR: /data/uploads
+    env_file:
+      - path: ${COMPOSE_DATA_DIR:-./data}/hub.env
+        required: false
+    volumes:
+      - ${COMPOSE_DATA_DIR:-./data}:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://127.0.0.1:9200/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.dashboard
+    image: anet-dashboard:compose
+    init: true
+    restart: unless-stopped
+    depends_on:
+      hub:
+        condition: service_healthy
+    ports:
+      - "${DASH_PORT:-3000}:3000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      # 容器内网地址：dashboard 走 service 名解析，不走 localhost（localhost 是容器自己）
+      COMMHUB_URL: http://hub:9200
+      # 本套件不带 TLS（终结在上游反代或裸 HTTP），cookie 需要放行 HTTP
+      COOKIE_INSECURE: "1"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s

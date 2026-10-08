@@ -1,0 +1,32 @@
+# CommHub Hub 生产镜像 —— 从本仓库 server/ 源码构建。
+# runbook：deploy/compose/README.md
+#
+# bun 钉在 1.4.0（含 digest）：1.3.14 在 preview.45 上有 uWS HttpContext::onClose
+# 连续 panic 前科，生产 2026-09-02 起换 1.4.0 后再无重启（deploy/hub/README.md #1769）。
+# 基础镜像带完整 tag+digest，过 base-image-pin 门（#1740）。
+FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
+
+# 这两个 npm 开关只影响 bun install 的供应链检查端点，不改变任何判据
+# （与 tests/Dockerfile 同理由：npm audit 端点间歇挂起会把 4s 安装变 4 分钟）。
+ENV npm_config_audit=false npm_config_fund=false
+
+WORKDIR /app
+
+# 先只拷 package.json 让依赖层可缓存（server/ 无 lockfile，与 tests/Dockerfile 一致）
+COPY server/package.json /app/server/package.json
+RUN cd /app/server && bun install
+
+COPY server/ /app/server/
+COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
+RUN chmod 755 /usr/local/bin/anet-hub-entrypoint
+
+# 非 root：直接用 bun 镜像自带的 bun 用户（uid 1000 = 常见宿主机首用户，
+# bind mount 的 data/ 直接可写）。
+RUN chown -R bun:bun /app
+
+USER bun
+EXPOSE 9200
+
+ENTRYPOINT ["/usr/local/bin/anet-hub-entrypoint"]
+# bin/commhub.ts 自己设 COMMHUB_SERVER=1 并显式 startHub()，不依赖 import 副作用
+CMD ["bun", "run", "/app/server/bin/commhub.ts"]

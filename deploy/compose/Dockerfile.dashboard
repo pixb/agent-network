@@ -1,0 +1,32 @@
+# Dashboard 生产镜像。runbook：deploy/compose/README.md
+#
+# ⚠️ dashboard 不在本仓库（全仓无其源码，发布走独立流程）——「仓库源码构建」
+# 对它不成立，只能 npm 钉版本。版本与 deploy/dashboard/dash-start.sh 的
+# VERSION= 保持同一坐标；换版改这里的 ARG DASH_VERSION。
+FROM node:20.20.0@sha256:65b74d0fb42134c49530a8c34e9f3e4a2fb8e1f99ac4a0eb4e6f314b426183a2
+
+ARG DASH_VERSION=0.6.3-preview.56
+ENV npm_config_audit=false npm_config_fund=false
+
+WORKDIR /app
+
+# 固化安装，不用 npx：npx 把包解到 ~/.npm/_npx/<hash>/，一条 npm cache clean
+# 就能删掉线上服务的运行目录（deploy/dashboard/dash-start.sh 踩过）。
+RUN npm init -y >/dev/null 2>&1 \
+    && npm install --omit=dev --no-audit --no-fund \
+       "@sleep2agi/agent-network-dashboard@${DASH_VERSION}"
+
+# 非 root：直接用 node 镜像自带的 node 用户（uid 1000 = 常见宿主机首用户）。
+# 🔴 /home/node/.anet/config.json 必须存在 —— 缺了它 dashboard 在认证请求上
+# 直接 ENOENT 500（2026-10-08 实测）。内容是中性默认值：实际地址以
+# compose.yaml 的 COMMHUB_URL 环境变量为准（env 压过 config.json，已实测）。
+RUN mkdir -p /home/node/.anet \
+    && printf '{"hub":"http://127.0.0.1:9200"}\n' > /home/node/.anet/config.json \
+    && chown -R node:node /home/node /app
+
+USER node
+EXPOSE 3000
+
+# HOST/PORT 的生产默认在 compose.yaml 里给；镜像自身也给安全默认
+ENV PORT=3000 HOST=0.0.0.0
+CMD ["./node_modules/.bin/agent-network-dashboard"]

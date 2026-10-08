@@ -1,0 +1,76 @@
+# 本机 pm2 → compose 迁移报告
+date=2026-10-08T23:00+08:00
+host=本机 (pix, docker 直接可用, docker 29.8.0, 无 buildx 插件/classic builder)
+source_commit=18a4d8a8 (origin/main 已同步, server/package.json=0.9.0-preview.117)
+result=SUCCESS
+
+## 决策（用户 2026-10-08 批准）
+1. 测试通过即切本机（pm2 hub:9200 + dashboard:3000 → compose）
+2. 镜像仓库源码构建；唯一例外 Dashboard 不在本仓 → 镜像内 npm 钉版本 0.6.3-preview.56
+3. 数据 = 项目内 bind mount 目录 deploy/compose/data/（备份=拷项目目录；新机=拷项目+up -d）
+   附带条件已写进 README：热备份 VACUUM INTO、data/ 含密钥按密件对待、新机首 build 需联网
+
+## 切换前状态
+- hub: pm2 app commhub-hub → script=~/.npm-global/bin/anet（'hub start --version 0.9.0-preview.117'）
+  真进程是 detached 的 bun grandchild，pm2 stop 打不到，必须 `anet hub stop`（实测教训）
+- dashboard: pm2 app anet-dashboard → deploy/dashboard/dash-start.sh, PORT=3000, HOST=127.0.0.1
+- hub.env: 不存在（本机从未配过 vault 密钥；pm2 env 无 ANET_HUB_SECRET_VAULT_KEY）
+- ~/.anet/server/uploads: 不存在（从未收过上传）
+- pm2 env 为整 shell 污染（TETRIS_PLANNER_TOKEN / ANET_HUB_TOKEN / OPENCODE_PID 等躺在 hub 进程环境）
+- DB 密文盘点（只读）: network_secrets=0, providers=0, provider_models=0 → 无任何 vault 密文，
+  可安全生成新 vault key（不存在需要解密的旧密文）
+
+## 备份与回滚坐标
+- 热备份: deploy/compose/data/backups/pre-compose-20261008.db
+  （pm2 hub 运行中 VACUUM INTO；PRAGMA integrity_check=ok; sessions=1, tasks=23）
+- 旧运行时原样保留: ~/.commhub/（commhub.db + commhub.db.bak-20261008-213747 +
+  hub.ecosystem.config.cjs + dashboard-runtime-v0.6.3-preview.56 + ~/.commhub 旁的
+  deploy/dashboard/dash-start.sh / ecosystem.config.cjs）
+- 回滚路径: docker compose down → pm2 start ~/.commhub/hub.ecosystem.config.cjs
+  + pm2 start deploy/dashboard/ecosystem.config.cjs（旧 DB/运行时未删，按原样恢复）
+
+## 执行步骤
+1. VACUUM INTO 热备份 + integrity 验证
+2. pm2 stop commhub-hub anet-dashboard → 9200 仍在听 → `anet hub stop`（杀掉 detached bun）→ 端口释放
+3. 汇集数据到 deploy/compose/data/：
+   - commhub.db ← 热备份快照
+   - hub.env ← 新生成 ANET_HUB_SECRET_VAULT_KEY=$(openssl rand -hex 32)，chmod 600
+   - uploads: 无，跳过
+4. docker compose -f deploy/compose/compose.yaml up -d --build → hub healthy + dashboard healthy
+5. 验证（见下）+ pm2 delete 两 app + pm2 save（pm2 列表已空）
+6. Dockerfile 修正（见踩坑）后重建 recreate + 全量复验 + 测试套件重跑全绿
+
+## 踩坑与修正
+- [坑1] pm2 stop 杀不到真 hub：anet hub start 是 detached 拉起，必须 `anet hub stop`
+- [坑2] dashboard 容器 500：ENOENT /home/node/.anet/config.json（pm2 时代宿主机有这文件）
+  → 镜像内置中性占位 {"hub":"http://127.0.0.1:9200"}；实测 COMMHUB_URL env 压过 config.json
+- [坑3] oven/bun 与 node:20 均自带 uid1000 用户（bun / node），弃手写 passwd 重复条目，
+  改用镜像内置用户（hub=uid1000 bun, dashboard=uid1000 node）
+
+## 切换后验证（全部 PASS，两次；第二次为 Dockerfile 修正后重建产物）
+[1] /health: ok=true version=0.9.0-preview.117 sessions_count=1（与备份一致）
+[2] REST atok (TETRIS_PLANNER_TOKEN): tasks=23（与备份一致）
+[3] MCP /mcp initialize: HTTP 200 (Bearer atok)
+[4] anet whoami (utok): User: admin (u_b1bd4ea4519c)（同一用户）
+[5] dashboard /login: 200, health=healthy
+[6] dashboard→hub 认证代理: 错密码 POST /api/auth/login → 401（非 5xx，链路通）
+[7] env 卫生: hub 容器 env 中 TETRIS_PLANNER_TOKEN/ANET_HUB_TOKEN/COMMHUB_TOKEN 计数=0
+[8] 运行身份: hub uid=1000(bun), dashboard uid=1000(node)，均非 root
+[9] docker restart anet-hub-1 → 自愈 healthy, 数据完好
+门禁: check-test-suite-registration=no new unregistered; check-base-image-pin=no new floating;
+      check-home-path-baseline=no file above baseline; bash -n ok
+测试套件: tests/test-compose-deploy ALL_PASS（L1 config/L2 build/L3 hub 117/L4 dash 200/
+          L5 三 token/L6 MCP atok=58 ntok=60/L7 迁移演练/L8 vault fail-closed）×2 轮
+报告: docs/tests/report-test-compose-deploy.txt（终轮 2026-10-08T22:55:46）
+
+## 当前拓扑
+- anet-hub-1: anet-hub:compose, 0.0.0.0:9200→9200, restart unless-stopped, data=./data:/data
+- anet-dashboard-1: anet-dashboard:compose, 0.0.0.0:3000→3000, 依赖 hub healthy
+- 项目名: anet（compose name=${COMPOSE_PROJECT_NAME:-anet}）
+- 说明: 切换窗口 <2min；pi-worker 本就 offline，其余节点 SSE 会自动重连
+
+## 未做/边界
+- 未 git commit（等用户明确要求）；改动含 deploy/compose/*、tests/test-compose-deploy/*、
+  .gitignore、clean-server.md §docker、docs/tests/两份报告
+- node:20.20.0 / dashboard 是 npm 钉版本安装，不在本仓源码
+- 生产机（vansin, systemd + hub-daemon.sh）未动，按「窄变更」原则另行迁移
