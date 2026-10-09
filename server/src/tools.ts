@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { requestAdopt, getAdopt, ackAdopt, unadopt, resolveManagedDaemon, activeBinding, createdDaemon } from "./node-daemon-bindings.js";
 import { runtimeReadinessSchema } from "./runtime-readiness.js";
+import { forkRecoveryRequestSchema, forkRecoveryResultSchema, publicForkResult } from "./codex-fork-contract.js";
 import { lockNodeAlias } from "./node-token-ownership.js";
 import { clearNodeFromAgentTeams, agentTeamWhoami } from "./agent-teams.js";
 import { parseDbTimestampMs } from "./db-timestamp.js";
@@ -21,7 +22,7 @@ import { getUserNetworkRole, createNetworkTokenForNode } from "./auth.js";
 import { addAgentNetworkScope, addAgentTimelineScope, addNetworkScope, canRestWriteNetwork, canRestWriteNetworkAsHuman, getUserNetworkIds, resolveRestNetworkScope, singleNetworkId, type RestNetworkScope } from "./network-scope.js";
 import { canMessageAgent, restrictedNetworkIds, RESTRICTED_MEMBER_TOOLS, type AgentRef } from "./agent-access.js";
 import { listedToolFilter, scopeToolsList, type ToolCaller } from "./tool-audience.js";
-import { agentCancelSchedule, agentCreateSchedule, agentGetSchedule, agentListSchedules, agentRunScheduleNow, agentScheduleRuns, agentUpdateSchedule } from "./schedule-agent.js";
+import { agentBatchScheduleInterval, agentCancelSchedule, agentCreateSchedule, agentGetSchedule, agentListSchedules, agentRunScheduleNow, agentScheduleRuns, agentUpdateSchedule } from "./schedule-agent.js";
 import { broadcastVerdict, dispatchVerdict, humanOnlyVerdict, NODE_TOOL_CLASS, nodeDecide, nodeIdentity, nodePermissionDeniedBody, writeVerdict, type NodeIdentity, type Verdict } from "./node-permissions.js";
 import { restrictedMemberAttachmentsDenied } from "./restricted-files.js";
 import { errorBody } from "./requirements-errors.js";
@@ -840,6 +841,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         //    应当 hub 先合)。同一份 schema 里 side_thread_capability / external_schedules
         //    是 `.strict()` 的,后果不同 —— 见 `host:` 上方那段方框注释。
         daemon_capabilities: z.object({
+          codex_fork_recovery: z.object({ protocol: z.literal(1), cli_supported: z.boolean() }).optional().catch(undefined),
           adopt_capable: z.boolean().optional(),
           runtimes_supported: z.array(z.string().max(64)).max(16).optional(),
           allowed_secret_keys: z.array(z.string().max(64)).max(64).optional(),
@@ -4277,6 +4279,10 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         model: z.string().min(1).max(100).optional().nullable(),
         flags: z.record(z.string(), z.unknown()).optional(),
         env_refs: z.array(z.string().max(64)).optional(),
+        // Wrong placement must fail, not silently create a legacy V1 node.
+        // These options belong under the strict flags envelope.
+        opencodeGeneration: z.never().optional(),
+        opencodeUnsafeTools: z.never().optional(),
         channels: z.array(z.unknown()).optional(),
         // app「新建节点」确认页的工作目录(绝对路径或 ~/…,daemon 侧展开并校验)。
         // 缺席 = 老行为:落 daemon 的 cwd。
@@ -4751,8 +4757,9 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       error: z.string().max(1000).optional(),
       child_pid: z.number().int().optional(),
       runtime: z.string().max(64).optional(),   // populated by daemon when status=runtime_capability_check_failed
+      launch_verified: z.boolean().optional(), // finite launcher exit + live generation proof, not mere registration/spawn
     },
-    async ({ request_id, status, error: ackError, child_pid: _pid, runtime: ackRuntime }) => {
+    async ({ request_id, status, error: ackError, child_pid: _pid, runtime: ackRuntime, launch_verified }) => {
       const callerDaemon = resolveCallerDaemonTokenBound();
       if (!callerDaemon.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: callerDaemon.error }) }] };
@@ -4770,6 +4777,15 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       }
       const ackedAt = Date.now();
       if (status === "started") {
+        if (launch_verified === true && (!Number.isInteger(_pid) || _pid! <= 0)) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "verified_child_pid_required" }) }] };
+        }
+        if (launch_verified === true) {
+          // A child can register before this acknowledgement arrives. Preserve
+          // both event orders, but a late success must never revive a failure.
+          db.run(`UPDATE node_create_requests SET launch_verified_at = COALESCE(launch_verified_at, ?1)
+                  WHERE request_id = ?2 AND status IN ('pending', 'delivered', 'succeeded')`, [ackedAt, request_id]);
+        }
         // Don't flip to 'succeeded' here — that happens via content-
         // match when the child actually registers. We just stamp ack.
         db.run(
@@ -4779,12 +4795,14 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, status: "awaiting_register" }) }] };
       }
       // failed / rejected / runtime_capability_check_failed — revoke
-      // child-ntok + mark request terminal.
+      // child-ntok + mark request terminal. Registration can precede the
+      // daemon's final capability verdict; don't leave succeeded visible
+      // while this same failure acknowledgement revokes its child token.
       if (row.child_token_id) {
         db.run(`UPDATE api_tokens SET revoked_at = datetime('now') WHERE token_id = ?1 AND revoked_at IS NULL`, [row.child_token_id]);
       }
       db.run(
-        `UPDATE node_create_requests SET status = ?1, error = ?2, acked_at = ?3 WHERE request_id = ?4 AND status IN ('pending', 'delivered')`,
+        `UPDATE node_create_requests SET status = ?1, error = ?2, acked_at = ?3, launch_verified_at = NULL WHERE request_id = ?4 AND status IN ('pending', 'delivered', 'succeeded')`,
         [status, ackError || null, ackedAt, request_id],
       );
       // RFC-026 §9.3 D2 — surface declaration↔reality gap on a
@@ -5393,9 +5411,10 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     {
       ...NODE_ID_ALIAS_FIELDS,
       daemon_node_id: z.string().min(1).max(200).regex(/^node_[a-z0-9_-]+$/).optional(),
+      fork_recovery: forkRecoveryRequestSchema.optional(),
       network_id: z.string().max(200).optional(),
     },
-    async ({ node_id, child_node_id: child_node_id_arg, daemon_node_id, network_id: clientNetId }) => {
+    async ({ node_id, child_node_id: child_node_id_arg, daemon_node_id, network_id: clientNetId, fork_recovery }) => {
       const idArg = resolveNodeIdArg({ node_id, child_node_id: child_node_id_arg });
       if (!idArg.ok) return { content: [{ type: "text" as const, text: JSON.stringify(idArg) }] };
       const child_node_id = idArg.node_id;
@@ -5414,6 +5433,20 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       );
       if (!child) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden_cross_tenant" }) }] };
       if (!canWrite(child.network_id)) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "permission_denied" }) }] };
+      if (fork_recovery !== undefined) {
+        const fail = (error: string) => ({ content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error }) }] });
+        if (!forkRecoveryRequestSchema.safeParse(fork_recovery).success) return fail("codex_fork_confirmation_invalid");
+        // Confirmation is additional to the existing caller/child authority.
+        // Require an affirmative new capability; missing means old/unsupported.
+        if (createdDaemon(child_node_id) !== resolvedDaemonId || activeBinding(child_node_id)) return fail("codex_fork_recovery_unsupported");
+        const daemon = db.get<{ config_snapshot: string | null; network_id: string }>(
+          `SELECT config_snapshot, network_id FROM nodes WHERE node_id=?1`, resolvedDaemonId);
+        let snapshot: any;
+        try { snapshot = JSON.parse(daemon?.config_snapshot || "{}"); } catch { /* unsupported */ }
+        const capability = snapshot?.daemon_capabilities?.codex_fork_recovery;
+        if (daemon?.network_id !== child.network_id || snapshot?.role !== "host_supervisor"
+            || capability?.protocol !== 1 || capability?.cli_supported !== true) return fail("codex_fork_recovery_unsupported");
+      }
       // #1448 finding-2 — stale-starting reaper，对齐 update_node_config / restart_node
       // 的 60s single-flight stale-supersede。start 只受理 'stopped';一旦卡 'starting'
       // (门铃丢 / daemon 在 UPDATE 'starting' 后死),config/restart 有 reaper、delete 有
@@ -5426,8 +5459,8 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "node_not_stopped", current_state: priorState }) }] };
         }
         const STALE_STARTING_MS = 60_000;
-        const inFlight = db.get<{ request_id: string; created_at: number; delivered_at: number | null; acked_at: number | null }>(
-          `SELECT request_id, created_at, delivered_at, acked_at FROM node_start_requests
+        const inFlight = db.get<{ request_id: string; created_at: number; delivered_at: number | null; acked_at: number | null; fork_recovery_json: string | null }>(
+          `SELECT request_id, created_at, delivered_at, acked_at, fork_recovery_json FROM node_start_requests
              WHERE child_node_id = ?1 AND status IN ('pending', 'delivered')
              ORDER BY created_at DESC LIMIT 1`, child.node_id,
         );
@@ -5443,6 +5476,11 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
               hint: `再等一下;超过 ${STALE_STARTING_MS / 1000}s 仍卡 starting,重试 start 会重新派发`,
             }) }] };
           }
+          // A timed-out receipt cannot prove a confirmed fork did not happen.
+          // Do not create a second recovery generation via the ordinary reaper.
+          if (inFlight.fork_recovery_json) return { content: [{ type: "text" as const, text: JSON.stringify({
+            ok: false, error: "codex_fork_outcome_unknown", existing_request_id: inFlight.request_id,
+          }) }] };
           // Stale — 标旧请求 timeout(autocommit,先于下面 tx 的新 INSERT,解除
           // node_start_requests 对 pending/delivered 的 child 唯一约束),放行重派。
           db.run(
@@ -5472,9 +5510,10 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           db.run(
             `INSERT INTO node_start_requests
                (request_id, network_id, daemon_node_id, child_node_id, child_alias,
-                created_by_token, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)`,
-            [requestId, child.network_id, daemon.node_id, child.node_id, child.alias, callerTokenId || "unknown", now],
+                created_by_token, status, created_at, fork_recovery_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)`,
+            [requestId, child.network_id, daemon.node_id, child.node_id, child.alias, callerTokenId || "unknown", now,
+              fork_recovery ? JSON.stringify(fork_recovery) : null],
           );
           // #1448 finding-2 — 也接受从 'starting' 重派(stale-supersede 后原态仍是
           // starting);两种入态都合法地转/留到 'starting'。
@@ -5497,19 +5536,27 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
   server.tool(
     "get_start_request",
     "Host supervisor pulls an authenticated pending start request.",
-    { request_id: z.string().min(1).max(200) },
-    async ({ request_id }) => {
+    { request_id: z.string().min(1).max(200), fork_recovery_capable: z.boolean().optional() },
+    async ({ request_id, fork_recovery_capable }) => {
       const callerDaemon = resolveCallerDaemonTokenBound();
       if (!callerDaemon.ok) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: callerDaemon.error }) }] };
-      const row = db.get<{ daemon_node_id: string; network_id: string; child_node_id: string; child_alias: string; status: string }>(
-        `SELECT daemon_node_id, network_id, child_node_id, child_alias, status FROM node_start_requests WHERE request_id = ?1`, request_id,
+      const row = db.get<{ daemon_node_id: string; network_id: string; child_node_id: string; child_alias: string; status: string; fork_recovery_json: string | null }>(
+        `SELECT daemon_node_id, network_id, child_node_id, child_alias, status, fork_recovery_json FROM node_start_requests WHERE request_id = ?1`, request_id,
       );
       if (!row) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "request_not_found" }) }] };
       if (row.daemon_node_id !== callerDaemon.daemonNodeId) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "not_your_request" }) }] };
       if (row.network_id !== callerDaemon.networkId) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "cross_network_request" }) }] };
       if (!['pending', 'delivered'].includes(row.status)) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "request_not_startable", status: row.status }) }] };
+      let recovery: unknown;
+      if (row.fork_recovery_json !== null) {
+        if (fork_recovery_capable !== true || createdDaemon(row.child_node_id) !== row.daemon_node_id || activeBinding(row.child_node_id))
+          return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "codex_fork_recovery_unsupported" }) }] };
+        try { recovery = forkRecoveryRequestSchema.parse(JSON.parse(row.fork_recovery_json)); }
+        catch { return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "codex_fork_confirmation_invalid" }) }] }; }
+      }
       db.run(`UPDATE node_start_requests SET status='delivered', delivered_at=?1 WHERE request_id=?2 AND status='pending'`, [Date.now(), request_id]);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, request_id, child_node_id: row.child_node_id, child_alias: row.child_alias }) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, request_id, child_node_id: row.child_node_id, child_alias: row.child_alias, start_completion_capable: true,
+        ...(recovery ? { managed: "created", fork_recovery: recovery } : {}) }) }] };
     },
   );
 
@@ -5518,15 +5565,16 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     "Host supervisor reports start completion or failure.",
     {
       request_id: z.string().min(1).max(200),
-      status: z.enum(["started", "start_failed"]),
+      status: z.enum(["starting", "started", "start_failed"]),
       child_pid: z.number().int().positive().optional(),
       error: z.string().max(1000).optional(),
+      fork_recovery: forkRecoveryResultSchema.optional(),
     },
-    async ({ request_id, status, child_pid, error: ackError }) => {
+    async ({ request_id, status, child_pid, error: ackError, fork_recovery }) => {
       const callerDaemon = resolveCallerDaemonTokenBound();
       if (!callerDaemon.ok) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: callerDaemon.error }) }] };
-      const row = db.get<{ daemon_node_id: string; network_id: string; child_node_id: string; child_alias: string; status: string }>(
-        `SELECT daemon_node_id, network_id, child_node_id, child_alias, status FROM node_start_requests WHERE request_id=?1`, request_id,
+      const row = db.get<{ daemon_node_id: string; network_id: string; child_node_id: string; child_alias: string; status: string; fork_recovery_json: string | null }>(
+        `SELECT daemon_node_id, network_id, child_node_id, child_alias, status, fork_recovery_json FROM node_start_requests WHERE request_id=?1`, request_id,
       );
       if (!row) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "request_not_found" }) }] };
       if (row.daemon_node_id !== callerDaemon.daemonNodeId) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "not_your_request" }) }] };
@@ -5537,13 +5585,25 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       if (!['pending', 'delivered'].includes(row.status)) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "request_not_ackable", status: row.status }) }] };
       }
+      if (fork_recovery !== undefined && (!row.fork_recovery_json || status === "starting"
+          || !forkRecoveryResultSchema.safeParse(fork_recovery).success)) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "codex_fork_result_invalid" }) }] };
+      }
+      // A finite co-presence launcher can spend minutes restoring a large thread.
+      // Refresh the existing stale-start clock, without claiming startup completed.
+      if (status === "starting") {
+        db.run(`UPDATE node_start_requests SET acked_at=?1 WHERE request_id=?2`, [Date.now(), request_id]);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, status: "starting" }) }] };
+      }
       if (status === "started" && !child_pid) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "child_pid_required" }) }] };
       }
       const now = Date.now();
       try {
         db.transaction(() => {
-          db.run(`UPDATE node_start_requests SET status=?1,error=?2,child_pid=?3,acked_at=?4 WHERE request_id=?5`, [status, ackError || null, child_pid || null, now, request_id]);
+          db.run(`UPDATE node_start_requests SET status=?1,error=?2,child_pid=?3,acked_at=?4,fork_result_json=?6 WHERE request_id=?5`,
+            [status, ackError || null, child_pid || null, now, request_id,
+              row.fork_recovery_json ? JSON.stringify(publicForkResult(fork_recovery)) : null]);
           db.run(`UPDATE nodes SET lifecycle_state=?1 WHERE node_id=?2`, [status === "started" ? "active" : "stopped", row.child_node_id]);
           if (status === "started") auditCreateNodeStrict({
             action: "start_node_completed", network_id: row.network_id, target_id: request_id,
@@ -6396,6 +6456,9 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
   server.tool("schedule_update", "Edit your schedule; status=paused|active.",
     { ...schedFields, schedule_id: schedId, base_revision: z.number().int().min(0).optional().describe("Reject if current revision differs."), name: z.string().optional(), task: z.string().optional(), schedule: z.any().optional(), status: z.string().optional() },
     async ({ schedule_id, ...rest }) => scheduleCall((id, w) => agentUpdateSchedule(id, w, schedule_id, rest as Record<string, unknown>)));
+  server.tool("schedule_batch_interval", "Batch interval edit; per-ID results.",
+    { schedule_ids: z.array(z.string()).min(1).max(100), every_seconds: z.number() },
+    async ({ schedule_ids, every_seconds }) => scheduleCall((id, w) => agentBatchScheduleInterval(id, w, schedule_ids, every_seconds)));
   server.tool("schedule_cancel", "Cancel your schedule.", { schedule_id: schedId },
     async ({ schedule_id }) => scheduleCall((id, w) => agentCancelSchedule(id, w, schedule_id)));
   server.tool("schedule_run_now", "Run your schedule now.", { schedule_id: schedId },

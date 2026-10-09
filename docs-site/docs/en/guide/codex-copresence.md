@@ -207,8 +207,17 @@ anet node start <node> --fork-on-resume-failure --yes    # no terminal (scripts 
 - Not confirmed (any answer but y, or non-interactive without `--yes`): no fork, no file is touched.
 - Before forking, the original rollout is **copied** to a read-only snapshot in `<node dir>/rollout-snapshots/`. The original is never modified (its hash is compared again after the fork; if it changed, the node is not switched).
 - Old thread → new thread, the snapshot path and the time are recorded in `<node dir>/codex-fork-recovery.json`, next to config.json. The thread recorded in config changes only after the fork succeeds.
+- If existing mapping history cannot be read, contains invalid JSON, or lacks a `forks` array, confirmed recovery stops before taking a snapshot or forking, preserving the file and reporting its path. Back up the current state, check permissions or restore valid history from backup, then retry; do not delete history to bypass the check. A first recovery with no history file still creates it normally.
 - 🔴 The new thread still reads its history from the **original rollout file**: keep it, do not move or delete it.
 - Currently covers `anet node start` of co-presence nodes only.
+
+#### Start-request correlation (#821, source capability, not released)
+
+A single-node start optionally accepts `--fork-recovery-request-id str_0123456789ab`. After a confirmed fork succeeds, only the new mapping gains `requestId`; existing records are preserved. Omitting it keeps the legacy format. It cannot be combined with `--all`. The ID identifies a Hub-generated start request; the CLI does not verify ownership or authorization. It replaces neither `--fork-on-resume-failure` nor `--yes`/interactive confirmation, and provides no idempotency or deduplication.
+
+A mapping means **the fork happened**, not that startup completed: it remains if subsequent bridge/TUI startup fails. Consumers must match the exact `requestId`, never infer the current result from the latest record or timestamp. No matching record does not prove absence of side effects. Hub→daemon argument forwarding and the client button are not connected yet.
+
+No services, ports, environment variables or secrets are added. Backups must still include the node's mapping, snapshots, configuration and original rollout; Git does not contain this runtime data. Use the existing version-switch procedure for software rollback; older code ignores the optional `requestId` and preserves history. Rollback does not undo a fork. Verify correlation against the old/new threads for the exact request ID; verify startup status separately.
 
 ### Pin a node to one codex (#739) {#codex-bin-pin}
 

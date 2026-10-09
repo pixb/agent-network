@@ -103,6 +103,8 @@ import {
   agentNodeHelpSupportsOpencode,
   opencodeExactPairInstallCommand,
   pairedAgentNodeResolution,
+  pairedAgentNodeResolveTimeoutMs,
+  pairedAgentNodeResolveError,
   resolveAgentNodePackageEntrypointFromPath,
   validateAgentNodePackageEntrypoint,
 } from "../src/opencode-agent-node-pair";
@@ -152,6 +154,7 @@ import {
   grokCopresenceSocketPaths,
 } from "../src/grok-copresence-profile";
 import { canonicalSocketsForProfile, planReapableSockets, reapStaleSocket, unixSocketPathInUse } from "../src/stale-socket";
+import { opencodeV2CopresenceRequested } from "../src/opencode-start-mode";
 import {
   codexCopresencePosture,
   codexCopresenceCreateFields,
@@ -290,7 +293,7 @@ import { findThreadRollouts, reconcilePendingThreadAtStart } from "../src/codex-
 import { copresenceRolloutGuard, copresenceVersionProbeScript, probeCodexVersionViaShell } from "../src/codex-copresence-rollout-guard";
 import { describeMissingOrdinalFailure, probeCodexVersionCached } from "../src/codex-rollout-history-guard";
 import { codexVersionPinMismatch, configuredCodexBin, configuredCodexVersion, resolveCopresenceCodexBin } from "../src/codex-bin-pin";
-import { resumeOrForkOnMissingOrdinal, type ForkRecoveryOptions } from "../src/codex-fork-recovery";
+import { parseForkRecoveryRequestId, resumeOrForkOnMissingOrdinal, type ForkRecoveryOptions } from "../src/codex-fork-recovery";
 import { probePosixOwnedLoopbackConnection, waitForPosixOwnedLoopbackConnection } from "../src/posix-codex-copresence";
 import {
   backupCodexRecoveryState,
@@ -645,6 +648,7 @@ async function codexTuiStateAfterRender(sessionName: string, timeoutMs: number) 
 function forkRecoveryOptions(nodeId: string, displayName: string, opts: CopresenceOptions, threadId: string | undefined): ForkRecoveryOptions {
   return {
     enabled: opts.forkOnResumeFailure === true, yes: opts.yes === true, interactive: process.stdin.isTTY === true,
+    requestId: opts.forkRecoveryRequestId,
     threadId, codexHome: opts.codexHome, nodeDir: join(nodesDir(), nodeId), node: displayName,
     confirm: async (prompt) => {
       const rl = getRL();
@@ -733,6 +737,8 @@ interface CopresenceOptions {
   skipRecoveryBackup?: boolean;
   /** Board #738: fork the thread when resume fails with "missing an ordinal" (after a human's yes). */
   forkOnResumeFailure?: boolean;
+  /** Optional Hub start request correlation, not permission to fork. */
+  forkRecoveryRequestId?: string;
   /** --yes: confirms the fork when there is no terminal to ask. */
   yes?: boolean;
   /** Resolved config.env values. Each native stage receives the same set. */
@@ -2271,6 +2277,17 @@ async function startOpencodeCopresenceOrchestration(nodeId: string, hubOverride?
     console.error(`[anet] ❌ OpenCode --copresence requires runtime=opencode-cli (node "${displayName}" is runtime=${runtime}).`);
     process.exit(1);
   }
+  // Refuse before saving the profile or replacing an existing bridge/TUI.
+  // Otherwise the actionable V2 policy error is buried/truncated in the
+  // bridge tail and misreported as a 30-second launcher timeout (#827).
+  const generationRefusal = opencodeStartGenerationRefusal(resolved.profile, {
+    copresence: true,
+    configFile: join(nodesDir(), resolved.id, "config.json"),
+  });
+  if (generationRefusal) {
+    console.error(`[anet] ❌ ${generationRefusal}`);
+    process.exit(1);
+  }
   if (!tmuxAvailable()) {
     console.error(`[anet] ❌ OpenCode --copresence requires tmux.`);
     process.exit(1);
@@ -2304,6 +2321,9 @@ async function startOpencodeCopresenceOrchestration(nodeId: string, hubOverride?
       ? [`export ANET_OPENCODE_SAFE_BASE=${shellQuote(process.env.ANET_OPENCODE_SAFE_BASE)}`]
       : []),
     `export ANET_OPENCODE_MODE=copresence`,
+    // Ordinary V2 starts now select orchestration from the persisted profile.
+    // This internal start owns the runtime, not a second TUI/bridge pair.
+    `export ANET_COPRESENCE_BRIDGE=1`,
     `exec > >(tee -a ${shellQuote(bridgeLog)}) 2>&1`,
     `exec ${shellQuote(process.execPath)} ${shellQuote(cliEntry)} node start ${shellQuote(resolved.id)}`
       + (hubOverride ? ` --hub ${shellQuote(hubOverride)}` : ""),
@@ -3886,13 +3906,14 @@ function resolveCodexAgentNodeLaunchPlan(): AgentNodeLaunchPlan {
     source = "paired";
   } else {
     let output: string;
+    const resolveTimeoutMs = pairedAgentNodeResolveTimeoutMs(probeEnv);
     try {
       const resolution = pairedAgentNodeResolution();
       output = execFileSync("npx", resolution.args, {
-        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 120_000, env: probeEnv,
+        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: resolveTimeoutMs, env: probeEnv,
       });
     } catch (error: any) {
-      throw pairedAgentNodeError(`could not resolve exact paired package: ${error?.stderr || error?.message || error}`);
+      throw pairedAgentNodeError(pairedAgentNodeResolveError(error, resolveTimeoutMs));
     }
     const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (lines.length !== 1 || !isAbsolute(lines[0])) {
@@ -4689,6 +4710,9 @@ Options:
   --fork-on-resume-failure    codex: if the thread cannot be resumed ("missing an
                               ordinal"), ask, then fork it into a new thread
                               (non-interactive: also pass --yes)
+  --fork-recovery-request-id <str_…>
+                              Correlate a codex fork mapping with a Hub start
+                              request (not confirmation or startup success)
   --copresence                Start a shared human + agent TUI\n                              (codex-app-server | opencode-cli | grok-build-cli)
                               (codex: recorded on the node, so the next start
                               needs no flag — plain 'anet node start <name>')
@@ -5326,6 +5350,15 @@ function printOpencodeCreationSecurityDisclosure(id: string, profile: Profile): 
     unsafeTools,
     configFile: join(nodesDir(), id, "config.json"),
   })) console.warn(line);
+  if (opencodeGenerationOfConfig(profile) === "v2") {
+    console.log(`\n[anet] ⚠ OpenCode V2 co-presence PREVIEW:`);
+    console.log(`[anet]    HIGH RISK: flags.opencodeUnsafeTools=true enables every local tool; trusted tasks only.`);
+    console.log(`[anet]    V1 permission environment switches do not enforce the V2 safety policy.`);
+    console.log(`[anet]    Cwd: project cwd. Use Docker/VM for process and filesystem isolation.`);
+    console.log(`[anet]    CommHub: agent-node receives tasks and publishes final text; a node-scoped MCP is configured.`);
+    console.log(`[anet]    Model-driven MCP tool calls require separate verification; plain messages are logged, not shown as TUI toasts.`);
+    return;
+  }
   console.log(`\n[anet] ${unsafeTools ? "⚠" : "🛡"} OpenCode tool/cwd policy:`);
   if (unsafeTools) {
     console.log(`[anet]    Built-in: bash / read / glob / grep / edit / write / list / task / skill ENABLED`);
@@ -5349,9 +5382,14 @@ async function configureOpencodeRuntime(
   interactive = Boolean(process.stdin.isTTY),
 ): Promise<void> {
   wizardOpts.runtime = "opencode-cli";
-  const currentPin = readEffectivePin();
-  console.log(`[anet] 请确保已安装 opencode CLI (exact): ${opencodeExactInstallCommand(currentPin.version)}`);
-  console.log(`[anet]   pin source: ${currentPin.source === "override-file" ? `~/.anet/opencode-pin.json (smoke ${currentPin.smokePassedAt})` : "built-in default"}`);
+  if (wizardOpts["opencode-generation"] === "v2") {
+    console.log(`[anet] 请确保已安装 OpenCode V2 (exact): ${opencodeGenerationInstallCommand("v2")}`);
+    console.log(`[anet]   V1 and V2 both install 'opencode': use separate npm prefixes and select the V2 prefix on PATH.`);
+  } else {
+    const currentPin = readEffectivePin();
+    console.log(`[anet] 请确保已安装 opencode CLI (exact): ${opencodeExactInstallCommand(currentPin.version)}`);
+    console.log(`[anet]   pin source: ${currentPin.source === "override-file" ? `~/.anet/opencode-pin.json (smoke ${currentPin.smokePassedAt})` : "built-in default"}`);
+  }
 
   if (!interactive) {
     wizardOpts._opencodePreset ||= "anthropic";
@@ -6444,6 +6482,10 @@ async function createCommand(idOverride?: string) {
   }
   if (normalizeRuntime(profile) === "opencode-cli") {
     printOpencodeCreationSecurityDisclosure(id, profile);
+    console.log(`\nStart: anet node start ${id}${profile.opencodeMode === "copresence" ? " --copresence" : ""}`);
+    closeRL();
+    if (process.env.ANET_INTERNAL_KEEP_PROCESS !== "1") process.exit(0);
+    return;
   } else if (profile.grokCopresence === true) {
     printGrokCopresenceWarning(id, profile.tools, "configured");
     console.log(`[anet]   One command brings up the node and its shared TUI together.`);
@@ -8208,6 +8250,11 @@ async function maybeExternalAppserverLifecycle(verb: "start" | "stop" | "restart
 
 async function startCommand() {
   const startInvokedAt = Date.now();
+  const opts = parseOpts();
+  const forkRecoveryRequestId = parseForkRecoveryRequestId(opts["fork-recovery-request-id"]);
+  if (forkRecoveryRequestId !== undefined && args.includes("--all")) {
+    throw new Error("--fork-recovery-request-id is for one node start, not --all");
+  }
   // #173 — `anet node start --all` starts every node under cwd's .anet/nodes/
   // (skip already-running, staggered, auto-resume). It delegates to the
   // `anet project up` implementation (projectUp) so the two stay in lockstep
@@ -8231,7 +8278,6 @@ async function startCommand() {
   const startPositionals = positionalArgs(args.slice(1));
   const id = startPositionals[0];
   if (!id) { showProfiles("start"); return; }
-  const opts = parseOpts();
   const forceNewSession = !!opts["new-session"];
 
   // RFC-030 P2 — `anet node start <alias> --copresence` spawns the 3-piece
@@ -8268,7 +8314,8 @@ async function startCommand() {
   //    runtime=codex-app-server". Each lane answers for itself.
   if (process.env.ANET_COPRESENCE_BRIDGE !== "1" && resolvedForCopresence
     && (codexCopresenceRequested(copresenceFlagPassed, resolvedForCopresence.profile as any)
-      || grokCopresenceRequested(copresenceFlagPassed, resolvedForCopresence.profile as any))) {
+      || grokCopresenceRequested(copresenceFlagPassed, resolvedForCopresence.profile as any)
+      || opencodeV2CopresenceRequested(resolvedForCopresence.profile))) {
     const copresenceRuntime = runtimeForExecution(
       resolvedForCopresence.profile,
       `start copresence node ${JSON.stringify(id)}`,
@@ -8329,6 +8376,7 @@ async function startCommand() {
       newSession: forceNewSession,
       skipRecoveryBackup: opts["skip-recovery-backup"] === "true",
       forkOnResumeFailure: opts["fork-on-resume-failure"] === "true",
+      forkRecoveryRequestId,
       yes: opts.yes === "true",
       configEnv: resolveProfileEnv(prof.env as any, homedir(), loadNodeDotenv(resolvedForCopresence.id)),
     });
@@ -12668,6 +12716,31 @@ async function stopResolvedNode(resolved: { id: string; profile: Profile }, stop
     // reinterpret that failure as permission to kill by name.
     console.error(`[anet]    Refusing the legacy tmux-name sweep: identity check did not complete.`);
     process.exit(1);
+  }
+
+  // OpenCode's bridge owns its private launch root. Closing tmux first also
+  // kills its tee/foreground wrapper, interrupting asynchronous cleanup even
+  // when every process eventually disappears. Give the frozen agent identity
+  // a bounded graceful shutdown before touching its terminal or descendants.
+  // Never widen marker-authorized teardown or signal an unverified pidfile.
+  if (allowLegacyTmuxNameSweep && process.platform === "linux"
+      && resolved.profile.runtime === "opencode-cli" && resolved.profile.opencodeMode === "copresence") {
+    const agents = stopProcesses.filter(identity => identity.role === "agent");
+    for (const identity of agents) {
+      const current = processIdentitySnapshot(identity.pid);
+      if (current.kind === "live" && current.birth === identity.birth) {
+        try { process.kill(identity.pid, "SIGTERM"); } catch { /* reaper audits below */ }
+      }
+    }
+    const drainDeadline = Date.now() + 10_000;
+    while (Date.now() < drainDeadline && agents.some(identity => {
+      const current = processIdentitySnapshot(identity.pid);
+      return current.kind === "unverifiable" || (current.kind === "live" && current.birth === identity.birth);
+    })) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    // Timeout is not success: the unchanged identity reaper below verifies
+    // remaining descendants and refuses the offline receipt on any residual.
   }
 
   // RFC-030 P2 legacy path — nodes without an identity marker may own three

@@ -24,6 +24,8 @@ export const FORK_RECOVERY_SNAPSHOT_DIR = "rollout-snapshots";
 export interface ForkRecoveryOptions {
   /** --fork-on-resume-failure was passed. */
   enabled: boolean;
+  /** Correlates a mapping with one Hub start request; never grants confirmation. */
+  requestId?: string;
   /** --yes was passed (required when there is no terminal to ask). */
   yes: boolean;
   /** A human can answer a prompt (stdin is a TTY). */
@@ -42,12 +44,21 @@ export interface ForkRecoveryOptions {
 }
 
 export interface ForkMapping {
+  requestId?: string;
   oldThreadId: string;
   newThreadId: string;
   originalRollout: string;
   snapshot: string;
   sha256: string;
   at: string;
+}
+
+/** Keep this opaque: the Hub owns ID generation, not the CLI. */
+export function parseForkRecoveryRequestId(value: string | undefined): string | undefined {
+  if (value !== undefined && value.match(/^str_[A-Za-z0-9_-]{1,128}$/)?.[0] !== value) {
+    throw new Error("--fork-recovery-request-id requires a Hub start request ID (str_…)");
+  }
+  return value;
 }
 
 export function sha256OfFile(path: string): string {
@@ -88,13 +99,21 @@ export function snapshotRollout(original: string, nodeDir: string, now: Date): {
   return { path, sha256: before };
 }
 
-export function recordForkMapping(nodeDir: string, entry: ForkMapping): string {
+function readForkMappings(nodeDir: string): ForkMapping[] {
   const path = join(nodeDir, FORK_RECOVERY_STATE_FILE);
-  let forks: ForkMapping[] = [];
   try {
     const prev = JSON.parse(readFileSync(path, "utf8"));
-    if (Array.isArray(prev?.forks)) forks = prev.forks;
-  } catch { /* first fork */ }
+    if (!Array.isArray(prev?.forks)) throw new Error("expected a forks array");
+    return prev.forks;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error(`Cannot read fork recovery history ${path}: ${(error as Error).message}. Preserve this file and restore a valid history from backup before retrying; it has not been replaced.`);
+  }
+}
+
+export function recordForkMapping(nodeDir: string, entry: ForkMapping): string {
+  const path = join(nodeDir, FORK_RECOVERY_STATE_FILE);
+  const forks = readForkMappings(nodeDir);
   atomicWritePrivateJson(path, { forks: [...forks, entry] });
   return path;
 }
@@ -118,6 +137,7 @@ export async function resumeOrForkOnMissingOrdinal<T extends { threadId: string 
   start: (forkFirst: boolean) => Promise<T>,
   o: ForkRecoveryOptions,
 ): Promise<T> {
+  const requestId = parseForkRecoveryRequestId(o.requestId);
   try {
     return await start(false);
   } catch (error) {
@@ -138,6 +158,8 @@ export async function resumeOrForkOnMissingOrdinal<T extends { threadId: string 
       log(`Not confirmed: nothing was forked and no file was changed.`);
       throw error;
     }
+    // A damaged audit trail must not trigger a new fork or be treated as empty.
+    readForkMappings(o.nodeDir);
     const now = (o.now ?? (() => new Date()))();
     const snap = snapshotRollout(original, o.nodeDir, now);
     log(`read-only snapshot: ${snap.path}`);
@@ -152,6 +174,7 @@ export async function resumeOrForkOnMissingOrdinal<T extends { threadId: string 
     const statePath = recordForkMapping(o.nodeDir, {
       oldThreadId: o.threadId, newThreadId: thread.threadId, originalRollout: original,
       snapshot: snap.path, sha256: snap.sha256, at: now.toISOString(),
+      ...(requestId === undefined ? {} : { requestId }),
     });
     log(`forked thread ${o.threadId} → ${thread.threadId} (recorded in ${statePath}); the original rollout is unchanged.`);
     return thread;

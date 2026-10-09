@@ -41,6 +41,7 @@ on:
       - 'tests/test1220-codex-tui-client-health/**'
       - 'tests/test-codex-appserver-watchdog/**'
       - 'tests/test-codex-copresence-first-start/**'
+      - 'tests/test812-paired-resolve-timeout/**'
       - 'tests/test1183-sync-pinned-dryrun/**'
       - 'tests/test1193-side-thread-contract/**'
       - 'tests/test1195-side-thread-hub-contract/**'
@@ -218,6 +219,11 @@ on:
       - 'tests/test-codex-external-appserver/**'
       - 'tests/test1225-opencode-copresence-onecommand/**'
       - 'tests/test543-opencode-v2-copresence/**'
+      - 'tests/test827-opencode-v2-hub/**'
+      - 'tests/test828-opencode-v2-mcp/**'
+      - 'tests/test829-opencode-create/**'
+      - 'tests/test832-opencode-v2-registry/**'
+      - 'tests/test828-opencode-v2-policy/**'
       - 'tests/test1178-codex-upgrade-recovery/**'
       - 'tests/test736-pm2-fleet-rebuild/**'
       - 'tests/test185-external-schedules/**'
@@ -269,6 +275,7 @@ on:
       - 'tests/test1220-codex-tui-client-health/**'
       - 'tests/test-codex-appserver-watchdog/**'
       - 'tests/test-codex-copresence-first-start/**'
+      - 'tests/test812-paired-resolve-timeout/**'
       - 'tests/test1271-daemon-start-node/**'
       # A test directory belongs here exactly when CI executes it — otherwise
       # editing the test cannot re-run the gate that runs it. The four below are
@@ -436,6 +443,11 @@ on:
       - 'tests/test-codex-external-appserver/**'
       - 'tests/test1225-opencode-copresence-onecommand/**'
       - 'tests/test543-opencode-v2-copresence/**'
+      - 'tests/test827-opencode-v2-hub/**'
+      - 'tests/test828-opencode-v2-mcp/**'
+      - 'tests/test829-opencode-create/**'
+      - 'tests/test832-opencode-v2-registry/**'
+      - 'tests/test828-opencode-v2-policy/**'
       - 'tests/test1178-codex-upgrade-recovery/**'
       - 'tests/test736-pm2-fleet-rebuild/**'
       - 'tests/test185-external-schedules/**'
@@ -2019,12 +2031,20 @@ jobs:
           # loopback stub model, private tmux socket. Not L1: the image installs a ~200 MB
           # native binary and the run drives a real TUI (~40 s).
           - test543-opencode-v2-copresence
+          # Hub #827 / #539: real CLI -> Hub -> packaged runtime -> V2 TUI,
+          # deterministic loopback model, private tmux; no paid credentials.
+          - test827-opencode-v2-hub
+          - test828-opencode-v2-mcp
+          - test829-opencode-create
+          - test832-opencode-v2-registry
+          - test828-opencode-v2-policy
           - test1191-windows-steer-contract
           - test1220-codex-tui-client-health
           - test-codex-appserver-watchdog
           # #535: first co-presence start with a slow agent-node fetch, bridge failure tail,
           # needs-login, single-node verify. Real Hub + tmux + 30 s fake npx (x2 with its witnessed red).
           - test-codex-copresence-first-start
+          - test812-paired-resolve-timeout
           - test1271-daemon-start-node
           - test1178-codex-upgrade-recovery
           - test736-pm2-fleet-rebuild
