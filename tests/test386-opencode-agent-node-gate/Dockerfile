@@ -20,6 +20,8 @@ COPY agent-node/src/runtime/opencode-acp/ /repo/agent-node/src/runtime/opencode-
 COPY agent-node/src/runtime/opencode-versions.ts /repo/agent-node/src/runtime/opencode-versions.ts
 COPY agent-node/src/runtime/opencode-backend.ts /repo/agent-node/src/runtime/opencode-backend.ts
 COPY agent-node/src/runtime/opencode-timeout.ts /repo/agent-node/src/runtime/opencode-timeout.ts
+# board #656: runtime.ts imports ../capacity-retry for temporary capacity retry.
+COPY agent-node/src/runtime/capacity-retry.ts /repo/agent-node/src/runtime/capacity-retry.ts
 COPY agent-node/src/util/timeout.ts /repo/agent-node/src/util/timeout.ts
 COPY tests/test386-opencode-agent-node-gate/ /test/
 
@@ -32,7 +34,7 @@ RUN mkdir -p /home/bun/prefix /home/bun/project /home/bun/probe \
 USER bun
 RUN umask 0002 \
   && cd /home/bun/prefix \
-  && HOME=/home/bun bun add --exact opencode-ai@1.18.34 \
+  && HOME=/home/bun bun add --exact opencode-ai@1.18.35 \
   && chmod -R g+w /home/bun/prefix \
   && mkdir -p /home/bun/.config /home/bun/.local/share \
       /home/bun/.cache /home/bun/.local/state

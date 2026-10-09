@@ -1,0 +1,63 @@
+# OpenCode V1 pin 1.18.34 → 1.18.35 —— Docker 验证报告
+
+- date: 2026-10-09
+- branch: pixb (worktree dirty → commit <filled by commit msg>)
+- 源码审计: anomalyco/opencode v1.18.34...v1.18.35 (28 commits / 193 files)
+  - 五接口面 0 变更；唯一运行时改动 = message-v2.ts +10/-1（xAI 工具结果图片过滤）
+  - 符合 #541 审计标准 → pin accepted
+- 决策: OPENCODE_V1_PIN=1.18.35；acceptedVersions=[.35, .34]；踢掉1.18.1（现为拒绝版本）
+- 改动镜像: agent-network/src/opencode-versions.ts ≡ agent-node/src/runtime/opencode-versions.ts（cp 字节一致，cmp 验证）
+
+## 一、套件结果矩阵
+
+| 套件 | 结果 | 备注 |
+|---|---|---|
+| test1225-opencode-copresence-onecommand | **PASS** | create→start --copresence→失败诊断一条龙 |
+| test610-opencode-clean-test-workspace | **PASS** | |
+| test621-test384-layer-isolation | **PASS** | |
+| test228-opencode-inbox-concurrency | **PASS** | 需 --build-arg TEST228_SOURCE_COMMIT=$(git rev-parse HEAD) |
+| test230-opencode-sender-label | **PASS** | 需 --build-arg TEST230_SOURCE_COMMIT |
+| test725-agent-node-unit-ci | **PASS** | 需 --build-arg SOURCE_COMMIT |
+| test745-agent-network-unit-ci | **PASS** | 需 --build-arg SOURCE_COMMIT |
+| test386-opencode-agent-node-gate | **PASS (rc=0)** | 修2处腐化后全绿；含 pin 四组合端到端（见下） |
+| test-rfc029-pr3-preset | **PASS** | |
+| test384-opencode-local-package-e2e | **L1–L5.5 全 PASS；L6+ 既有环境腐化** | 修3处腐化后推进到 L6；L6 真实 Zen 回复需凭证（见下） |
+| test227-opencode-tui-copresence | 33 pass / 2 fail（既有） | board656 + undici(Node-only) —— 合并新进 runtime.test.ts 的用例在 oven/bun:1.3.1 基底下过不了；diff 实锤本仓改动仅2行版本字面量，无因果；test725(node:22) 全绿证明单测域本身健康 |
+| test-rfc029-pr1-registration | S1–S3 PASS；S4 既有 | S3 修转义正则后过；S4 `grep "runtime: opencode-cli"` 与现实日志 `runtime: opencode (input: opencode-cli)` 漂移，上游基线同红 |
+| test-rfc029-pr2-acp-shim | FAIL（既有） | worktree 基线（上游 HEAD）同样 FAIL，结果逐条一致 |
+| test-rfc029-pr4-kernel-live | FAIL（既有） | 与 test384 L6 同类：真实免费档模型回复需 Zen 凭证，套件内匿名不可达 |
+
+本地单测（此前已跑）：agent-network 2033 pass/4 fail、agent-node 2726 pass/4 fail —— 8 个失败在上游干净树同样复现（tmux/proc、grok setpriv、codex CLI、undici、#1957 attach-tui 等环境问题），pin 改动零新增失败。
+
+## 二、pin 行为验证（test386，Docker 内，真实 opencode-ai 包）
+
+- `release pin opencode-ai@1.18.35 starts without a transition note` ✓
+- `previous pin opencode-ai@1.18.34 still starts, hands 1.18.34 to agent-node, prints the upgrade note` ✓
+- `unvetted opencode-ai@1.18.2 is refused with the release-pin install command` ✓
+- `non-root uid=gid=1000 umask-0002 real opencode-ai@1.18.35 passes network and agent-node gates` ✓
+- 配对门全套：exact agent-node@2.5.0-preview.127 / 项目内同版本负载跳过 / ANET_AGENT_NODE_BIN 拒绝 / 无 exact global 拒绝且不执行 npx / capable-looking preview.21 拒绝 ✓
+- 过渡窗单测（binary.test.ts transition describe 滚动后）：.35 pin、.34 唯一 transition、.34 manifest 谎报版本拒绝 ✓（套件内 agent-network 93 pass、agent-node ACP 家族 77 pass 全绿）
+
+## 三、为解锁验证而修的上游腐化（窄变更，均与 pin 无关的既有坏）
+
+1. `tests/test386-.../Dockerfile`: 补 `COPY agent-node/src/runtime/capacity-retry.ts` —— 合并 #2451(board656) 后 runtime.ts 引 `../capacity-retry`，cherry-pick 式 COPY 未跟上 → 镜像内 module not found，套件从未跑到深处。
+2. `tests/test386-.../run.sh`: fixture 重写 `node -e` → `bun -e` —— oven/bun:1.3.1 镜像的 node 是 fallback wrapper：`-e` 参数被吞、未捕获异常仍 exit 0 → 空 mktemp 被 mv 覆盖 fixture package.json（0 字节）→ exact-bin 候选版本校验必败，报成 "entrypoint is outside node_modules"（errors[0] 是 /test/bin 老 shim 的干扰信息）。bun -e argv 正确、行为已实测。
+3. `tests/test384-.../run.sh`: 常量派生 sed → bun -e import（#902 修过 test386，test384 漏改；常量现为 `= PAIRED_AGENT_*` 派生，sed 恒空）。
+4. `tests/test384-.../wizard_probe.py`: 菜单标签 `codex-app-server` → `codex-cli`（#1139 改显示名）+ 顺序对齐 createRuntimeChoices（9/25 owner 决策 grok-build-cli 垫底）。
+5. `tests/test-rfc029-pr1-registration/run.sh`: 转义正则漏网 `1\.18\.34` → `1\.18\.35`（全局字符串替换打不中反斜杠形态）。
+6. 本机环境：host bun 1.4.2 的 `bun install` 把 gitignored 的 `agent-network/bun.lock`/`agent-node/bun.lock` 重写为 lockfileVersion 2，被 oven/bun:1.3.1 套件 COPY 后 bun install 直接报 Unknown lockfile version。两文件已移至 /tmp/opencode-diff/*.bak（可再生、不入库；CI 无此文件不受影响）。**注意：以后在本仓跑过 bun install 后、再跑 bun:1.3.1 基底套件前需删掉 bun.lock。**
+
+## 四、既有环境腐化（未修，与 pin 无关，留档）
+
+- test384 L6+ / rfc029-pr4：真实 `opencode/deepseek-v4-flash-free` 回复。历史 report-test384.txt（1.18.1 时代）显示当时匿名免费档可真回复；今日容器内匿名 `opencode run -m opencode/deepseek-v4-flash-free` 返回 UnknownError server error（Zen 拒匿名）。套件无凭证入口，修复需引入密钥 → 超出本次范围（AGENTS.md：密钥不进 git）。
+- test227 board656/undici、pr1 S4、pr2：见矩阵备注，全部经上游 HEAD 基线或 diff 因果分析定性为既有。
+
+## 五、基线方法备忘
+
+- 用 `git worktree add /tmp/wt-base386 HEAD` 做干净基线；**docker build -f 必须用绝对路径**指向 worktree 内 Dockerfile，相对路径会解析到主工作树的已改 Dockerfile，造出"杂交镜像"（本次踩过）。
+- oven/bun:1.3.1 基底套件：跑前确认无 gitignored bun.lock v2 污染。
+- SOURCE_COMMIT 类套件（228/230/725/745）：`--build-arg SOURCE_COMMIT=$(git rev-parse HEAD)`（当前 HEAD=e430f615，这些套件目录无本地改动，blob 一致）。
+
+## 六、结论
+
+pin 1.18.35 在 Docker 端到端验证通过（test386 全绿覆盖 .35 静默 / .34 提示升级 / 未审版本拒绝 / 真实包身份门禁 / 配对门全套；test1225/610/621/228/230/725/745/pr3 全绿）。改动可合入。

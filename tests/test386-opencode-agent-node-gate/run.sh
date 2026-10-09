@@ -61,7 +61,10 @@ for fixture in /test/exact-global/node_modules/@sleep2agi/agent-node/package.jso
                /test/project-work/node_modules/@sleep2agi/agent-node/package.json; do
   [ -f "$fixture" ] || fail "fixture missing: $fixture"
   tmp=$(mktemp)
-  EXPECT_NODE="$EXPECT_NODE" node -e '
+  # bun's node fallback wrapper mishandles -e argv (drops args) and swallows
+  # uncaught script errors with exit 0, which silently mv'd an empty mktemp
+  # over the fixture package.json. Use bun -e directly.
+  EXPECT_NODE="$EXPECT_NODE" bun -e '
     const fs = require("fs");
     const p = process.argv[1];
     const j = JSON.parse(fs.readFileSync(p, "utf8"));
@@ -102,7 +105,7 @@ bun test \
   src/runtime/opencode-acp/runtime.test.ts >> "$REPORT" 2>&1
 pass "agent-node OpenCode package, child-env, profile-state, ACP client/events, and runtime unit tests"
 
-# Exact 1.18.34 loads /etc/opencode after OPENCODE_CONFIG_CONTENT and can start
+# Exact 1.18.35 loads /etc/opencode after OPENCODE_CONFIG_CONTENT and can start
 # a managed local MCP during config load. Safe mode must refuse the real system
 # source before version probe/spawn; the fixture command must remain untouched.
 [ ! -e /etc/opencode ] || fail "managed-config fixture path already exists in test image"
@@ -134,7 +137,7 @@ bun -e '
       workDir,
       launchBase,
       binary: "/test/opencode-global/node_modules/opencode-ai/bin/opencode.exe",
-      expectedVersion: "1.18.34",
+      expectedVersion: "1.18.35",
     });
     process.exit(2);
   } catch (error) {
@@ -159,10 +162,10 @@ pass "agent-network release bundle build"
 su -s /bin/bash bun -c \
   'umask 0002 && bun /test/nonroot-real-package.ts' >> "$REPORT" 2>&1 \
   || fail "non-root umask-0002 real opencode-ai package identity gates"
-pass "non-root uid=gid=1000 umask-0002 real opencode-ai@1.18.34 passes network and agent-node gates"
+pass "non-root uid=gid=1000 umask-0002 real opencode-ai@1.18.35 passes network and agent-node gates"
 
 # Bundle-level regression for CLI terminator semantics: the fake exact-pinned
-# OpenCode reports 1.18.34 but exits 64 for auth login. The helper must return
+# OpenCode reports 1.18.35 but exits 64 for auth login. The helper must return
 # nonzero (not have process.exitCode overwritten by main().then), leave the old
 # persistent credential byte-for-byte intact, and clean its disposable root.
 rm -rf /tmp/test386-auth-work /tmp/test386-auth-home
@@ -248,7 +251,7 @@ jq -e '.argv | index("opencode-cli") != null' \
   || fail "exact preview did not receive runtime=opencode-cli"
 jq -e '
   .opencodeBinary == "/test/opencode-global/node_modules/opencode-ai/bin/opencode.exe"
-  and .opencodeVersion == "1.18.34"
+  and .opencodeVersion == "1.18.35"
   and (.opencodeSafeBase == null)
   and (.path | startswith("/test/bin:/test/exact-bin:"))
   and .executable == "/test/exact-global/node_modules/@sleep2agi/agent-node/dist/cli.js"
@@ -265,7 +268,7 @@ grep -Fq "using installed exact @sleep2agi/agent-node@$EXPECT_NODE" \
   /tmp/test386-success.log || fail "exact installed agent-node diagnostic is missing"
 pass "stale global bypassed; later exact global received protected PATH/binary/version/base; npx was not executed"
 
-# Board #541 — the release pin moved 1.18.1 → 1.18.34. A host still holding
+# Board #541 — the release pin moved 1.18.34 → 1.18.35. A host still holding
 # the previous exact global install must keep starting (one transition window)
 # with a one-line upgrade note, and the launcher must hand the *found* version
 # to the paired agent-node. Any other version stays refused with the pin hint.
@@ -303,31 +306,31 @@ run_transition_start() {
   mask_log < /tmp/test386-$label.log >> "$REPORT"
 }
 
-make_global_opencode /test/legacy-global 1.18.1
+make_global_opencode /test/legacy-global 1.18.34
 run_transition_start legacy /test/legacy-global/bin
-[ "$transition_rc" -eq 0 ] || fail "previous pin opencode-ai@1.18.1 no longer starts (rc=$transition_rc)"
+[ "$transition_rc" -eq 0 ] || fail "previous pin opencode-ai@1.18.34 no longer starts (rc=$transition_rc)"
 jq -e '
   .opencodeBinary == "/test/legacy-global/node_modules/opencode-ai/bin/opencode.exe"
-  and .opencodeVersion == "1.18.1"
+  and .opencodeVersion == "1.18.34"
 ' /tmp/test386-exact-preview-launch.json >/dev/null \
-  || fail "launcher did not hand the admitted transition version 1.18.1 to agent-node"
-grep -Fq 'opencode-ai@1.18.1 is the previous release pin' /tmp/test386-legacy.log \
+  || fail "launcher did not hand the admitted transition version 1.18.34 to agent-node"
+grep -Fq 'opencode-ai@1.18.34 is the previous release pin' /tmp/test386-legacy.log \
   || fail "transition start printed no upgrade note"
-grep -Fq 'anet opencode upgrade-pin 1.18.34' /tmp/test386-legacy.log \
+grep -Fq 'anet opencode upgrade-pin 1.18.35' /tmp/test386-legacy.log \
   || fail "transition note does not name the upgrade command"
-pass "previous pin opencode-ai@1.18.1 still starts, hands 1.18.1 to agent-node, prints the upgrade note"
+pass "previous pin opencode-ai@1.18.34 still starts, hands 1.18.34 to agent-node, prints the upgrade note"
 
 run_transition_start current /test/bin
 [ "$transition_rc" -eq 0 ] || fail "release pin start exited $transition_rc"
 ! grep -Fq 'previous release pin' /tmp/test386-current.log \
   || fail "release pin start printed the transition note"
-pass "release pin opencode-ai@1.18.34 starts without a transition note"
+pass "release pin opencode-ai@1.18.35 starts without a transition note"
 
 make_global_opencode /test/unvetted-global 1.18.2
 run_transition_start unvetted /test/unvetted-global/bin
 [ "$transition_rc" -ne 0 ] || fail "unvetted opencode-ai@1.18.2 was accepted"
 [ ! -e /tmp/test386-exact-preview-launch.json ] || fail "unvetted opencode-ai@1.18.2 reached agent-node"
-grep -Fq 'npm install -g opencode-ai@1.18.34' /tmp/test386-unvetted.log \
+grep -Fq 'npm install -g opencode-ai@1.18.35' /tmp/test386-unvetted.log \
   || fail "unvetted refusal does not name the release-pin install command"
 pass "unvetted opencode-ai@1.18.2 is refused with the release-pin install command"
 

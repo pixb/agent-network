@@ -13,13 +13,15 @@ ADMIN_USER=test384_admin
 ADMIN_PASSWORD='Test384-Strong-Password!'
 LIVE_ALIAS=wizard-openai
 FREE_MODEL="${OPENCODE_FREE_MODEL:-opencode/deepseek-v4-flash-free}"
-EXPECTED_OPENCODE="${OPENCODE_VERSION_UNDER_TEST:-1.18.34}"
+EXPECTED_OPENCODE="${OPENCODE_VERSION_UNDER_TEST:-1.18.35}"
 # 默认值从源码常量派生,不写死:release 升常量时这里跟着走,不需要有人记得改。
 # (2026-08-17:走 RELEASE-SOP 的 preview.40 dry-run 时发现 sync 脚本不碰这个文件,
 #  于是照 SOP 发版会让这里默认测到上一个版本 —— 测的是旧产物,却看起来在测新版。)
 PAIR_SRC=/repo/agent-network/src/opencode-agent-node-pair.ts
-SRC_NETWORK=$(sed -n 's/^export const OPENCODE_AGENT_NETWORK_VERSION = "\([^"]*\)";$/\1/p' "$PAIR_SRC" 2>/dev/null)
-SRC_NODE=$(sed -n 's/^export const OPENCODE_AGENT_NODE_VERSION = "\([^"]*\)";$/\1/p' "$PAIR_SRC" 2>/dev/null)
+# The constants are derived (= PAIRED_AGENT_*_VERSION), so a literal sed reads
+# nothing; evaluate the module instead. Still fail-closed below.
+SRC_NETWORK=$(bun -e "import { OPENCODE_AGENT_NETWORK_VERSION as v } from '$PAIR_SRC'; console.log(v)" 2>/dev/null || true)
+SRC_NODE=$(bun -e "import { OPENCODE_AGENT_NODE_VERSION as v } from '$PAIR_SRC'; console.log(v)" 2>/dev/null || true)
 EXPECTED_NETWORK="${AGENT_NETWORK_VERSION_UNDER_TEST:-${SRC_NETWORK}}"
 EXPECTED_NODE="${AGENT_NODE_VERSION_UNDER_TEST:-${SRC_NODE}}"
 [ -n "$EXPECTED_NETWORK" ] || { echo "FAIL: cannot resolve expected agent-network version" >&2; exit 1; }
@@ -488,7 +490,7 @@ echo "PASS: ordinary pre-planted dotenv/auth/invalid config were atomically rese
 
 CURRENT_LAYER="L1.6 exact auth-login isolation + atomic import"
 echo
-echo "## L1.6 — exact 1.18.34 auth-login uses a disposable root and imports only validated API auth"
+echo "## L1.6 — exact 1.18.35 auth-login uses a disposable root and imports only validated API auth"
 
 # A credential-writing command must not let resolveNodeRef's legacy raw path
 # lookup escape .anet/nodes. The outside profile is intentionally valid enough
@@ -525,7 +527,7 @@ ln -s "$AUTH_ESCAPE/state" "$REGULAR_NODE/.local/state/opencode"
 ln -s "$AUTH_ESCAPE/runtime" "$REGULAR_NODE/.runtime/persistent-escape-canary"
 ln -s "$AUTH_ESCAPE/tmp" "$REGULAR_NODE/.tmp/persistent-escape-canary"
 
-# Put the real 1.18.34 project-discovery exploit fixture in place before the
+# Put the real 1.18.35 project-discovery exploit fixture in place before the
 # first interactive prompt. The pexpect driver checks the marker immediately
 # after the prompt is rendered and once more after the helper exits.
 plant_hostile_ancestor_config
@@ -768,7 +770,7 @@ mv "$PROFILE_TMP" "$OPENAI_NODE/config.json"
 chmod 600 "$OPENAI_NODE/config.json"
 rm -f -- "$PROFILE_STALE_MARKER"
 
-# Exact 1.18.34 writes databases/logs below XDG_DATA_HOME and follows planted
+# Exact 1.18.35 writes databases/logs below XDG_DATA_HOME and follows planted
 # descendants. Plant both known escape shapes in the persistent node tree;
 # the runtime must use a fresh launch data root and leave this outside target
 # completely empty through fake and real ACP turns.
@@ -861,9 +863,9 @@ grep -Eqi 'ancestor discovery candidate|safe workspace|refuses' \
   "$ROOT/node-safe-base-candidate.log"
 echo "PASS: candidate in trusted-base ancestor chain hard-failed before OpenCode ACP spawn; transient roots=0"
 
-CURRENT_LAYER="L6 exact 1.18.34 ancestor config/plugin isolation + real replied task"
+CURRENT_LAYER="L6 exact 1.18.35 ancestor config/plugin isolation + real replied task"
 echo
-echo "## L6 — exact 1.18.34 real task ignores malicious ancestor config/plugin"
+echo "## L6 — exact 1.18.35 real task ignores malicious ancestor config/plugin"
 clear_opencode_session "$OPENAI_NODE"
 [[ "$(opencode --version | tr -d '\r\n')" == "$EXPECTED_OPENCODE" ]]
 jq -e --arg model "$FREE_MODEL" '.model == $model' \

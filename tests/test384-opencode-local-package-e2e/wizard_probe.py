@@ -15,14 +15,19 @@ import pexpect
 
 
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+# Rendered order must match createRuntimeChoices() in agent-network/bin/cli.ts
+# (grok-build-cli is deliberately last since the 2026-09-25 owner decision).
 RUNTIMES = [
     "claude-agent-sdk",
     "claude-code-cli",
     "codex-sdk",
-    "codex-app-server",
+    # Since #1139 the codex-app-server row renders under the display label
+    # "codex-cli — Codex 共存 TUI…" (value is still codex-app-server); the
+    # menu text no longer contains the raw value string.
+    "codex-cli",
     "grok-build-acp",
-    "grok-build-cli",
     "opencode-cli",
+    "grok-build-cli",
 ]
 PRESETS = ["Anthropic 原生 API", "OpenAI"]
 

@@ -42,7 +42,8 @@ describe("supported-versions table", () => {
   test("agent-node's historical pin constant is the table's v1 pin", () => {
     expect(OPENCODE_DEFAULT_PIN).toBe(OPENCODE_V1_PIN);
     expect(isAcceptedOpencodeVersionFor("v1", OPENCODE_V1_PIN)).toBe(true);
-    expect(isAcceptedOpencodeVersionFor("v1", "1.18.1")).toBe(true); // #541 transition window
+    expect(isAcceptedOpencodeVersionFor("v1", "1.18.34")).toBe(true); // transition window
+    expect(isAcceptedOpencodeVersionFor("v1", "1.18.1")).toBe(false); // previous window dropped
     expect(isAcceptedOpencodeVersionFor("v1", "1.18.2")).toBe(false);
     expect(isAcceptedOpencodeVersionFor("v1", "2.0.22")).toBe(false);
   });

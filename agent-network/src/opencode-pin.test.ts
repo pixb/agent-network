@@ -27,8 +27,8 @@ beforeEach(() => {
 });
 
 describe("opencode-pin — built-in fallback", () => {
-  test("release builtin pin is the revalidated opencode-ai@1.18.34", () => {
-    expect(OPENCODE_BUILTIN_PIN).toBe("1.18.34");
+  test("release builtin pin is the revalidated opencode-ai@1.18.35", () => {
+    expect(OPENCODE_BUILTIN_PIN).toBe("1.18.35");
   });
 
   test("returns the built-in constant when no override file exists", () => {
@@ -42,9 +42,9 @@ describe("opencode-pin — built-in fallback", () => {
     const detail = "opencode package identity/version check failed: no trusted package on PATH";
     const hint = formatOpencodePackageIdentityFailure(OPENCODE_BUILTIN_PIN, detail);
     expect(hint).toContain(detail);
-    expect(hint).toContain("Expected trusted opencode-ai@1.18.34");
-    expect(hint).toContain("npm install -g opencode-ai@1.18.34");
-    expect(opencodeExactInstallCommand()).toBe("npm install -g opencode-ai@1.18.34");
+    expect(hint).toContain("Expected trusted opencode-ai@1.18.35");
+    expect(hint).toContain("npm install -g opencode-ai@1.18.35");
+    expect(opencodeExactInstallCommand()).toBe("npm install -g opencode-ai@1.18.35");
   });
 });
 
@@ -57,10 +57,10 @@ describe("opencode-pin — override file write + read round-trip", () => {
     expect(pin.smokePassedAt).toBe("2026-07-04T00:00:00.000Z");
   });
 
-  test("an override left by `upgrade-pin 1.18.1` (previous pin) yields to the new built-in pin", () => {
-    writePinOverride("1.18.1", "2026-07-16T00:00:00.000Z", "smoke: initialize + session/new", fakeHome);
+  test("an override left by `upgrade-pin 1.18.34` (previous pin) yields to the new built-in pin", () => {
+    writePinOverride("1.18.34", "2026-07-16T00:00:00.000Z", "smoke: initialize + session/new", fakeHome);
     const pin = readEffectivePin(fakeHome);
-    expect(pin.version).toBe("1.18.34");
+    expect(pin.version).toBe("1.18.35");
     expect(pin.source).toBe("builtin");
   });
 
@@ -107,19 +107,20 @@ describe("opencode-pin — validation refuses malformed / unvalidated overrides"
   });
 });
 
-describe("opencode-pin — 1.18.1 → 1.18.34 transition (#541)", () => {
+describe("opencode-pin — 1.18.34 → 1.18.35 transition", () => {
   test("accepted versions: release pin first, then the previous pin; nothing else", () => {
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.1"]);
-    expect(acceptedOpencodeVersions()).toEqual(["1.18.34", "1.18.1"]);
-    expect(acceptedOpencodeVersions("1.18.1")).toEqual(["1.18.1"]);
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.34"]);
+    expect(acceptedOpencodeVersions()).toEqual(["1.18.35", "1.18.34"]);
+    expect(acceptedOpencodeVersions("1.18.34")).toEqual(["1.18.34"]);
   });
 
   test("legacy note is one line naming the found version and the upgrade command", () => {
-    expect(opencodeLegacyPinNote("1.18.34")).toBeNull();
+    expect(opencodeLegacyPinNote("1.18.35")).toBeNull();
     expect(opencodeLegacyPinNote("1.18.2")).toBeNull();
-    const note = opencodeLegacyPinNote("1.18.1")!;
-    expect(note).toContain("opencode-ai@1.18.1");
-    expect(note).toContain("anet opencode upgrade-pin 1.18.34");
+    expect(opencodeLegacyPinNote("1.18.1")).toBeNull();
+    const note = opencodeLegacyPinNote("1.18.34")!;
+    expect(note).toContain("opencode-ai@1.18.34");
+    expect(note).toContain("anet opencode upgrade-pin 1.18.35");
     expect(note).not.toContain("\n");
   });
 
