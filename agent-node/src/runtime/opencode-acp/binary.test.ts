@@ -356,41 +356,41 @@ describe("resolvePinnedOpencodeBinary", () => {
   });
 });
 
-// Board #541 — the release pin moved 1.18.34 → 1.18.35. A host still holding
+// Board #541 — the release pin moved 1.18.35 → 1.19.0. A host still holding
 // the previous exact install must keep starting (with an upgrade note) for one
 // transition window; anything else stays rejected.
 describe("opencode pin transition", () => {
-  test("release pin is opencode-ai@1.18.35; 1.18.34 is the only transition version", () => {
-    expect(OPENCODE_DEFAULT_PIN).toBe("1.18.35");
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.34"]);
-    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.18.35", "1.18.34"]);
+  test("release pin is opencode-ai@1.19.0; 1.18.35 is the only transition version", () => {
+    expect(OPENCODE_DEFAULT_PIN).toBe("1.19.0");
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.35"]);
+    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.0", "1.18.35"]);
+    expect(isAcceptedOpencodeVersion("1.19.0")).toBe(true);
     expect(isAcceptedOpencodeVersion("1.18.35")).toBe(true);
-    expect(isAcceptedOpencodeVersion("1.18.34")).toBe(true);
     for (const v of ["1.18.1", "1.18.2", "1.18.33", "1.18.36", "2.0.22", ""]) {
       expect(isAcceptedOpencodeVersion(v)).toBe(false);
     }
   });
 
   test("transition note names the found version and the exact upgrade command", () => {
-    expect(opencodeTransitionNote("1.18.35")).toBeNull();
+    expect(opencodeTransitionNote("1.19.0")).toBeNull();
     expect(opencodeTransitionNote("1.18.2")).toBeNull();
-    const note = opencodeTransitionNote("1.18.34")!;
-    expect(note).toContain("opencode-ai@1.18.34");
-    expect(note).toContain("anet opencode upgrade-pin 1.18.35");
+    const note = opencodeTransitionNote("1.18.35")!;
+    expect(note).toContain("opencode-ai@1.18.35");
+    expect(note).toContain("anet opencode upgrade-pin 1.19.0");
     expect(note).not.toContain("\n");
   });
 
   test("launcher-selected transition version is admitted and revalidates without an explicit version", () => {
     const root = makeTrustedRoot("opencode-bin-transition");
     try {
-      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.18.34" });
+      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.18.35" });
       const attestation = resolvePinnedOpencodeBinaryAttestation({
         requestedBinary: fixture.binary,
-        expectedVersion: "1.18.34",
+        expectedVersion: "1.18.35",
         probeEnv: process.env,
       });
-      expect(attestation.expectedVersion).toBe("1.18.34");
-      expect(revalidatePinnedOpencodeBinary(attestation, { expectedVersion: "1.18.34" })).toBe(fixture.binary);
+      expect(attestation.expectedVersion).toBe("1.18.35");
+      expect(revalidatePinnedOpencodeBinary(attestation, { expectedVersion: "1.18.35" })).toBe(fixture.binary);
       expect(revalidatePinnedOpencodeBinary(attestation)).toBe(fixture.binary);
       expect(() => revalidatePinnedOpencodeBinary(attestation, { expectedVersion: PIN }))
         .toThrow("attestation version changed");
@@ -403,12 +403,12 @@ describe("opencode pin transition", () => {
     const legacyRoot = makeTrustedRoot("opencode-bin-default-legacy");
     const currentRoot = makeTrustedRoot("opencode-bin-default-current");
     try {
-      const legacy = packageStub(legacyRoot, "opencode-ai", { manifestVersion: "1.18.34" });
+      const legacy = packageStub(legacyRoot, "opencode-ai", { manifestVersion: "1.18.35" });
       const legacyOnly = resolvePinnedOpencodeBinaryAttestation({
         searchPath: pathShim(legacyRoot, legacy.binary),
         probeEnv: process.env,
       });
-      expect(legacyOnly.expectedVersion).toBe("1.18.34");
+      expect(legacyOnly.expectedVersion).toBe("1.18.35");
       expect(legacyOnly.binary).toBe(legacy.binary);
       expect(revalidatePinnedOpencodeBinary(legacyOnly)).toBe(legacy.binary);
 
@@ -438,15 +438,15 @@ describe("opencode pin transition", () => {
     }
   });
 
-  test("a package whose manifest says 1.18.34 but reports another version is rejected", () => {
+  test("a package whose manifest says 1.18.35 but reports another version is rejected", () => {
     const root = makeTrustedRoot("opencode-bin-transition-lie");
     try {
-      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.18.34", reportedVersion: "1.18.2" });
+      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.18.35", reportedVersion: "1.18.2" });
       expect(() => resolvePinnedOpencodeBinary({
         requestedBinary: fixture.binary,
-        expectedVersion: "1.18.34",
+        expectedVersion: "1.18.35",
         probeEnv: process.env,
-      })).toThrow("expected opencode-ai@1.18.34; resolved binary reports 1.18.2");
+      })).toThrow("expected opencode-ai@1.18.35; resolved binary reports 1.18.2");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

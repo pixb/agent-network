@@ -16,7 +16,7 @@ def send(value: object) -> None:
 
 
 if "--version" in sys.argv:
-    print("1.18.35")
+    print("1.19.0")
     raise SystemExit(0)
 
 if sys.argv[1:] != ["acp"]:

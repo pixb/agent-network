@@ -453,7 +453,7 @@ export function resolvePinnedOpencodeBinaryAttestation(
   } catch (error: any) {
     throw new Error(`opencode version probe failed: ${error?.message || error}`);
   }
-  // V1 prints a bare semver ("1.18.34"); V2 prints "opencode v2.0.22".
+  // V1 prints a bare semver ("1.18.35"); V2 prints "opencode v2.0.22".
   const found = raw.match(/(\d+\.\d+\.\d+)/)?.[1] ?? raw;
   if (found !== expectedVersion) {
     throw new Error(`expected ${packageName}@${expectedVersion}; resolved binary reports ${found || "no version"}`);

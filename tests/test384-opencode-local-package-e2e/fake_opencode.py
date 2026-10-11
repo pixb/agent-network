@@ -30,7 +30,7 @@ def send(value: object) -> None:
 
 def main() -> int:
     if "--version" in sys.argv:
-        print("1.18.35")
+        print("1.19.0")
         return 0
     if len(sys.argv) < 2 or sys.argv[1] != "acp":
         print("fake-opencode only implements --version and acp", file=sys.stderr)

@@ -1,0 +1,58 @@
+# OpenCode V1 pin 1.18.35 → 1.19.0 —— Docker 验证报告
+
+- date: 2026-10-11
+- branch: pixb (worktree dirty → commit <filled by commit msg>)
+- 源码审计: anomalyco/opencode v1.18.35...v1.19.0 (31 commits / 138 files)
+  - 五接口面 0 变更；真实变更 = ①`opencode upgrade --major`（OpenCode 2 引导，含 installation/index.ts、TUI dialog-update）②PTY connect 的 origin/ticket 校验前置（防存在性探测，两个 handler）③更新检查改"只提示不自动装"（config.ts autoupdate 语义/描述）
+  - npm tarball opencode-ai@1.19.0 身份核验: name=opencode-ai, bin={"opencode":"./bin/opencode.exe"} —— 与身份门硬编码一致
+  - packages/opencode/package.json 仅 version 行变更，bin 布局未动
+  - 符合 #541 审计标准 → pin accepted
+- 决策: OPENCODE_V1_PIN=1.19.0；acceptedVersions=[1.19.0, 1.18.35]；1.18.34 出窗（现为拒绝版本）
+- 改动镜像: agent-network/src/opencode-versions.ts ≡ agent-node/src/runtime/opencode-versions.ts（cp 字节一致，cmp 验证）
+
+## 一、套件结果矩阵
+
+| 套件 | 结果 | 备注 |
+|---|---|---|
+| test386-opencode-agent-node-gate | **PASS (rc=0)** | 零腐化修复直接全绿；含 pin 四组合端到端（见下） |
+| test1225-opencode-copresence-onecommand | **PASS** | |
+| test610-opencode-clean-test-workspace | **PASS** | |
+| test621-test384-layer-isolation | **PASS** | |
+| test228-opencode-inbox-concurrency | **PASS** | --build-arg TEST228_SOURCE_COMMIT=$(git rev-parse HEAD) |
+| test230-opencode-sender-label | **PASS** | --build-arg TEST230_SOURCE_COMMIT |
+| test725-agent-node-unit-ci | **PASS** | --build-arg SOURCE_COMMIT |
+| test745-agent-network-unit-ci | **PASS** | --build-arg SOURCE_COMMIT |
+| test-rfc029-pr3-preset | **PASS** | |
+| test384-opencode-local-package-e2e | L1–L5.5 全 PASS；L6 既有环境腐化 | L6 真实 Zen 免费档匿名回复需凭证（与 11835 轮同位置、同定性） |
+| test227-opencode-tui-copresence | 33 pass / 2 fail（既有） | board656 + undici(Node-only)，与 11835 轮基线逐条一致 |
+| test-rfc029-pr1-registration | S1–S3 PASS；S4 既有 | S4 `grep "runtime: opencode-cli"` 与现实日志 `runtime: opencode (input: opencode-cli)` 漂移，11835 轮基线同红 |
+| test-rfc029-pr2-acp-shim | FAIL（既有） | S-happy/S-thinking/S-load-fails（board656），与 11835 轮基线一致 |
+| test-rfc029-pr4-kernel-live | 未跑（既有腐化） | 与 test384 L6 同类：真实免费档回复需 Zen 凭证，匿名不可达 |
+
+本地单测：agent-network 全量 exit=0 全绿（上轮 4 个环境 flake 本轮未触发）；agent-node 2726 pass / 4 fail —— 4 个失败（grok setpriv、codex CLI、#1957 attach-tui tmux、undici Node-only）与上轮基线完全一致，pin 滚动零新增失败。
+
+## 二、pin 行为验证（test386，Docker 内，真实 opencode-ai@1.19.0）
+
+- `release pin opencode-ai@1.19.0 starts without a transition note` ✓
+- `previous pin opencode-ai@1.18.35 still starts, hands 1.18.35 to agent-node, prints the upgrade note` ✓
+- `unvetted opencode-ai@1.18.2 is refused with the release-pin install command` ✓
+- `non-root uid=gid=1000 umask-0002 real opencode-ai@1.19.0 passes network and agent-node gates` ✓
+- 配对门全套：exact agent-node@2.5.0-preview.127 / 项目内同版本负载跳过 / 显式项目内 agent-node 拒绝 / ANET_AGENT_NODE_BIN 拒绝 / capable-looking preview.21 拒绝 / 无 exact global 拒绝且不执行 npx ✓
+- test386 内嵌单测（agent-network transition 家族 + release bundle build + typecheck）全绿 ✓
+
+## 三、滚动面（1.18.35 → 1.19.0 两步替换：先 pin 后过渡）
+
+- 源码: 两份 opencode-versions.ts（pin+accepted）、opencode-pin.test.ts、opencode-package-binary.test.ts、binary.test.ts（transition describe）、binary.ts/runtime.test.ts/backend.test.ts/v1-spawn-snapshot.test.ts/runtime-readiness.test.ts/copresence runtime.test.ts（fake 版本字面量）、cli.ts 注释、smoke fixture py
+- 套件: test386 全家（Dockerfile/run.sh/bin/opencode/nonroot-real-package.ts/opencode-package.json/project-bin/README）、test384 全家、test227（Dockerfile/harness）、pr1/pr2/pr3/pr4 相关文件
+- 文档: runbook opencode-tui-copresence.md（代际表、idle 语义、#541 链路史、五面比对史追加 1.18.35→1.19.0 一条、部署前置）
+- 有意保留 1.18.34/1.18.35: provider-error.test.ts（真实错误形状取证）、free-tier.ts 注释（历史）、copresence runtime.test.ts 历史观察注释、release-*.md 与 11835 报告（历史存档）
+
+## 四、本轮修的既有腐化（挡路级）
+
+1. `tests/test-rfc029-pr1-registration/run.sh:159`: 转义正则 `1\.18\.35` 漏网未滚成 `1\.19\.0`（上轮同类问题：双反斜杠替换形态打不中文件里的单反斜杠）—— 本轮手工修复。S3 恢复 PASS。
+
+## 五、结论
+
+- 五面 0 变更 + npm 包 bin 身份不变 → 标准 #541 pin bump，deny 列表可沿用（runbook 五面比对史已记录）
+- 核心矩阵 9 套全绿（含 test386 pin 四组合 rc=0）；3 套既有失败与 11835 轮基线逐条一致，均与 pin 无关
+- 可合入

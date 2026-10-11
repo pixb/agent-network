@@ -3,7 +3,7 @@ set -eu
 
 : > /tmp/test384/project-local-opencode-was-executed
 if [ "${1:-}" = "--version" ]; then
-  printf '%s\n' '1.18.35'
+  printf '%s\n' '1.19.0'
   exit 0
 fi
 exit 93

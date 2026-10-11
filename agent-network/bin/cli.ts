@@ -3696,7 +3696,7 @@ function checkOpencodePin():
       hint: formatOpencodePackageIdentityFailure(effective.version, failure),
     };
   }
-  // opencode --version prints just the semver (e.g. "1.18.34"). Match
+  // opencode --version prints just the semver (e.g. "1.18.35"). Match
   // the first x.y.z substring so future format tweaks (build metadata
   // suffix) don't break the pin check.
   const m = raw.match(/(\d+\.\d+\.\d+)/);

@@ -43,7 +43,7 @@ if (command === "serve") {
     if (req.headers.authorization !== expectedAuth) { res.writeHead(401); return res.end("unauthorized"); }
     const body = await new Promise((resolve) => { let s=""; req.on("data", c => s+=c); req.on("end", () => resolve(s)); });
     const json = body ? JSON.parse(body) : {};
-    if (req.url === "/global/health") return send(res, { healthy:true, version:"1.18.34" });
+    if (req.url === "/global/health") return send(res, { healthy:true, version:"1.19.0" });
     if (req.url === "/session/status") return send(res, statuses);
     if (req.url === "/session" && req.method === "POST") {
       const id = "ses_test123";
@@ -185,7 +185,7 @@ if (command === "serve") {
     for (const part of value.parts || []) console.log(JSON.stringify({type:"text",part}));
   }).catch(e => { console.error(e.message); process.exitCode=1; });
 } else if (args.includes("--version") || command === "--version") {
-  console.log("1.18.34");
+  console.log("1.19.0");
 } else {
   console.error("unsupported fake command", args.join(" "));
   process.exit(2);

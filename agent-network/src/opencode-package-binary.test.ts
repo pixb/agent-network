@@ -53,7 +53,7 @@ function makePackage(parent: string, overrides: Record<string, unknown> = {}): {
   writeFileSync(packageJson, JSON.stringify({
     name: "opencode-ai",
     version: PIN,
-    // The 1.18.34/1.18.35 tarballs spell this with `./`; registry metadata may display
+    // The 1.18.35/1.19.0 tarballs spell this with `./`; registry metadata may display
     // the normalized form. The verifier accepts only these equivalent bytes.
     bin: { opencode: "./bin/opencode.exe" },
     ...overrides,
@@ -280,7 +280,7 @@ describe("#1845 platform gate", () => {
   });
 });
 
-// Board #541 — pin moved 1.18.34 → 1.18.35; the previous exact install keeps
+// Board #541 — pin moved 1.18.35 → 1.19.0; the previous exact install keeps
 // resolving for one transition window, the release pin wins when both exist,
 // and every other version is still refused with release-pin diagnostics.
 describe("resolveAcceptedOpencodePackageBinaryFromPath (transition window)", () => {
@@ -292,17 +292,17 @@ describe("resolveAcceptedOpencodePackageBinaryFromPath (transition window)", () 
     return { ...pkg, bin };
   }
 
-  test("a host still on the previous pin 1.18.34 resolves and reports 1.18.34", () => {
+  test("a host still on the previous pin 1.18.35 resolves and reports 1.18.35", () => {
     const base = safeTestBase();
-    const legacy = globalInstall(base, "legacy", "1.18.34");
+    const legacy = globalInstall(base, "legacy", "1.18.35");
     expect(resolveAcceptedOpencodePackageBinaryFromPath(legacy.bin, {
       acceptedVersions: acceptedOpencodeVersions(),
-    })).toEqual({ binary: legacy.binary, version: "1.18.34" });
+    })).toEqual({ binary: legacy.binary, version: "1.18.35" });
   });
 
   test("the release pin wins even when the transition version is earlier on PATH", () => {
     const base = safeTestBase();
-    const legacy = globalInstall(base, "legacy", "1.18.34");
+    const legacy = globalInstall(base, "legacy", "1.18.35");
     const current = globalInstall(base, "current", PIN);
     expect(resolveAcceptedOpencodePackageBinaryFromPath(`${legacy.bin}:${current.bin}`, {
       acceptedVersions: acceptedOpencodeVersions(),
@@ -321,7 +321,7 @@ describe("resolveAcceptedOpencodePackageBinaryFromPath (transition window)", () 
     const base = safeTestBase();
     const project = join(base, "project");
     mkdirSync(project, { mode: 0o700 });
-    const local = globalInstall(project, "payload", "1.18.34");
+    const local = globalInstall(project, "payload", "1.18.35");
     expect(() => resolveAcceptedOpencodePackageBinaryFromPath(local.bin, {
       acceptedVersions: acceptedOpencodeVersions(),
       forbiddenRoots: [project],

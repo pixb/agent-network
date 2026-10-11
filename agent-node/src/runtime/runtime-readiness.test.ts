@@ -189,7 +189,7 @@ describe("#622 probeRuntimeReadiness —— 状态判定", () => {
   });
 
   test("V1 Zen failure and missing OpenCode CLI remain blocking", async () => {
-    const v1 = deps({ bins: { opencode: OK("1.18.34") }, net: { "opencode.ai": "unreachable" } });
+    const v1 = deps({ bins: { opencode: OK("1.18.35") }, net: { "opencode.ai": "unreachable" } });
     expect((await probeRuntimeReadiness(["opencode-cli"], v1))["opencode-cli"].state).toBe("no_network");
     expect(v1.calls.head).toEqual(["https://opencode.ai"]);
     const missing = deps();
