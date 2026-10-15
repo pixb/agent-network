@@ -359,6 +359,59 @@ describe("buildOpencodeChildEnv — deny-by-default boundary", () => {
     }
   });
 
+  describe("Zen free-tier model catalog seeding", () => {
+    test("seeds models.json from the operator cache so free models work on a cold launch root", () => {
+      const workDir = mkdtempSync(join(tmpdir(), "opencode-seed-catalog-"));
+      const launchBase = makeLaunchBase("seed-catalog");
+      const fakeHome = mkdtempSync(join(tmpdir(), "opencode-seed-home-"));
+      const prevHome = process.env.HOME;
+      let env: NodeJS.ProcessEnv | undefined;
+      try {
+        const sourceDir = join(fakeHome, ".cache", "opencode");
+        mkdirSync(sourceDir, { recursive: true });
+        const catalog = JSON.stringify({
+          provider: { opencode: { models: { "mimo-v2.6-flash-free": { name: "Zen Flash (free)" } } } },
+        });
+        writeFileSync(join(sourceDir, "models.json"), catalog, { mode: 0o600 });
+        process.env.HOME = fakeHome;
+        env = buildOpencodeChildEnv({ workDir, cwd: workDir, unsafeTools: true, launchBase });
+        const seeded = join(env.XDG_CACHE_HOME!, "opencode", "models.json");
+        expect(existsSync(seeded)).toBe(true);
+        expect(readFileSync(seeded, "utf8")).toBe(catalog);
+        // Seeded as a private, owner-controlled file inside the launch root.
+        expect(lstatSync(seeded).mode & 0o777).toBe(0o600);
+        expect(lstatSync(seeded).uid).toBe(process.getuid!());
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (env) cleanupOpencodeChildEnv(workDir, env);
+        rmSync(launchBase, { recursive: true, force: true });
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(fakeHome, { recursive: true, force: true });
+      }
+    });
+
+    test("skips seeding (best-effort) when the operator has no cached catalog", () => {
+      const workDir = mkdtempSync(join(tmpdir(), "opencode-seed-miss-"));
+      const launchBase = makeLaunchBase("seed-miss");
+      const fakeHome = mkdtempSync(join(tmpdir(), "opencode-seed-empty-home-"));
+      const prevHome = process.env.HOME;
+      let env: NodeJS.ProcessEnv | undefined;
+      try {
+        process.env.HOME = fakeHome; // no .cache/opencode/models.json
+        env = buildOpencodeChildEnv({ workDir, cwd: workDir, unsafeTools: true, launchBase });
+        expect(existsSync(join(env.XDG_CACHE_HOME!, "opencode", "models.json"))).toBe(false);
+      } finally {
+        if (prevHome === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome;
+        if (env) cleanupOpencodeChildEnv(workDir, env);
+        rmSync(launchBase, { recursive: true, force: true });
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(fakeHome, { recursive: true, force: true });
+      }
+    });
+  });
+
   test("detects exact managed config sources across Linux, Windows, and macOS", () => {
     const fixture = mkdtempSync(join(tmpdir(), "opencode-managed-config-"));
     try {
