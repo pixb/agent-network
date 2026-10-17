@@ -246,12 +246,15 @@ export function streamVerdict(id: NodeIdentity, target: AgentRef | "network"): V
 // ── MCP:每个工具归一类(test 钉住「每个注册的工具都归了类」,新工具忘了归类会红) ──
 export type ToolClass = "always" | "read" | "dispatch" | "broadcast" | "requirements" | "schedule" | "node_write" | "human_only";
 export const NODE_TOOL_CLASS: Readonly<Record<string, ToolClass>> = {
+  daemon_provider_snapshot: "human_only",
+  pull_daemon_provider_snapshots: "always", ack_daemon_provider_snapshot: "always",
   // 回复 / 上报 / 自己的收件箱 / 生命周期协议(节点自己的请求)—— 任何模式都能做
   report_status: "always", report_completion: "always", get_inbox: "always", ack_inbox: "always",
   mark_tasks_runtime_submitted: "always", mark_tasks_consumed: "always", send_reply: "always", send_peer_reply: "always", send_ack: "always",
   get_config_update: "always", ack_config_update: "always", get_rules_file_request: "always", ack_rules_file_request: "always", get_rules_file_result: "always",
   get_create_request: "always", ack_create_request: "always", get_stop_request: "always", ack_stop_request: "always",
   get_start_request: "always", ack_start_request: "always", get_probe_request: "always", ack_probe_request: "always",
+  get_opencode_catalog_request: "always", ack_opencode_catalog: "always",
   list_my_pending_create_requests: "always", list_my_pending_lifecycle_requests: "always", list_my_children: "always",
   request_adopt_node: "human_only", unadopt_node: "human_only",
   get_adopt_request: "always", ack_adopt_request: "always",
@@ -273,9 +276,10 @@ export const NODE_TOOL_CLASS: Readonly<Record<string, ToolClass>> = {
   schedule_create: "schedule", schedule_update: "schedule", schedule_cancel: "schedule", schedule_run_now: "schedule",
   schedule_batch_interval: "schedule",
   // 写节点 / 技能 / 探测:只读、受限不行;正常由 RFC-036 等既有规则管
-  update_node_config: "node_write", write_node_rules_file: "node_write", restart_node: "node_write", create_node: "node_write",
+  update_node_config: "node_write", write_node_rules_file: "node_write", restart_node: "node_write", create_node: "node_write", clone_node: "node_write",
   stop_node: "node_write", delete_node: "node_write", start_node: "node_write", submit_skill: "node_write", probe_provider_model: "node_write",
   // 只有人能做
   upsert_network_secret: "human_only", upsert_provider: "human_only", update_provider: "human_only",
   projects_create: "human_only", projects_update: "human_only", review_skill: "human_only",
+  read_opencode_catalog: "human_only", get_opencode_catalog: "human_only",
 };

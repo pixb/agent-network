@@ -26,6 +26,19 @@ Returns `node_id`, `source` (`node` / `none`), `team {id,name}`, nearest-first `
 
 ## Complete tool index
 
+**Daemon Provider management (#906, development / not released)**
+
+| Tool | What it does |
+|------|------|
+| `daemon_provider_snapshot` | Network owner/admin requests scoped `refresh`, reads a request with `read`, saves a versioned Provider with `put`, or explicitly confirms single-node `apply`. Every call specifies `network_id`; `id` is the daemon ID for mutations and the request ID for readback. Secrets are never returned. |
+| `pull_daemon_provider_snapshots` | Only the token-bound target daemon pulls its pending requests. Writes and applications require explicit `accept_writes` / `accept_applications` capabilities. Internal protocol, not listed to models by default. |
+| `ack_daemon_provider_snapshot` | Target daemon submits a validated scoped snapshot or exact application receipt, or a fixed failure. Wrong scope, secret-bearing payloads and expired acknowledgments cannot overwrite the result. |
+
+An application receipt is distinct from a saved configuration. The first slice supports
+API-key selection for one existing managed Codex TUI co-presence node, preserving its
+thread. Official account switching is not implemented by this path. Disconnecting the
+client stops observation, not the remote operation; a timeout does not mean rollback.
+
 **Agent teams**
 
 | Tool | What it does |
@@ -112,11 +125,12 @@ against each other and a mismatch is rejected. You normally do not pass `network
 
 Node tokens only; people use the app or `/api/scheduled-tasks`. Permissions and quota: [Schedules](/en/guide/schedules#agent-managed).
 
-**Node lifecycle — driven by the `anet` CLI / Dashboard** · 6
+**Node lifecycle — driven by the `anet` CLI / Dashboard** · 7
 
 | Tool | What it does |
 |------|------|
 | `create_node` | Create and start a node on a host daemon |
+| `clone_node` | Clone an existing daemon child into a new node on that same daemon: new alias, new ntok_, source token not copied |
 | `delete_node` | Stop child, revoke ntok, delete the hub row (config backed up by default) |
 | `stop_node` | Stop the agent-node child, keep the config dir |
 | `start_node` | Start a stopped child node through its host daemon |
@@ -179,6 +193,15 @@ before controlling a process; a restored Hub row alone is insufficient.
 | `get_probe_request` | Daemon pulls a pending probe request |
 | `ack_probe_request` | Daemon reports a probe result (strict whitelist: exactly 4 fields, any extra one is `-32602`) |
 | `get_probe_results` | Query probe history, optionally filtered by provider/model/daemon |
+
+**OpenCode V2 catalog (network members)** · 4
+
+| Tool | What it does |
+|------|------|
+| `read_opencode_catalog` | Queue a native catalog read for one owned OpenCode V2 child. `ok` with `status: pending` means authorized and stored in memory. It is not a snapshot and does not mean a daemon received the doorbell. Does not start a server. Rejects url, authorization, directory, settings, headers, and body |
+| `get_opencode_catalog` | Poll that read. `pending` is not a snapshot. Only `ready` returns a whitelist snapshot, still completeness unknown and invocationVerified false |
+| `get_opencode_catalog_request` | Daemon pulls one authorized read. Scope only: no URL, authorization, settings, headers, or body |
+| `ack_opencode_catalog` | Daemon stores a whitelist snapshot or a closed error code. Extra fields are rejected. A stored failure is status failed, not a transport error |
 
 **Internal signals — called by agent-node** · 3
 

@@ -24,6 +24,57 @@ transport ignores AbortSignal. It rechecks connection after registry success;
 this is a startup observation, not a guarantee against future disconnects.
 Post-readiness reconnect/recovery remains the existing runtime lifecycle.
 
+## Native catalog snapshot (#2574 / #906)
+
+`agent-node/src/runtime/opencode-v2-catalog.ts` (`readOpenCodeCatalog` /
+`normalizeOpenCodeCatalog`) reads an already-owned authenticated loopback
+server: `/api/provider`, `/api/model`, `/api/model/default`, scoped by
+`directory`. It does not start or reload a server, read `auth.json`, send a
+prompt, or run a paid model probe. The normalized snapshot keeps public ids
+only (`invocationVerified: false`, `completeness: "unknown"`, including an
+empty snapshot).
+
+Merged on main in #2574. Not wired to daemon dispatch, Hub authorization,
+heartbeat, or client model selection. Caller-supplied scope labels do not
+authorize access. It is not a user command and was not in the published
+preview package measured on 2026-10-11 (`@sleep2agi/agent-network@2.3.0-preview.162`).
+Node create still copies this machine's `opencode.json`. It does not call
+this reader. Do not present snapshot counts as verified usable models.
+Evidence: `docs/tests/report-test906-native-catalog.txt`. Parent #906 / #901
+acceptance stays open.
+
+## V2 capability decision (#828)
+
+Decision recorded on 2026-10-09 for **`@opencode/cli@2.0.22` only**:
+retain the explicit unsafe-tools preview gate. Native deny experiments are
+not enough to offer an ANet default safe mode. They do not establish an OS
+sandbox, nor do they constrain code that runs before model-tool dispatch.
+
+| Capability | Observed evidence | Supported conclusion / limit |
+| --- | --- | --- |
+| Native shell/read/write/edit deny | Six configurations, 24 forced calls and six unauthenticated API refusals in [test828 policy](../tests/report-test828.txt) | Inline deny and project deny refused execution with unchanged/absent sentinels. Inline deny over project allow also refused. This is a pinned upstream experiment, not the product's safe preset. |
+| Rule ordering and V1 environment switches | The same policy probe | A later matching allow executes; V1 deny environment switches do not override V2 inline allow. Do not copy V1 policy or infer safety from a deny rule's presence alone. |
+| CommHub dispatch and receipt identity | [test828 MCP](../tests/report-test828-mcp.txt) | The controlled model called the real isolated Hub with the node's identity; sender spoofing was refused without a task write. The test used all-allow permissions and catalog discovery, not a selective safe policy or autonomous paid-model behavior. |
+| Cold first-turn MCP availability | [test832 main restack](../tests/report-test832-main-restack.txt) | Three cold starts at 0/1200/3500 ms passed dispatch, identity and receipt checks. Missing tools, authentication refusal and startup deadline stop before model usage. Startup readiness does not promise permanent availability. |
+| CLI lifecycle and generated observer cleanup | [test827 main restack](../tests/report-test827-main-restack.txt) and the stronger cleanup replay in [test832 main restack](../tests/report-test832-main-restack.txt) | Isolated Linux CLI/Hub/TUI start, receipt and stop were exercised. This does not accept native Windows/macOS clients, production rollout or complete backup restoration. |
+| Default safe mode / hostile tasks | Not established by these suites | **Unsupported for V2.** Keep refusing V2 without explicit unsafe-tools opt-in; do not default, inherit or auto-retry that consent. Use only trusted workspaces and tasks in the preview. |
+
+Before changing the last row, separately verify selective CommHub allow
+without local-tool escape, plugin/local MCP execution before permissions,
+user-global and managed configuration, agent-specific/saved permissions,
+reload/discovery overrides, and filesystem/network/process isolation. A
+passing identity test cannot stand in for any of these checks. Missing
+evidence keeps the existing gate closed; it is not permission to broaden it.
+
+The CLI/daemon/client entrypoints and signed client release have their own
+acceptance under #829 and #539. Daemon create now rejects an explicit
+generation whose installed `opencode --version` is not an accepted pin for
+that generation, and requires a native `provider/model` for V2. Provider
+presets and the signed client release remain separate. Package publication
+or a merged UI patch does not change this capability decision. The table
+consolidates existing evidence; it makes no new upstream-version or
+registry-availability claim.
+
 ## Restore, validate and roll back
 
 1. Restore the repository and an approved exact-main runtime release using the

@@ -1,3 +1,4 @@
+import { hostSupervisorIdentityRows } from "./host-supervisor-identity.js";
 import { buildServeErrorResponse } from "./serve-error.js";
 import { sanitizeRuntimeReadiness } from "./runtime-readiness.js";
 import { markGzipReusable, maybeGzipResponse, trimLightTask } from "./http-gzip";
@@ -32,6 +33,7 @@ import { expireStaleOpenTasks } from "./task-stale-open.js";
 import { flagOrphanTasks } from "./task-orphan.js";
 import { addAgentNetworkScope, addHumanNetworkScope, addNetworkScope, addOwnTrafficScope, addAgentTimelineScope, canRestWriteNetwork, canRestWriteNetworkAsHuman, getUserNetworkIds, resolveRestNetworkScope, resolveRestWriteNetworkId, singleNetworkId, type RestNetworkScope } from "./network-scope.js";
 import { lifecycleProjections, lifecycleRequestResponse } from "./node-lifecycle-read.js";
+import { listAdoptionCandidates, snapshotReportsAdoptionDiscovery } from "./adoption-candidates.js";
 import { restrictedMemberSeesFile, restrictedMemberAttachmentsDenied } from "./restricted-files.js";
 import { dmParticipantSeesFile, listDmThread, listDmThreads, sendHumanDm } from "./human-dm.js";
 import { groupMemberSeesFile, groupUnreadFor, listGroupMessages, listGroupThreads, markGroupRead, memberGroup, sendGroupMessage } from "./group-messages.js";
@@ -133,7 +135,11 @@ if (AUTH_TOKEN) {
 const MCP_LABEL_MAX_BYTES = 1024 * 1024;
 
 // Read version from package.json so banners and /health stay in sync.
+// ANET_EMBEDDED_COMMHUB_VERSION is set only by the standalone anet binary
+// (bin/anet-bin.ts). npm/bunx leaves it unset and keeps the disk read.
 const SERVER_VERSION = (() => {
+  const embedded = process.env.ANET_EMBEDDED_COMMHUB_VERSION?.trim() ?? "";
+  if (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(embedded)) return embedded;
   try {
     const url = new URL("../package.json", import.meta.url);
     return JSON.parse(require("fs").readFileSync(url, "utf8")).version || "?";
@@ -1455,6 +1461,30 @@ return Bun.serve({
       return withCors(req, Response.json({ ok: true, user: resolved.user, networks, current_network: resolved.networkId, credential }));
     }
 
+    // Separate route: older Hubs must return unsupported, not silently ignore
+    // avatar_url in their existing profile PUT and pretend that it was saved.
+    if (url.pathname === "/api/auth/me/avatar" && req.method === "PUT") {
+      const token = req.headers.get("Authorization")?.replace("Bearer ", "");
+      if (!token) return withCors(req, Response.json({ ok: false, error: "token required" }, { status: 401 }));
+      const resolved = resolveToken(token);
+      if (!resolved) return withCors(req, Response.json({ ok: false, error: "invalid token", ...(tokenRejection(token) ?? {}) }, { status: 401 }));
+      if (isNodeCredential(resolved)) return userTokenRequired(req);
+      let body: unknown;
+      try { body = await req.json(); } catch {
+        return withCors(req, Response.json({ ok: false, error: "invalid_json" }, { status: 400 }));
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)
+          || !Object.hasOwn(body, "avatar_url")
+          || Object.keys(body).some((key) => key !== "avatar_url")) {
+        return withCors(req, Response.json({ ok: false, error: "invalid_avatar_body", reason: "expected only avatar_url (string or null)" }, { status: 400 }));
+      }
+      const avatar = validateAvatarUrl((body as { avatar_url: unknown }).avatar_url);
+      if (!avatar.ok) return withCors(req, Response.json({ ok: false, error: "invalid_avatar_url", reason: avatar.reason }, { status: 400 }));
+      // No supplied target ID/alias; user identity comes exclusively from auth.
+      db.run("UPDATE users SET avatar_url = ?1, updated_at = datetime('now') WHERE user_id = ?2", [avatar.value, resolved.user.user_id]);
+      return withCors(req, Response.json({ ok: true, user_id: resolved.user.user_id, avatar_url: avatar.value }));
+    }
+
     if (url.pathname === "/api/auth/me" && req.method === "PUT") {
       const token = req.headers.get("Authorization")?.replace("Bearer ", "");
       if (!token) return withCors(req, Response.json({ ok: false, error: "token required" }, { status: 401 }));
@@ -1473,7 +1503,7 @@ return Bun.serve({
           db.run(`UPDATE users SET ${updates.join(", ")} WHERE user_id = ?${params.length}`, params);
         }
         // Re-fetch
-        const user = db.get<any>("SELECT user_id, username, display_name, email, role FROM users WHERE user_id = ?1", resolved.user.user_id);
+        const user = db.get<any>("SELECT user_id, username, display_name, avatar_url, email, role FROM users WHERE user_id = ?1", resolved.user.user_id);
         return withCors(req, Response.json({ ok: true, user }));
       } catch (e: any) {
         return withCors(req, Response.json({ ok: false, error: e.message }, { status: 400 }));
@@ -1491,7 +1521,7 @@ return Bun.serve({
         // #711 不带 keep_cli_tokens 的请求(旧 app、dashboard 代理)= 改密码前的行为:撤销全部不绑网络的令牌。
         // keep_cli_tokens 必须是布尔 true 才保留命令行 / 脚本令牌。
         const meta = resolved.tokenId ? getUserTokenMeta(resolved.user.user_id, resolved.tokenId) : null;
-        const result = changePassword(resolved.user.user_id, body.old_password, body.new_password, resolved.tokenId, { keepCliTokens: body.keep_cli_tokens === true });
+        const result = changePassword(resolved.user.user_id, body.old_password, body.new_password, resolved.tokenId, { keepCliTokens: body.keep_cli_tokens === true, revokeNetworkTokens: body.revoke_network_tokens === true });
         if (result.ok) {
           // 换发的新令牌沿用当前这条的种类和设备标识:anet passwd 换完仍是命令行令牌。
           const issued = issueUserToken(resolved.user.user_id, "password-change", { kind: meta?.kind, clientLabel: meta?.client_label, userAgent: meta?.user_agent });
@@ -2567,6 +2597,11 @@ return Bun.serve({
       if (!lifecycleUser) return withCors(req, Response.json({ ok: false, error: "user_token_required" }, { status: 403 }));
       return withCors(req, lifecycleRequestResponse(url, restScope));
     }
+    // Board #654: read-only hand-started adoption candidates. Not a binding.
+    if (url.pathname === "/api/adoption-candidates" && req.method === "GET") {
+      if (!lifecycleUser || !restAuth?.userId) return withCors(req, Response.json({ ok: false, error: "user_token_required" }, { status: 403 }));
+      return withCors(req, Response.json(listAdoptionCandidates(restScope, { userId: restAuth.userId, isAdmin })));
+    }
 
     const sideActor = resolveSideThreadActor(req, resolveRequestAuth(req, { allowQueryToken: false }), isAdmin);
     const nodeCommandActor = sideActor?.kind === "node" && sideActor.boundNodeId && sideActor.boundNetworkId
@@ -3638,9 +3673,7 @@ return Bun.serve({
       // TUI*) as that node. Same table, same token, one transport hardened and
       // its sibling not.
       //
-      // User tokens keep the previous behaviour: the Dashboard legitimately
-      // posts as its logged-in user, and tightening that is a separate change
-      // with its own compatibility surface.
+      // Human dispatches use the authenticated username on both transports.
       // The decision itself lives in rest-identity.ts as a pure function so the
       // shipped path and the tested path are the same code.
       const identity = resolveRestFromSession({
@@ -3661,7 +3694,11 @@ return Bun.serve({
       }
       const fromSession = identity.fromSession;
       const ttlSeconds = (body as any).ttl_seconds || 3600;
-      const fromNodeId = resolveRestNodeIdForAlias(fromSession, taskNetId);
+      const fromNodeId = restAuth && !requestToken(req).startsWith("ntok_")
+        ? null
+        : requestToken(req).startsWith("ntok_")
+          ? (identity.nodeId ?? null)
+          : resolveRestNodeIdForAlias(fromSession, taskNetId);
       const targetNodeId = target.session?.node_id ?? null;
       const actualTo = restActualTo(target, taskNetId);
       // #221 — fold top-level `attachments` into `meta.attachments` so
@@ -4538,31 +4575,10 @@ return Bun.serve({
         isPrivileged = true;
       }
 
-      // EXISTS subquery handles BOTH revoked_at SET and DELETEd token
-      // rows (revokeToken DELETEs the row in production — PR2 v1
-      // SHOULD-FIX per 通信龙 audit). EXISTS naturally dedupes daemons
-      // with rotated tokens.
-      const sqlRows = db.all<Record<string, any>>(`
-        SELECT
-          n.node_id, n.alias, n.hostname, n.network_id,
+      const sqlRows = hostSupervisorIdentityRows(`SELECT n.node_id, n.alias, n.hostname, n.network_id, n.owner_user_id,
           n.runtimes_supported, n.allowed_secret_keys,
-          n.created_at, n.updated_at,
-          s.last_seen_at AS session_last_seen,
-          s.cpu_cores AS session_cpu_cores,
-          s.mem_total_gb AS session_mem_total_gb,
-          s.ip AS session_ip,
-          n.config_snapshot
-        FROM nodes n
-        LEFT JOIN sessions s ON s.alias = n.alias AND (s.network_id = n.network_id OR s.network_id IS NULL)
-        WHERE n.network_id = ?1
-          AND EXISTS (
-            SELECT 1 FROM api_tokens t
-            WHERE t.network_id = n.network_id
-              AND t.name = 'node:' || n.alias
-              AND t.revoked_at IS NULL
-          )
-        ORDER BY n.updated_at DESC
-      `, effectiveNetId);
+          n.created_at, n.updated_at, n.config_snapshot
+        FROM nodes n WHERE n.network_id = ?1 ORDER BY n.updated_at DESC`, [effectiveNetId]);
 
       const nowMs = Date.now();
       // 心跳周期是 3 分钟（agent-node/src/cli.ts 的 report_status 定时器），
@@ -4589,6 +4605,7 @@ return Bun.serve({
           // upgraded past preview.55.
           let snapCanCreate: boolean | undefined;
           let snapAdoptCapable: boolean | undefined;
+          let snapAdoptionDiscovery = false;
           let snapBlockedReason: string | undefined;
           // #1545 —— 见 report_status schema 里 create_capability_observed_ms_ago 的注释:
           // 上报侧**故意收得宽**(无 int/min/max,免得一个诊断字段能让整份 report 被拒),
@@ -4603,6 +4620,7 @@ return Bun.serve({
               snapRole = typeof parsed?.role === "string" ? parsed.role : null;
               const caps = parsed?.daemon_capabilities;
               if (typeof caps?.adopt_capable === "boolean") snapAdoptCapable = caps.adopt_capable;
+              if (snapshotReportsAdoptionDiscovery(parsed)) snapAdoptionDiscovery = true;
               if (caps && typeof caps.can_create_nodes === "boolean") {
                 snapCanCreate = caps.can_create_nodes;
               }
@@ -4620,10 +4638,11 @@ return Bun.serve({
             } catch { /* malformed */ }
           }
           return { row: r, role: snapRole, canCreate: snapCanCreate, blockedReason: snapBlockedReason,
-            observedMsAgo: snapObservedMsAgo, readiness: snapReadiness, adoptCapable: snapAdoptCapable };
+            observedMsAgo: snapObservedMsAgo, readiness: snapReadiness, adoptCapable: snapAdoptCapable,
+            adoptionDiscovery: snapAdoptionDiscovery };
         })
         .filter(({ role }) => role === "host_supervisor")
-        .map(({ row: r, canCreate, blockedReason, observedMsAgo, readiness, adoptCapable }) => {
+        .map(({ row: r, canCreate, blockedReason, observedMsAgo, readiness, adoptCapable, adoptionDiscovery }) => {
           let online = false;
           let lastSeenAt: string | null = null;
           if (r.session_last_seen) {
@@ -4667,7 +4686,10 @@ return Bun.serve({
             // Do not reveal even the new capability for a node the user cannot read.
             const visibleParams: any[] = [r.node_id];
             const visibleSql = addAgentNetworkScope("SELECT node_id FROM nodes WHERE node_id=?1", visibleParams, restScope, { alias: "alias", nodeId: "node_id" });
-            if (db.get(visibleSql, ...visibleParams)) out.adopt_capable = adoptCapable;
+            if (db.get(visibleSql, ...visibleParams)) {
+              out.adopt_capable = adoptCapable;
+              if (adoptionDiscovery) out.adoption_discovery = true;
+            }
           }
           // #1353 Fix ② — only emit the two capability keys when the
           // daemon actually reported them. Undefined vs. false is a

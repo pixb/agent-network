@@ -8,7 +8,7 @@
      The latest stamp records the checked channel version; the preview stamp records the validated
      release candidate, not npm publication. Historical references (e.g. `<= 2.3.0-preview.37`) are not stamped. -->
 <!-- version-claim: package=agent-network channel=latest version=2.3.0-preview.76 -->
-<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.161 -->
+<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.180 -->
 
 From starting a Hub to chatting with your first agent in the Dashboard: **4 steps**, each with one command and one check.
 
@@ -60,7 +60,7 @@ The first `anet hub start` prints the admin credentials once:
    Store this password now; it will not be shown again.
 ```
 
-The checked `latest` (`2.3.0-preview.76`) and validated `preview` release candidate (`2.3.0-preview.161`) both print a random password: `anet-` followed by 22 hex characters.
+The checked `latest` (`2.3.0-preview.76`) prints a random password: `anet-` followed by 22 hex characters. Candidate `2.3.0-preview.180` has CLI default bootstrap code byte-identical to `.177` (previously also `.176`) (also unchanged from `.174` and the checked `.172`), so that behavior is preserved by source continuity. This installation gate uses an explicit password; the default path was not rerun separately. Publication requires all release gates to pass.
 **Candidate validation does not mean publication.** Run `npm view @sleep2agi/agent-network dist-tags` for the currently installable channel versions; do not treat the candidate number as the current npm `preview`.
 The fixed `admin / anethub` only exists on `2.2.x` and earlier; it will not log you in to a freshly installed Hub.
 
@@ -91,6 +91,8 @@ The wizard asks: runtime → (only for `claude-agent-sdk`) vendor → model → 
 The wizard **defaults to highlighting `claude-agent-sdk`**; pressing Enter all the way lands you on the vendor + API-key path. If you've already done `claude auth login`, **manually picking `claude-code-cli`** is the zero-config fastest path.
 
 `anet node create` lists all 7 runtimes (4 stable: `claude-agent-sdk` / `claude-code-cli` / `codex-sdk` / `grok-build-acp`; 3 preview: `codex-app-server` (shown as `codex-cli` in the menu) / `grok-build-cli` / `opencode-cli`); the full comparison is here: [Runtime comparison](/en/guide/runtimes#runtimes-—-canonical-table).
+
+OpenCode V2 is not an eighth runtime, and the wizard does not select it by default. It is still `opencode-cli`, it needs an explicit `--opencode-generation v2 --opencode-unsafe-tools`, and it only runs as co-presence. Maturity is still preview (npm `latest` does not have this create flag yet). Steps, Hub dialogue, and the model catalog that is not wired through yet: [OpenCode V2](/en/guide/opencode).
 :::
 
 Start the node:

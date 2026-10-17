@@ -232,6 +232,18 @@ missing is reported at start (the request ends as `runtime_capability_check_fail
 - Only valid for `codex-app-server`; the Hub rejects the key on any other runtime (`flag_not_applicable_to_runtime`).
 - An older Hub or daemon that does not know the key rejects the request (`flag_key_unknown`) instead of quietly creating a headless node.
 
+### Creating an OpenCode V2 co-presence node through the daemon {#opencode-v2-via-daemon}
+
+`runtime` stays `opencode-cli`. To create a V2 co-presence node, `create_node`'s `node_spec.flags` must include both `"opencodeGeneration": "v2"` and `"opencodeUnsafeTools": true`, and `model` must be OpenCode's own `provider/model` (exactly one slash):
+
+```json
+{"name": "oc-v2", "runtime": "opencode-cli", "model": "provider/model", "flags": {"opencodeGeneration": "v2", "opencodeUnsafeTools": true}}
+```
+
+This API does not take an anet provider preset; keys stay in the OpenCode config already on the target node. Before the daemon writes the child config, `opencode --version` on PATH must be the accepted `@opencode/cli@2.0.22`. An explicit `v1` must likewise match an accepted `opencode-ai` version (current pin `1.18.34`, transition `1.18.1`). A mismatch is `opencode_generation_mismatch`. Omitting `opencodeGeneration` still creates a legacy V1 node, even if the binary on the machine happens to be V2. A `--version` timeout is not rejected at this step.
+
+Readback: the daemon's config snapshot `flags` echo `opencodeGeneration`, `opencodeMode`, and `opencodeUnsafeTools` as read-only fields. `update_node_config` cannot change those three. `runtime_readiness` for `opencode-cli` may include `generation` and `accepted`. V2 `state` stays `unknown` (provider and login depend on the target node's own configuration). `accepted: false` means this 2.x is not the accepted pin, so an explicit create is refused.
+
 ### Task timeout: `flags.timeout` is in milliseconds {#create-node-timeout-ms}
 
 `create_node`'s `node_spec.flags.timeout` is in **milliseconds**: the daemon writes it into the child's config
@@ -439,7 +451,7 @@ a new stop automatically invalidates it. Failed starts and malformed/foreign evi
 Deploy the updated CLI and boot script together. Older scanners conservatively retain the stop. These
 files are local state: restoring a backup with changed file identity keeps the stop until an explicit start.
 Rollback does not automatically restart stopped nodes. Services, ports, secret sources and orchestration
-are unchanged; this does not implement board #659 B remote three-stage startup.
+are unchanged. Native layout remote start runs the trusted `anet node start` and acknowledges only after the new marker, three stages, and loopback listen match. `external-appserver` start stays refused. This does not prove the Codex version or rollout, and adopted restart stays refused.
 
 Deployment is an operator action, not performed by this PR. Record the current CLI version and the
 boot service's actual ExecStart path; back up its installed script and review drift against the repository.
@@ -457,7 +469,7 @@ Stop / Start for adopted nodes is available from agent-node ≥ `2.5.0-preview.1
 From commhub-server ≥ `0.9.0-preview.109`, the Hub answers a restart of an adopted node with `adopted_restart_requires_daemon`, asking you to Stop and then Start (`.108` and earlier have no such refusal).
 From the original workspace, run `anet daemon adopt <alias> --daemon <daemon-id>` to inspect the plan.
 `--yes` only requests adoption; wait for independent daemon verification and an active Hub binding.
-The daemon's `adopt_roots` defaults to empty (deny). Co-presence nodes are not supported.
+The daemon's `adopt_roots` defaults to empty (deny). Native Codex co-presence can be started remotely; `external-appserver` remote start stays refused.
 
 - Stop rechecks configuration, UID and `/proc` birth identity and signals only the verified process tree.
 - Successful stop writes `<nodeDir>/.hub-stopped`. `anet project up` and the repository boot sweep keep the node down without clearing its PID file.
@@ -496,7 +508,7 @@ that released-client compatibility replay has already passed.
 
 These additive fields and endpoint require a header user token (not a URL token) and the existing node
 visibility/network permissions. Daemon/network tokens gain no new read access;
-existing fields remain unchanged. This is not candidate discovery.
+existing fields remain unchanged. Those reads describe adoption and lifecycle requests that already exist; they are not candidate discovery. See [Adoption candidate discovery](#adoption-candidates).
 
 - `GET /api/nodes` adds `managed: "created" | "adopted" | "none"`, based on real
   creation records (precedence), active bindings, or neither—not ID prefixes or
@@ -532,6 +544,24 @@ Raw errors stay in the database, without leaking paths or host details to node r
 No new service, port, configuration or database migration. Use the existing
 upgrade/rollback procedures. Binding/request history comes from Hub database
 backups, not Git. No production deployment or new recovery drill is claimed.
+
+## Adoption candidate discovery (read-only) {#adoption-candidates}
+
+When a daemon is `adopt_capable`, its heartbeat may include hand-started nodes under `adopt_roots` that pass the existing v1 local identity checks. The list does not write a binding, signal a process, start, stop, or adopt. `launch_hint` (`bare` / `tmux` / `stopped` / `unverified`) is a local hint, not authority.
+
+Boundary versus adoption v2:
+
+- Co-presence nodes (codex three-stage, grok, opencode) are not candidates. Discovery does not enable the codex v2 identity check. Three-stage stop and start stay on the existing adoption path.
+- `managed` / `adoption` on `GET /api/nodes`, and `GET /api/node-lifecycle-requests`, still describe creation records and adoption or lifecycle requests that already exist.
+- Adopting still calls `request_adopt_node`. The daemon repeats the UID, path, config, and process checks. A reported workdir is not proof that those checks passed.
+
+`adopt_roots` defaults to empty. Until it is set, the daemon omits `adoption_candidates` and heartbeat behavior is unchanged.
+
+`GET /api/adoption-candidates` accepts a user token in the header only (not a URL token, and not a daemon or network token). A row is returned only when the daemon is online (heartbeat within 5 minutes), advertises `adopt_capable`, shares the node's hostname, reports the same alias, and the node has no creation record and no pending or active binding. The workdir is visible to that node's owner, a network owner/admin, or a Hub admin. Everyone else gets an empty list. The response has no token, environment, or PID. One daemon reports at most 32 rows; the endpoint returns at most 64.
+
+`GET /api/host-supervisors` adds `adoption_discovery: true` for a user token that can see the daemon, and only when the daemon actually reported an array. Absence means that daemon did not publish a discovery result. It does not mean "nothing to adopt" and it does not mean "adoption is unsupported". An empty array means discovery ran and found no candidate.
+
+No new table, port, service, or secret source. After rollback the endpoint is gone; existing bindings are unchanged.
 
 ## Related {#related}
 

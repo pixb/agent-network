@@ -17,6 +17,7 @@
 // the path without terminating the test runner.
 
 import type { RuntimeReadiness } from "./runtime-readiness.js";
+import { validateCodexConfigFlag } from "./codex-config-flags.js";
 import {
   closeSync,
   constants,
@@ -73,12 +74,22 @@ const ALLOWED_FLAGS = new Set<string>([
   "maxTurns",
   "budget",
   "timeout",
+  "approvalPolicy",
+  "sandboxMode",
+  "skipGitRepoCheck",
+  "copresenceFullAccess",
+  "modelReasoningEffort",
 ]);
 
 const RESTART_REQUIRED_FLAGS = new Set<string>([
   "permissionMode",
   "dangerouslySkipPermissions",
   "timeout",
+  "approvalPolicy",
+  "sandboxMode",
+  "skipGitRepoCheck",
+  "copresenceFullAccess",
+  "modelReasoningEffort",
 ]);
 
 /**
@@ -121,7 +132,10 @@ export interface ConfigUpdate {
 /** Validation outcome. `null` = pass; otherwise the rejection envelope. */
 export type ValidationResult = { field: string; reason: string } | null;
 
-export function validateLocalPatch(patch: ConfigPatch): ValidationResult {
+export function validateLocalPatch(
+  patch: ConfigPatch,
+  opts?: { runtime?: string | null },
+): ValidationResult {
   if (patch.model !== undefined) {
     if (typeof patch.model !== "string" || patch.model.length === 0 || patch.model.length > 200) {
       return { field: "model", reason: "must be a non-empty string ≤ 200 chars" };
@@ -148,6 +162,8 @@ export function validateLocalPatch(patch: ConfigPatch): ValidationResult {
     if (!ALLOWED_FLAGS.has(key)) {
       return { field: `flags.${key}`, reason: "not in local allowlist" };
     }
+    const codexFail = validateCodexConfigFlag(key, val, opts?.runtime ?? null);
+    if (codexFail) return codexFail;
     switch (key) {
       case "permissionMode":
         if (
@@ -370,6 +386,8 @@ export function mergePatch(existing: any, patch: ConfigPatch): any {
   if (patch.model !== undefined) next.model = patch.model;
   if (patch.flags) {
     next.flags = { ...(next.flags || {}), ...patch.flags };
+    if (patch.flags.copresenceFullAccess === true) next.codexCopresenceFullAccess = true;
+    else if (patch.flags.copresenceFullAccess === false) delete next.codexCopresenceFullAccess;
   }
   if (patch.channels !== undefined) {
     // Channels replace-with-preserve-paths:
@@ -454,6 +472,15 @@ export interface DaemonCapabilities {
    *  🔴 不改变 `can_create_nodes` 的语义(旧 app 依赖它);这是**新增**的一格。 */
   runtime_readiness?: Record<string, RuntimeReadiness>;
   adopt_capable?: boolean;
+  /** Board #654 — hand-started nodes this daemon could adopt. Published only
+   * while discovery is running. Not a binding, and not co-presence / three-stage. */
+  adoption_candidates?: Array<{
+    node_id: string;
+    alias: string;
+    workdir: string;
+    runtime: string | null;
+    launch_hint: "bare" | "tmux" | "stopped" | "unverified";
+  }>;
 }
 
 /** #622 —— 把后台自检的最新结果挂到快照的 daemon_capabilities 上。
@@ -638,6 +665,15 @@ export function buildConfigSnapshot(
   const f = (fileConfig?.flags || {}) as Record<string, unknown>;
   for (const k of ALLOWED_FLAGS) {
     if (k in f) out.flags[k] = f[k];
+  }
+  // Read-only echo for OpenCode manage/readback. These are not editable:
+  // they stay out of ALLOWED_FLAGS, so update_node_config still rejects them.
+  if (fileConfig?.runtime === "opencode-cli") {
+    const generation = fileConfig.opencodeGeneration;
+    if (generation === "v1" || generation === "v2") out.flags.opencodeGeneration = generation;
+    const mode = fileConfig.opencodeMode;
+    if (mode === "headless" || mode === "copresence") out.flags.opencodeMode = mode;
+    if (typeof f.opencodeUnsafeTools === "boolean") out.flags.opencodeUnsafeTools = f.opencodeUnsafeTools;
   }
   return out;
 }

@@ -360,13 +360,15 @@ describe("resolvePinnedOpencodeBinary", () => {
 // the previous exact install must keep starting (with an upgrade note) for one
 // transition window; anything else stays rejected.
 describe("opencode pin transition", () => {
-  test("release pin is opencode-ai@1.19.0; 1.18.35 is the only transition version", () => {
+  test("release pin is opencode-ai@1.19.0 with the retained transition window", () => {
     expect(OPENCODE_DEFAULT_PIN).toBe("1.19.0");
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.35"]);
-    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.0", "1.18.35"]);
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.35", "1.18.34", "1.18.1"]);
+    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
     expect(isAcceptedOpencodeVersion("1.19.0")).toBe(true);
-    expect(isAcceptedOpencodeVersion("1.18.35")).toBe(true);
-    for (const v of ["1.18.1", "1.18.2", "1.18.33", "1.18.36", "2.0.22", ""]) {
+    for (const v of ["1.18.35", "1.18.34", "1.18.1"]) {
+      expect(isAcceptedOpencodeVersion(v)).toBe(true);
+    }
+    for (const v of ["1.18.2", "1.18.33", "1.18.36", "2.0.22", ""]) {
       expect(isAcceptedOpencodeVersion(v)).toBe(false);
     }
   });

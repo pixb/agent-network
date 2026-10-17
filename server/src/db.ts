@@ -1,3 +1,4 @@
+import { refreshScheduledBackoff } from "./scheduled-backoff.js";
 import { createAdapter, type DbAdapter } from "./db-adapter"; import { withStatementHook } from "./status-read-cache"; // #431 写 sessions 的语句让 /api/status 缓存失效
 
 export const db: DbAdapter = withStatementHook(createAdapter());
@@ -245,6 +246,7 @@ db.exec(`
     started_at        TEXT,
     runtime_submitted_at TEXT,
     consumed_at       TEXT,
+    last_activity_at  TEXT,
     thread_id         TEXT,
     turn_id           TEXT,
     completed_at      TEXT,
@@ -319,6 +321,15 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 `);
+
+// Human profile avatar. Additive for existing databases; old binaries ignore it.
+try {
+  db.exec("ALTER TABLE users ADD COLUMN avatar_url TEXT");
+} catch (e: any) {
+  // Both supported adapters report a duplicate column on the next startup.
+  // Do not send SQLite PRAGMA to PostgreSQL or swallow other migration errors.
+  if (!/duplicate column|already exists/i.test(e?.message || "")) throw e;
+}
 
 // #261 P0-2 (2026-06-28): must_change_password flag. Added via ALTER
 // (not in the CREATE block above) so it's a no-op on fresh DBs that
@@ -519,6 +530,33 @@ try {
 }
 
 // `node_config_updates` — pending + history. One row per dashboard write.
+// #906: redacted daemon-owned inventory requests, never credential material.
+db.exec(`CREATE TABLE IF NOT EXISTS daemon_provider_snapshots (
+  request_id TEXT PRIMARY KEY, network_id TEXT NOT NULL, daemon_node_id TEXT NOT NULL,
+  requested_by TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, observed_at INTEGER,
+  snapshot_json TEXT, error TEXT
+)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_daemon_provider_pending
+  ON daemon_provider_snapshots(network_id, daemon_node_id, status)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_daemon_provider_inflight
+  ON daemon_provider_snapshots(network_id, daemon_node_id) WHERE status='pending'`);
+// One encrypted mutation payload per request; public receipt remains secret-free.
+db.exec(`CREATE TABLE IF NOT EXISTS daemon_provider_writes (
+  request_id TEXT PRIMARY KEY, expected_revision INTEGER NOT NULL,
+  ciphertext BLOB NOT NULL, iv BLOB NOT NULL, tag BLOB NOT NULL
+)`);
+// Application intent is credential-free; secrets stay in the daemon's store.
+db.exec(`CREATE TABLE IF NOT EXISTS daemon_provider_applications (
+  request_id TEXT PRIMARY KEY, expected_revision INTEGER NOT NULL,
+  selection_json TEXT NOT NULL
+)`);
+
+// Login commands contain only intent. OAuth tokens never enter Hub storage.
+db.exec(`CREATE TABLE IF NOT EXISTS daemon_provider_logins (
+  request_id TEXT PRIMARY KEY, intent_json TEXT NOT NULL
+)`);
+
 // At most one row per node may be in a non-terminal state at a time
 // (single-flight enforced at the tool layer; this table just stores).
 //
@@ -779,6 +817,15 @@ try {
   if (!/duplicate column|already exists/i.test(e?.message || "")) throw e;
 }
 
+// Hub #938 — clone_node reuses this table (same token mint, sweeper, and
+// register finalize) but must not be replayed as a blank create_node.
+// NULL/empty = ordinary create. Non-empty JSON = clone directives.
+try {
+  db.exec(`ALTER TABLE node_create_requests ADD COLUMN clone_json TEXT`);
+} catch (e: any) {
+  if (!/duplicate column|already exists/i.test(e?.message || "")) throw e;
+}
+
 // #1493 — 把 user_inbox.network_id 升到 **schema 级 NOT NULL**(belt-and-suspenders,
 // 叠在 send_desktop_message 的代码级三闸之上:canWrite / `!effectiveNetId` return /
 // getUserNetworkRole,tools.ts)。「不产生 network_id=NULL 孤儿」现是代码级保证 + #1492
@@ -890,6 +937,19 @@ db.exec(`
     UNIQUE(network_id, name)
   );
   CREATE INDEX IF NOT EXISTS idx_providers_network ON providers(network_id);
+`);
+// #907 network-owned Provider configuration. Keys remain in network_secrets.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS hub_provider_configs (
+    network_id TEXT NOT NULL, provider_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    config_json TEXT NOT NULL, secret_key_ref TEXT NOT NULL, updated_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, provider_id)
+  );
+  CREATE TABLE IF NOT EXISTS hub_provider_bindings (
+    request_id TEXT PRIMARY KEY, network_id TEXT NOT NULL, provider_id TEXT NOT NULL,
+    provider_revision INTEGER NOT NULL, daemon_node_id TEXT NOT NULL,
+    daemon_provider_id TEXT NOT NULL, created_at INTEGER NOT NULL
+  );
 `);
 db.exec(`
   CREATE TABLE IF NOT EXISTS provider_models (
@@ -1213,7 +1273,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_from_node ON tasks(from_node
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_to_node ON tasks(to_node_id)"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_inbox_node ON inbox(node_id)"); } catch {}
 
-function backfillMessageNodeIds() {
+export function backfillMessageNodeIds() {
   let inboxDirect = 0;
   let inboxRenamed = 0;
   let tasksToDirect = 0;
@@ -1333,6 +1393,7 @@ function backfillMessageNodeIds() {
         LIMIT 1
       )
       WHERE from_node_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM users u WHERE u.username = tasks.from_name)
         AND EXISTS (
           SELECT 1 FROM sessions s
           WHERE s.node_id IS NOT NULL
@@ -1358,6 +1419,7 @@ function backfillMessageNodeIds() {
         LIMIT 1
       )
       WHERE from_node_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM users u WHERE u.username = tasks.from_name)
         AND EXISTS (
           SELECT 1 FROM rename_txn r
           JOIN sessions s
@@ -1497,6 +1559,8 @@ try { db.exec("ALTER TABLE tasks ADD COLUMN meta_json TEXT"); } catch {}
 // started_at (legacy report_status/content matching). Old binaries ignore them.
 try { db.exec("ALTER TABLE tasks ADD COLUMN runtime_submitted_at TEXT"); } catch {}
 try { db.exec("ALTER TABLE tasks ADD COLUMN consumed_at TEXT"); } catch {}
+// #1113: exact original-turn activity. NULL keeps the old execution-clock fallback.
+try { db.exec("ALTER TABLE tasks ADD COLUMN last_activity_at TEXT"); } catch {}
 // Exact vendor-runtime boundary for SideThread-capable clients. These values
 // are written only by the token-bound target node after attributable runtime
 // evidence; the Hub never derives them from task text or caller input.
@@ -1647,6 +1711,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scheduled_runs_network
     ON scheduled_task_runs(network_id, created_at DESC);
 `);
+// #1278 — opt-in state. Existing schedules remain disabled.
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN no_change_backoff INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN backoff_streak INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN backoff_effective_seconds INTEGER"); } catch {}
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN backoff_last_run_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE scheduled_task_runs ADD COLUMN backoff_excluded INTEGER NOT NULL DEFAULT 0"); } catch {}
+// #1279 — opt-in requirement event policy/cursor; old plans stay disabled.
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN requirement_wake_json TEXT"); } catch {}
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN requirement_wake_cursor INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN requirement_wake_last_event_id INTEGER"); } catch {}
+// #1274 — explicit successful-work signal and dispatch revision, separate
+// from lifecycle. NULL is unknown for legacy runs; rollback ignores columns.
+try { db.exec("ALTER TABLE scheduled_task_runs ADD COLUMN work_outcome TEXT"); } catch {}
+try { db.exec("ALTER TABLE scheduled_task_runs ADD COLUMN schedule_revision INTEGER"); } catch {}
+try { db.exec("ALTER TABLE scheduled_task_runs ADD COLUMN work_outcome_node_id TEXT"); } catch {}
 try { db.exec("ALTER TABLE scheduled_tasks ADD COLUMN misfire_policy TEXT NOT NULL DEFAULT 'catch_up_once'"); } catch {}
 // Skipped runs (overlap_policy=skip) name the open task that blocked them and
 // whether the node had ever picked it up: not_received | in_progress.
@@ -2090,6 +2169,10 @@ type ScheduledTaskBinding = { run_id: string; schedule_id: string };
  * the history reflects the current retry rather than the first failed attempt.
  */
 export function syncScheduledRunForTask(taskId: string, expectedNetworkId?: string | null): { matched: boolean; status?: string } {
+  return db.transaction(() => syncScheduledRunForTaskInTransaction(taskId, expectedNetworkId));
+}
+
+function syncScheduledRunForTaskInTransaction(taskId: string, expectedNetworkId?: string | null): { matched: boolean; status?: string } {
   const task = db.get<ScheduledTaskLifecycleRow>(
     `SELECT task_id, network_id, status, completed_at
        FROM tasks
@@ -2118,18 +2201,23 @@ export function syncScheduledRunForTask(taskId: string, expectedNetworkId?: stri
           SET status = ?1,
               error_code = ?2,
               error_message = NULL,
+              work_outcome = CASE WHEN ?1 = 'replied' THEN work_outcome ELSE NULL END,
+              work_outcome_node_id = CASE WHEN ?1 = 'replied' THEN work_outcome_node_id ELSE NULL END,
               completed_at = COALESCE(?3, datetime('now'))
         WHERE run_id = ?4 AND task_id = ?5 AND network_id = ?6 AND schedule_id = ?7`,
       [task.status, errorCode, task.completed_at, binding.run_id, task.task_id, task.network_id, binding.schedule_id],
     );
-    if (updated.changes === 1) fireScheduledRunTerminalHook(binding.schedule_id, task.status);
+    if (updated.changes === 1) {
+      refreshScheduledBackoff(binding.schedule_id, task.network_id!);
+      fireScheduledRunTerminalHook(binding.schedule_id, task.status);
+    }
     return { matched: updated.changes === 1, status: task.status };
   }
 
   if (task.status === "delivered") {
     const updated = db.run(
       `UPDATE scheduled_task_runs
-          SET status = 'delivered', error_code = NULL, error_message = NULL, completed_at = NULL
+          SET status = 'delivered', error_code = NULL, error_message = NULL, completed_at = NULL, work_outcome = NULL, work_outcome_node_id = NULL, backoff_excluded = 1
         WHERE run_id = ?1 AND task_id = ?2 AND network_id = ?3 AND schedule_id = ?4`,
       [binding.run_id, task.task_id, task.network_id, binding.schedule_id],
     );
@@ -2165,7 +2253,7 @@ export function logTaskEvent(taskId: string, fromStatus: string | null, toStatus
 // RFC-039 F3: queries break created_at ties with SQLite's implicit rowid
 // (insertion order). PostgreSQL has none, so give these tables a real one.
 if (db.dialect === "postgres") {
-  for (const table of ["nodes", "user_inbox"]) db.exec(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS rowid BIGSERIAL`);
+  for (const table of ["nodes", "user_inbox", "inbox"]) db.exec(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS rowid BIGSERIAL`);
 }
 
 // Board #625: common SQLite/PostgreSQL DDL. Adoption records authority, not processes.

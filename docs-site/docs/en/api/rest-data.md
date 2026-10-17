@@ -269,7 +269,7 @@ curl "http://localhost:9200/api/host-supervisors" \
 🔴 **`can_create_nodes` / `create_nodes_blocked_reason` (daemon node-creation capability).** The daemon reports it via `report_status.host.daemon_capabilities`; the hub mirrors it here verbatim so the Dashboard "create-node wizard" can decide whether a host is selectable and, if not, why (`create_nodes_blocked_reason` appears **only** when `can_create_nodes === false`).
 🔴 **Both keys are present only if the daemon actually reported them.** A daemon running an older agent-node that does not yet send `daemon_capabilities` omits both keys **entirely** from the response — they are absent, not `false`. Consumers must treat an absent key as "unknown, assume creatable" and must **not** grey out a healthy older daemon by mistaking absence for blocked (`undefined ≠ false`).
 
-🔴 **`runtime_readiness` (measured per-runtime readiness, #622).** The daemon self-checks at start-up and then every 10 minutes (±10% jitter) in the background, keyed by runtime name, e.g. `{"claude-code-cli": {"ok": true, "state": "ready", "reason": "可以创建", "version": "2.1.290", "checked_at": "2026-10-06T03:00:00.000Z", "cli": "found", "auth": "present", "network": "reachable"}}`. `state` is one of `ready` / `missing_cli` / `not_logged_in` / `no_network` / `unknown`; `reason` is user-facing Chinese text that includes the fix; `checked_at` is the daemon's own clock. Optional: `version`, `cli` (`found`/`missing`/`bundled`/`unknown`), `auth` (`present`/`absent`/`not_required`/`unknown`), `network` (`reachable`/`unreachable`/`skipped`), `shared_login_count` (codex only: how many other local nodes share the same codex login). The CLI is resolved on **the PATH the daemon's child nodes actually get**; login checks look only at whether a file or env var name **exists** and never read or report contents. **Old daemons that don't report it have no such key**; it does **not** change the meaning of `can_create_nodes`.
+🔴 **`runtime_readiness` (measured per-runtime readiness, #622).** The daemon self-checks at start-up and then every 10 minutes (±10% jitter) in the background, keyed by runtime name, e.g. `{"claude-code-cli": {"ok": true, "state": "ready", "reason": "可以创建", "version": "2.1.290", "checked_at": "2026-10-06T03:00:00.000Z", "cli": "found", "auth": "present", "network": "reachable"}}`. `state` is one of `ready` / `missing_cli` / `not_logged_in` / `no_network` / `unknown`; `reason` is user-facing Chinese text that includes the fix; `checked_at` is the daemon's own clock. Optional: `version`, `cli` (`found`/`missing`/`bundled`/`unknown`), `auth` (`present`/`absent`/`not_required`/`unknown`), `network` (`reachable`/`unreachable`/`skipped`), `shared_login_count` (codex only: how many other local nodes share the same codex login). The CLI is resolved on **the PATH the daemon's child nodes actually get**; login checks look only at whether a file or env var name **exists** and never read or report contents. **Old daemons that don't report it have no such key**; it does **not** change the meaning of `can_create_nodes`. For `opencode-cli`, the result may also include `generation` (`v1` or `v2`) and `accepted` (boolean). Older daemons omit both; they do not make `state` `ready`, and they do not change `can_create_nodes`.
 
 🔴 **The `online` window is 5 minutes**, not the heartbeat period. agent-node's `report_status` fires every **3 minutes**, and the window must exceed it — otherwise a daemon would flap to `offline` for the 60–180 s after every heartbeat.
 
@@ -277,6 +277,42 @@ curl "http://localhost:9200/api/host-supervisors" \
 
 **Network scope**: the REST auth pipeline's `restScope` (SEC-1).
 
+**`adoption_discovery`** is `true` only when that daemon reported an `adoption_candidates` array. Absence does not mean there is nothing to adopt. The list itself is [`GET /api/adoption-candidates`](#get-api-adoption-candidates), not this response.
+
+
+---
+
+### GET /api/adoption-candidates
+
+> Read-only. Hand-started nodes a daemon reported as adoptable. Does not adopt, signal, or start.
+
+```bash
+curl "http://localhost:9200/api/adoption-candidates?network_id=net_xxx" \
+  -H "Authorization: Bearer utok_xxx"
+```
+
+Header user tokens only. A daemon token, network token, or token in the URL returns 403 `user_token_required`.
+
+```json
+{
+  "ok": true,
+  "candidates": [
+    {
+      "node_id": "n_xxx",
+      "alias": "hand-node",
+      "daemon_node_id": "node_daemon_xxx",
+      "daemon_alias": "daemon",
+      "hostname": "build-1",
+      "workdir": "/home/user/project",
+      "runtime": "claude-agent-sdk",
+      "launch_hint": "tmux"
+    }
+  ],
+  "count": 1
+}
+```
+
+`launch_hint` is `bare`, `tmux`, `stopped`, or `unverified`: a hint the daemon saw, not permission to act. The workdir is included only for the node owner, a network owner/admin, or a Hub admin. Co-presence nodes are not listed. See [adoption candidate discovery](/en/deploy/daemon#adoption-candidates).
 
 ---
 
@@ -1189,7 +1225,7 @@ curl -N "http://localhost:9200/events/coder-1?token=ntok_xxx"
 | `new_reply` | Reply to a task (`send_reply`) | `{inbox_count, from, message_id, in_reply_to, status}` |
 | `broadcast` | Broadcast received (`broadcast` tool) | `{inbox_count}` |
 | `chained_reply` | Sub-task completion routed back to the parent task's originator ([`tools.ts`](https://github.com/sleep2agi/agent-network/blob/main/server/src/tools.ts) — grep `chained_reply`) | `{parent_task_id, child_task_id, child_alias}` |
-| `node.renamed` | Broadcast on RFC-010 node-rename COMMIT ([`rename.ts` `renamedEvent`](https://github.com/sleep2agi/agent-network/blob/main/server/src/rename.ts#L211)); pushed to the old + new alias streams **plus every network member's user channel** (the dashboard subscribes to `/events/<username>`, not per-alias streams — #84 SSE channel fix) | `{txn_id, alias(=new_alias), network_id, data:{old_alias, new_alias, surfaces_updated[], history_policy:"preserve"}}` |
+| `node.renamed` | Broadcast on RFC-010 node-rename COMMIT ([`rename.ts` `renamedEvent`](https://github.com/sleep2agi/agent-network/blob/main/server/src/rename.ts#L219)); pushed to the old + new alias streams **plus every network member's user channel** (the dashboard subscribes to `/events/<username>`, not per-alias streams — #84 SSE channel fix) | `{txn_id, alias(=new_alias), network_id, data:{old_alias, new_alias, surfaces_updated[], history_policy:"preserve"}}` |
 
 > Earlier docs claimed `new_message` carried a `message` field and `broadcast` carried `{content, from}` — neither is correct. Verify [`tools.ts`](https://github.com/sleep2agi/agent-network/blob/main/server/src/tools.ts) for the actual payloads. **Since #1439/#1441, `new_message` / `new_reply` / `broadcast` / `new_task` (incl. retry/reassign) all carry the real `inbox_count` (recipient's unread count) — clients can use it directly to show the new-message count; `broadcast` is no longer a hardcoded 1.** Note: `new_task` / `new_message` additionally carry a `renamed_from` field (the old alias) when the target alias was just renamed — the `canonical.renamed` branch in `tools.ts`.
 >

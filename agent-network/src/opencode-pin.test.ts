@@ -108,16 +108,16 @@ describe("opencode-pin — validation refuses malformed / unvalidated overrides"
 });
 
 describe("opencode-pin — 1.18.35 → 1.19.0 transition", () => {
-  test("accepted versions: release pin first, then the previous pin; nothing else", () => {
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.35"]);
-    expect(acceptedOpencodeVersions()).toEqual(["1.19.0", "1.18.35"]);
-    expect(acceptedOpencodeVersions("1.18.35")).toEqual(["1.18.35"]);
+  test("accepted versions: release pin first, then the previous pins; nothing else", () => {
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.35", "1.18.34", "1.18.1"]);
+    expect(acceptedOpencodeVersions()).toEqual(["1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect(acceptedOpencodeVersions("1.18.35")).toEqual(["1.18.35", "1.18.34", "1.18.1"]);
   });
 
   test("legacy note is one line naming the found version and the upgrade command", () => {
     expect(opencodeLegacyPinNote("1.19.0")).toBeNull();
     expect(opencodeLegacyPinNote("1.18.2")).toBeNull();
-    expect(opencodeLegacyPinNote("1.18.1")).toBeNull();
+    expect(opencodeLegacyPinNote("1.18.1")).toContain("opencode-ai@1.18.1");
     const note = opencodeLegacyPinNote("1.18.35")!;
     expect(note).toContain("opencode-ai@1.18.35");
     expect(note).toContain("anet opencode upgrade-pin 1.19.0");

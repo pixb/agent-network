@@ -45,10 +45,10 @@ const OPENCODE_V1_SUPPORT: OpencodeGenerationSupport = Object.freeze({
   generation: "v1",
   packageName: "opencode-ai",
   pin: OPENCODE_V1_PIN,
-  // Pin first, then the previous pin for one transition window (#541): a
-  // host still holding the old exact install keeps starting and is told to
+  // Pin first, then the previous pins for one transition window (#541): a
+  // host still holding an old exact install keeps starting and is told to
   // upgrade. Each entry passed the full Docker/E2E gate when it was the pin.
-  acceptedVersions: Object.freeze([OPENCODE_V1_PIN, "1.18.35"]),
+  acceptedVersions: Object.freeze([OPENCODE_V1_PIN, "1.18.35", "1.18.34", "1.18.1"]),
   status: "supported",
 });
 

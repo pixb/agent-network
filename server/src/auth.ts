@@ -2,7 +2,7 @@
  * V3 Auth module — user registration, login, token management
  */
 import { db, generateId, hashPassword, verifyPassword, hashToken, generateToken, generateUserToken, generateNetworkToken, uuidv4 } from "./db.js"; import { deleteDepartmentsForNetwork, groupTx, removeMemberFromChatGroups } from "./departments.js"; // #419: also ensures network_members.department_id exists (same line on purpose: docs pin auth.ts line numbers)
-import { WEAK_PASSWORDS } from "./password-dict.js";
+import { WEAK_PASSWORDS } from "./password-dict.js"; import { passwordNetworkTokens, type KeptNetworkToken } from "./password-network-tokens.js";
 import { checkNodeTokenClaim, legacyNodeHolder } from "./node-token-ownership.js";
 import { NETWORK_REST_COLUMNS, NETWORK_REST_SELECT, sqlColumns } from "./rest-projections.js";
 import { deleteAgentGrants, isAgentRestricted } from "./agent-access.js"; import { deleteTaskGrantsForMember, newMemberTaskAccess, type TaskAccessMode } from "./task-access.js"; // 一行两个 import:文档钉着 auth.ts 的行号
@@ -35,6 +35,7 @@ export interface AuthUser {
   user_id: string;
   username: string;
   display_name: string | null;
+  avatar_url?: string | null;
   email: string | null;
   role: string;
 }
@@ -161,7 +162,7 @@ export function register(username: string, password: string, email?: string, dis
 
 export function login(username: string, password: string, client: SessionClientInfo = {}): AuthResult {
   const user = db.get<any>(
-    "SELECT user_id, username, password_hash, display_name, email, role, must_change_password FROM users WHERE username = ?1",
+    "SELECT user_id, username, password_hash, display_name, avatar_url, email, role, must_change_password FROM users WHERE username = ?1",
     username);
 
   if (!user) {
@@ -232,7 +233,7 @@ export function login(username: string, password: string, client: SessionClientI
 
   return {
     ok: true,
-    user: { user_id: user.user_id, username: user.username, display_name: user.display_name, email: user.email, role: user.role },
+    user: { user_id: user.user_id, username: user.username, display_name: user.display_name, avatar_url: user.avatar_url, email: user.email, role: user.role },
     token,
     token_id: tokenId,
     network_id: networkId,
@@ -329,7 +330,7 @@ export type SessionClientInfo = { label?: unknown; userAgent?: unknown; kind?: u
 // 种类由客户端自报(client_kind / client_label),**只用于展示和「显式保留」那条路**:
 // 改密码默认仍撤销全部不绑网络的令牌(当前这条除外),调用方显式 keep_cli_tokens=true 才保留 'cli'。
 // 所以一个自称 cli 的令牌永远不能靠自报在默认改密码里活下来。
-// 节点 / 网络令牌(network_id 非空)不分类,改密码永远不碰。
+// 节点 / 网络令牌(network_id 非空)不按cli分类;具名网络令牌另有显式撤销选项。
 export type UserTokenKind = "login" | "cli";
 
 /** 登录 / 注册请求签发的令牌算哪一类:客户端显式报 kind='cli',或 client_label 是 anet 自报的「anet <版本> · …」。 */
@@ -384,7 +385,7 @@ function lookupToken(token: string): { row: any; rejected?: undefined } | { row?
   const cutoff = idleCutoffOffset();
   const row = db.get<any>(
     `SELECT t.token_id, t.user_id, t.network_id, t.scope, t.name AS token_name,
-            u.username, u.display_name, u.email, u.role,
+            u.username, u.display_name, u.avatar_url, u.email, u.role,
             CASE WHEN t.network_id IS NULL THEN 1
                  WHEN EXISTS (SELECT 1 FROM network_members nm WHERE nm.network_id = t.network_id AND nm.user_id = t.user_id) THEN 1
                  ELSE 0 END AS is_member
@@ -433,7 +434,7 @@ export function resolveToken(token: string): { user: AuthUser; networkId: string
   );
 
   return {
-    user: { user_id: row.user_id, username: row.username, display_name: row.display_name, email: row.email, role: row.role },
+    user: { user_id: row.user_id, username: row.username, display_name: row.display_name, avatar_url: row.avatar_url, email: row.email, role: row.role },
     networkId: row.network_id,
     tokenId: row.token_id || null,
     // tokenName carries the binding identity. For node-scoped ntok_, it's
@@ -641,14 +642,14 @@ export function revokeOtherSessions(userId: string, currentTokenId: string): num
   return db.run(`DELETE FROM api_tokens WHERE user_id = ?1 AND ${SESSION_TOKEN_SQL} AND token_id != ?2`, [userId, currentTokenId]).changes;
 }
 
-export type ChangePasswordResult = { ok: boolean; error?: string; revoked?: number; revoked_login?: number; revoked_cli?: number; kept_cli_tokens?: KeptCliToken[] };
+export type ChangePasswordResult = { ok: boolean; error?: string; revoked?: number; revoked_login?: number; revoked_cli?: number; kept_cli_tokens?: KeptCliToken[]; revoked_network?: number; kept_network_tokens?: KeptNetworkToken[] };
 
 /**
  * 改密码。默认撤销该用户全部不绑网络的令牌(改密码前的行为,旧 app 依赖它)。#711:opts.keepCliTokens=true
  * 时保留 kind='cli' 的(anet 命令行登录、具名脚本令牌),并在 kept_cli_tokens 里列出。当前会话和节点令牌永远保留。
- * revoked = 两类合计(旧字段,兼容旧客户端)。
+ * revokeNetworkTokens=true显式撤销具名网络令牌;默认列出保留清单。revoked含三类合计。
  */
-export function changePassword(userId: string, oldPassword: string, newPassword: string, currentTokenId?: string | null, opts: { keepCliTokens?: boolean } = {}): ChangePasswordResult {
+export function changePassword(userId: string, oldPassword: string, newPassword: string, currentTokenId?: string | null, opts: { keepCliTokens?: boolean; revokeNetworkTokens?: boolean } = {}): ChangePasswordResult {
   const passwordError = validatePasswordStrength(newPassword, "new password");
   if (passwordError) return { ok: false, error: passwordError };
   const user = db.get<any>("SELECT password_hash FROM users WHERE user_id = ?1", userId);
@@ -662,10 +663,14 @@ export function changePassword(userId: string, oldPassword: string, newPassword:
   // password change. If the user changes via `anet passwd`, the bootstrap
   // nudge goes away on next login. SET to 0 explicitly (rather than skip)
   // so a future flag flip can't drift the state.
-  db.run("UPDATE users SET password_hash = ?1, must_change_password = 0, updated_at = datetime('now') WHERE user_id = ?2", [hashPassword(newPassword), userId]);
-  const keep = opts.keepCliTokens === true;
-  const r = revokeTokensAfterPasswordChange(userId, currentTokenId, keep);
-  return { ok: true, revoked: r.login + r.cli, revoked_login: r.login, revoked_cli: r.cli, ...(keep ? { kept_cli_tokens: r.kept } : {}) };
+  const nextHash = hashPassword(newPassword);
+  return db.transaction(() => {
+    db.run("UPDATE users SET password_hash = ?1, must_change_password = 0, updated_at = datetime('now') WHERE user_id = ?2", [nextHash, userId]);
+    const keep = opts.keepCliTokens === true;
+    const r = revokeTokensAfterPasswordChange(userId, currentTokenId, keep);
+    const network = passwordNetworkTokens(userId, currentTokenId, opts.revokeNetworkTokens === true);
+    return { ok: true, revoked: r.login + r.cli + network.revoked, revoked_login: r.login, revoked_cli: r.cli, ...(keep ? { kept_cli_tokens: r.kept } : {}), revoked_network: network.revoked, kept_network_tokens: network.kept };
+  });
 }
 
 /**
@@ -702,7 +707,7 @@ export function resetUserPassword(targetUsername: string, callerIsHubAdmin: bool
 
 export function getNetworkMembers(networkId: string) {
   return db.all<any>(
-    `SELECT nm.user_id, nm.role, nm.joined_at, nm.invited_by, u.username, u.display_name,
+    `SELECT nm.user_id, nm.role, nm.joined_at, nm.invited_by, u.username, u.display_name, u.avatar_url,
             CASE WHEN u.role = 'admin' OR nm.role IN ('owner', 'admin') OR nm.agent_access = 'all' THEN 'all' ELSE 'granted' END AS agent_access,
             (SELECT COUNT(*) FROM network_member_agent_grants g WHERE g.network_id = nm.network_id AND g.user_id = nm.user_id) AS agent_grant_count,
             CASE WHEN u.role = 'admin' OR nm.role IN ('owner', 'admin') OR nm.task_access = 'all' THEN 'all' ELSE 'scoped' END AS task_access,
@@ -716,8 +721,8 @@ export function getNetworkMembers(networkId: string) {
 
 /** 网络里的人类成员(给受限成员也能看的通讯录):只有身份字段,不含角色与授权。 */
 export function getNetworkHumans(networkId: string) {
-  return db.all<{ user_id: string; username: string; display_name: string | null }>(
-    `SELECT u.user_id, u.username, u.display_name
+  return db.all<{ user_id: string; username: string; display_name: string | null; avatar_url: string | null }>(
+    `SELECT u.user_id, u.username, u.display_name, u.avatar_url
        FROM network_members nm JOIN users u ON nm.user_id = u.user_id
       WHERE nm.network_id = ?1 ORDER BY COALESCE(NULLIF(u.display_name, ''), u.username), u.user_id`,
     networkId);
