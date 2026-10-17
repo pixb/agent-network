@@ -1,0 +1,32 @@
+test227 (real OpenCode TUI copresence) — pin 1.19.3 vs pre-bump baseline
+======================================================================
+
+test227 builds an image that installs the REAL opencode-ai from npm and drives
+the real TUI copresence path (free model `opencode/north-mini-code-free`, no API
+key). It was run twice to separate pin-related regressions from pre-existing red:
+
+  A) bump    : tests/test227-opencode-tui-copresence/Dockerfile, ARG OPENCODE_VERSION=1.19.3
+               docker run --rm test227-pin193      -> 33 pass / 2 fail
+  B) baseline: same Dockerfile at 3a0cf736 (pre-bump), ARG OPENCODE_VERSION=1.19.0
+               docker run --rm test227-base3a      -> 33 pass / 2 fail
+
+The two failures are IDENTICAL in name in both runs, so they are pre-existing
+and unrelated to the pin:
+
+  (fail) OpenCode copresence task deadline > board656 a tool part then capacity
+         does not resubmit                                    [~5005ms, timeout]
+  (fail) OpenCode copresence turn transport outlives undici's header timeout
+         (Node) > a turn longer than the global headersTimeout returns its reply;
+         a plain fetch dies with the named cause
+
+The second case spawns a Node driver to assert undici's UND_ERR_HEADERS_TIMEOUT
+behaviour; the image ships Debian's Node 18, and it fails there in both runs
+(37 ms at baseline, 611 ms under load) with a Node ESM loader stack — an
+environment/Node-version issue, not a table change. The first is a 5 s deadline
+timeout, equally present at baseline.
+
+Conclusion: the pin bump introduces no test227 regression. These two failures
+predate it (same commit range that also left test386 red — see
+report-test386-opencode-v1-1.19.3.txt, which was repaired separately). They are
+NOT fixed here; they are a separate pre-existing gap in this image's Node
+version / the board656 deadline.
