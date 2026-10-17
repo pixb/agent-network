@@ -356,30 +356,34 @@ describe("resolvePinnedOpencodeBinary", () => {
   });
 });
 
-// Board #541 — the release pin moved 1.18.35 → 1.19.0. A host still holding
-// the previous exact install must keep starting (with an upgrade note) for one
-// transition window; anything else stays rejected.
+// Board #541 — the release pin moved 1.18.35 → 1.19.0 → 1.19.3. A host still
+// holding a previous exact install must keep starting (with an upgrade note) for
+// one transition window; anything else stays rejected.
 describe("opencode pin transition", () => {
-  test("release pin is opencode-ai@1.19.0 with the retained transition window", () => {
-    expect(OPENCODE_DEFAULT_PIN).toBe("1.19.0");
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.18.35", "1.18.34", "1.18.1"]);
-    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
-    expect(isAcceptedOpencodeVersion("1.19.0")).toBe(true);
-    for (const v of ["1.18.35", "1.18.34", "1.18.1"]) {
+  test("release pin is opencode-ai@1.19.3 with the retained transition window", () => {
+    expect(OPENCODE_DEFAULT_PIN).toBe("1.19.3");
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect(isAcceptedOpencodeVersion("1.19.3")).toBe(true);
+    for (const v of ["1.19.0", "1.18.35", "1.18.34", "1.18.1"]) {
       expect(isAcceptedOpencodeVersion(v)).toBe(true);
     }
-    for (const v of ["1.18.2", "1.18.33", "1.18.36", "2.0.22", ""]) {
+    for (const v of ["1.19.1", "1.19.2", "1.18.2", "1.18.33", "1.18.36", "2.0.22", ""]) {
       expect(isAcceptedOpencodeVersion(v)).toBe(false);
     }
   });
 
   test("transition note names the found version and the exact upgrade command", () => {
-    expect(opencodeTransitionNote("1.19.0")).toBeNull();
+    expect(opencodeTransitionNote("1.19.3")).toBeNull();
     expect(opencodeTransitionNote("1.18.2")).toBeNull();
-    const note = opencodeTransitionNote("1.18.35")!;
-    expect(note).toContain("opencode-ai@1.18.35");
-    expect(note).toContain("anet opencode upgrade-pin 1.19.0");
+    const note = opencodeTransitionNote("1.19.0")!;
+    expect(note).toContain("opencode-ai@1.19.0");
+    expect(note).toContain("anet opencode upgrade-pin 1.19.3");
     expect(note).not.toContain("\n");
+    const older = opencodeTransitionNote("1.18.35")!;
+    expect(older).toContain("opencode-ai@1.18.35");
+    expect(older).toContain("anet opencode upgrade-pin 1.19.3");
+    expect(older).not.toContain("\n");
   });
 
   test("launcher-selected transition version is admitted and revalidates without an explicit version", () => {

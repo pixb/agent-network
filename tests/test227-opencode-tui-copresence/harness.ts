@@ -81,7 +81,7 @@ try {
   runtime = await openOpenCodeCopresenceRuntime({
     cwd: project,
     workDir,
-    expectedVersion: process.env.OPENCODE_VERSION_UNDER_TEST || "1.19.0",
+    expectedVersion: process.env.OPENCODE_VERSION_UNDER_TEST || "1.19.3",
     binarySearchPath: process.env.PATH || "",
     model: process.env.OPENCODE_FREE_MODEL || "opencode/north-mini-code-free",
     commhubMcpUrl: `http://127.0.0.1:${mcpServer.port}/mcp`,

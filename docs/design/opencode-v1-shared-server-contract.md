@@ -33,8 +33,8 @@ native gate without a relevant change or unresolved result.
 - Existing V2 reuse B: PR #2645, OPEN at review, exact head
   `0c7af87a898e2420f30c3ade510d082ea2fc6ddb`. Reuse its lifecycle/proxy concepts;
   do not merge its entire branch or implement a second V2 lane for this task.
-- `opencode-versions.ts` now pins V1 `opencode-ai@1.18.34`, still accepts
-  `1.18.1`; V2 is `@opencode/cli@2.0.22`, a different API/security contract.
+- `opencode-versions.ts` now pins V1 `opencode-ai@1.19.3`, still accepts
+  `1.19.0` / `1.18.35` / `1.18.34` / `1.18.1`; V2 is `@opencode/cli@2.0.22`, a different API/security contract.
 - Main `runtime.ts` creates a random loopback Server/password, imports a V1
   checkpoint into fresh launch data, then owns process teardown. It has no shared
   Server option. PR #2645 explicitly rejects shared Server with a V1 backend.

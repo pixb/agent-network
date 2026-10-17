@@ -53,7 +53,7 @@ function makePackage(parent: string, overrides: Record<string, unknown> = {}): {
   writeFileSync(packageJson, JSON.stringify({
     name: "opencode-ai",
     version: PIN,
-    // The 1.18.35/1.19.0 tarballs spell this with `./`; registry metadata may display
+    // The 1.18.35/1.19.0/1.19.3 tarballs spell this with `./`; registry metadata may display
     // the normalized form. The verifier accepts only these equivalent bytes.
     bin: { opencode: "./bin/opencode.exe" },
     ...overrides,
@@ -280,7 +280,7 @@ describe("#1845 platform gate", () => {
   });
 });
 
-// Board #541 — pin moved 1.18.35 → 1.19.0; the previous exact install keeps
+// Board #541 — pin moved 1.18.35 → 1.19.0 → 1.19.3; the previous exact install keeps
 // resolving for one transition window, the release pin wins when both exist,
 // and every other version is still refused with release-pin diagnostics.
 describe("resolveAcceptedOpencodePackageBinaryFromPath (transition window)", () => {

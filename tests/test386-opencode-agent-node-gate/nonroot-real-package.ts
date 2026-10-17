@@ -6,7 +6,7 @@ import {
   resolvePinnedOpencodeBinary,
 } from "/repo/agent-node/src/runtime/opencode-acp/binary";
 
-const expectedVersion = "1.19.0";
+const expectedVersion = "1.19.3";
 const project = "/home/bun/project";
 const probeCwd = "/home/bun/probe";
 const requested = "/home/bun/prefix/node_modules/.bin/opencode";

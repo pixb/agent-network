@@ -127,7 +127,7 @@ main 完整 SHA 构建；回滚须回到已验证版本，先停止新增 V2 节
 
 | 代际 | 上游包 / 固定版本 | 模式 | 安全边界 |
 | --- | --- | --- | --- |
-| V1（默认） | `opencode-ai@1.19.0`，过渡兼容 `1.18.35` / `1.18.34` / `1.18.1` | headless / copresence | 原有逐项 deny 安全预设 |
+| V1（默认） | `opencode-ai@1.19.3`，过渡兼容 `1.19.0` / `1.18.35` / `1.18.34` / `1.18.1` | headless / copresence | 原有逐项 deny 安全预设 |
 | V2（受限 preview） | `@opencode/cli@2.0.22` | 仅 copresence | 必须显式确认 `flags.opencodeUnsafeTools=true`；默认拒绝 |
 
 两个上游包都安装名为 `opencode` 的命令，**不能装进同一个 npm prefix**。
@@ -357,19 +357,19 @@ CommHub 的两种入站语义保持分离：
 
 普通消息不能使用 OpenCode `noReply` user message 伪装通知：该 API 虽然当下不生成回答，却会留下未回答的 user turn，下一条真实任务可能把它一起回答，造成延迟误回复或 agent 间回复循环。
 
-网络提交前读取 `/session/status`：已有 human/network turn 忙时排队，agent-node 内部的多条网络任务再经过 FIFO 串行化。固定版 OpenCode 1.19.0 在 idle 时实际返回空状态表；实现不会仅凭“缺状态条目”放行，而会再读 `/session/:id`，只有精确 session 仍存在时才按该固定版本的 idle 语义放行，缺 session、404 或未知状态形状都等到超时。
+网络提交前读取 `/session/status`：已有 human/network turn 忙时排队，agent-node 内部的多条网络任务再经过 FIFO 串行化。固定版 OpenCode 1.19.3 在 idle 时实际返回空状态表；实现不会仅凭“缺状态条目”放行，而会再读 `/session/:id`，只有精确 session 仍存在时才按该固定版本的 idle 语义放行，缺 session、404 或未知状态形状都等到超时。
 
-OpenCode 1.19.0 仍没有原子“空闲检查并认领”API，因此人类可能恰好在空闲检查后开始输入，这是 preview 的已知残余竞态。踩中时，human 与 network 两条内容可能被合并进同一个看似正常的 assistant reply，导致网络对端收到混合内容，或其中一个 turn 被另一个吃掉；看到回复混入另一条同时输入的内容时，应把该网络 turn 判为失败并重试，不能把结果当成可信完成。这里不能宣称强 lease。
+OpenCode 1.19.3 仍没有原子“空闲检查并认领”API，因此人类可能恰好在空闲检查后开始输入，这是 preview 的已知残余竞态。踩中时，human 与 network 两条内容可能被合并进同一个看似正常的 assistant reply，导致网络对端收到混合内容，或其中一个 turn 被另一个吃掉；看到回复混入另一条同时输入的内容时，应把该网络 turn 判为失败并重试，不能把结果当成可信完成。这里不能宣称强 lease。
 
 启动也必须串行化：离线期间积压的普通消息会在注册后触发恢复 drain，它可能与主启动路径同时请求 OpenCode runtime。实现使用 single-flight 合并这些请求；否则一个 node 会生成两个 server/session，attach 脚本也会被后写者覆盖。
 
 ## 安全与生命周期
 
-- V1 严格固定为 `opencode-ai@1.19.0`（#541 链路：`1.18.1` → `1.18.34` → `1.18.35` → 本次 `1.19.0`）。过渡期已装 `1.18.35`/`1.18.34`/`1.18.1` 的主机仍可启动并提示升级（三者都是曾通过完整 Docker/E2E gate 的旧 pin，合并上游 main 时按向后兼容一并保留）；其他 V1 版本拒绝。V2 必须显式选择代际并满足上表中的包身份、版本和风险确认条件，不能当成 V1 的原位升级。
+- V1 严格固定为 `opencode-ai@1.19.3`（#541 链路：`1.18.1` → `1.18.34` → `1.18.35` → `1.19.0` → 本次 `1.19.3`）。过渡期已装 `1.19.0`/`1.18.35`/`1.18.34`/`1.18.1` 的主机仍可启动并提示升级（四者都是曾通过完整 Docker/E2E gate 的旧 pin，合并上游 main 时按向后兼容一并保留）；其他 V1 版本拒绝（`1.19.1`/`1.19.2` 从未做过本仓 pin，也拒绝）。V2 必须显式选择代际并满足上表中的包身份、版本和风险确认条件，不能当成 V1 的原位升级。
 - 版本探针不接触 vendor credential；通过包身份校验后才生成一次性运行环境。
 - TUI launcher 位于节点私有目录，mode 必须为 `0700`；它包含本次启动的 loopback 密码和 CommHub token export，不得复制、打印或提交。serve/attach 子进程也通过环境变量持有这些 secret；同 UID 用户与 root 可经 `/proc/<pid>/environ` 或进程环境读取，因此安全边界是“同 UID + 私有目录”，不是 secret 不进入 `/proc`/tmux 环境。
 - CommHub token 只通过每节点私有环境变量交给 OpenCode；MCP 配置正文只保存 `{env:...}` 引用，不内嵌 token。每个节点必须独占自己的启动环境，不能共用 attach launcher 或 server。
-- 安全模式固定 OpenCode 1.19.0(过渡期兼容 1.18.35/1.18.34/1.18.1)，并对该版本全部内建工具逐项 deny；动态工具只放行 `commhub_*`。OpenCode 会把对象形式 wildcard 规则移到最后，因此不能用尾部 `* = deny` 再期待较早的 MCP allow 生效。若未来放宽版本 pin，必须同时重新验证 wildcard 优先级并恢复可证明的默认 deny（或重新生成完整内建 deny 列表），不得直接沿用当前逐项列表。1.18.1 → 1.18.34 已按源码逐项比对(#541)、1.18.34 → 1.18.35 已按源码逐项比对:环境变量开关、config 路径/managed config/指令发现、permission 模块、内建工具集合、serve/attach 参数与 session REST 路由均未变(1.18.35 唯一运行时改动是 message-v2.ts 的 xAI 工具结果图片过滤,不涉权限/工具面),逐项 deny 列表可沿用。1.18.35 → 1.19.0 已按源码逐项比对(31 commits/138 files,五面 0 变更;真实变更为 `opencode upgrade --major` 引导、PTY connect 的 origin/ticket 校验前置、更新检查改只提示不自动装),逐项 deny 列表可沿用。
+- 安全模式固定 OpenCode 1.19.3(过渡期兼容 1.19.0/1.18.35/1.18.34/1.18.1)，并对该版本全部内建工具逐项 deny；动态工具只放行 `commhub_*`。OpenCode 会把对象形式 wildcard 规则移到最后，因此不能用尾部 `* = deny` 再期待较早的 MCP allow 生效。若未来放宽版本 pin，必须同时重新验证 wildcard 优先级并恢复可证明的默认 deny（或重新生成完整内建 deny 列表），不得直接沿用当前逐项列表。1.18.1 → 1.18.34 已按源码逐项比对(#541)、1.18.34 → 1.18.35 已按源码逐项比对:环境变量开关、config 路径/managed config/指令发现、permission 模块、内建工具集合、serve/attach 参数与 session REST 路由均未变(1.18.35 唯一运行时改动是 message-v2.ts 的 xAI 工具结果图片过滤,不涉权限/工具面),逐项 deny 列表可沿用。1.18.35 → 1.19.0 已按源码逐项比对(31 commits/138 files,五面 0 变更;真实变更为 `opencode upgrade --major` 引导、PTY connect 的 origin/ticket 校验前置、更新检查改只提示不自动装),逐项 deny 列表可沿用。1.19.0 → 1.19.3 已按源码逐项比对(`v1.19.0...v1.19.3` 10 commits/87 files,五面 0 变更:`packages/opencode/src/permission/*`、`.../tool/*`、serve/attach 命令与 session REST 路由定义均未改,openapi 仅新增可选 `reasoning_options` 模型字段),逐项 deny 列表可沿用；非安全面真实变更为下线 session sharing(连带移除 `OPENCODE_DISABLE_SHARE`)、模型 reasoning variants、`opencode upgrade` 改为在本 major 内用 npm 发现且只提示不自动装。
 - server 使用 detached process group；停止前复核 PID、PGRP、Linux start ticks，身份漂移时拒绝误杀。
 - `SIGINT`、`SIGTERM` 和 tmux 关闭 pane 使用的 `SIGHUP` 全部进入同一 cleanup；少了 `SIGHUP` 会在 `tmux kill-session` 后遗留 detached server。
 - Linux OpenCode 共存的正常 `node stop` 应先给已记录且 birth 匹配的 agent 最多 10 秒完成清理，再关闭终端并审计残留进程；不要以直接关闭 tmux 替代正常停止。`test827` 同时检查生成的 registry observer 和 attach launcher 已消失，因为进程退出不代表私有启动文件清理完成。这一停止顺序修复仍须经过 main 合并/正式制品门，分支测试不代表已部署。
@@ -412,7 +412,7 @@ sg docker -c 'docker rmi anet-test228:dev'
 1. process-group、FIFO、独立 work/informational drain、`new_message` SSE 与 inbox 接线单元层
 2. CLI mode/tmux/陈旧环境接线层
 3. loopback + 未认证 401 + launcher 0700
-4. 真 OpenCode 1.19.0 使用 bearer 连接隔离假 CommHub MCP，并实际调用 `send_message`
+4. 真 OpenCode 1.19.3 使用 bearer 连接隔离假 CommHub MCP，并实际调用 `send_message`
 5. full TUI 显示普通消息通知，且通知不污染下一条模型回复
 6. 两条真实任务 turn 后 TUI/server 仍在线
 7. busy task 未结束时普通消息先显示；把两条 drain 重新合并的 mutation 必须转红
@@ -444,4 +444,4 @@ sg docker -c 'docker rmi anet-test228:dev'
 ## 接第三方 OpenAI 兼容网关(2026-09-17 实测)
 
 安全模式下 `renderSafeRuntimeConfig`(`agent-node/src/runtime/opencode-acp/child-env.ts`)只保留 `anthropic`/`openai` 两个 provider id 且 `options` 清空,子进程 env 白名单不含 `OPENAI_BASE_URL`;节点目录里的 `opencode.json` 加 baseURL 会在下次 start 被丢掉。可行路径:`flags.opencodeUnsafeTools=true`(不再设 `OPENCODE_DISABLE_PROJECT_CONFIG`,工作区根目录 `opencode.json` 生效)+ `provider.anthropic.options.baseURL` + `provider.anthropic.models.<model>` + `--model anthropic/<model>`。`openai` preset 走 Responses API,兼容网关通常 500;自定义 provider id 被凭据白名单剥掉;内置 id 的 `npm` 不可覆盖。
-部署前置:`opencode-ai@1.19.0` 装在 umask 0022 的独立前缀;无 `/run/user/<uid>` 时用 `ANET_OPENCODE_SAFE_BASE` 指 0700 且父目录不带组写位、不在 `$HOME` 下的目录;agent-node 必须是所用 anet 的精确配对版本。
+部署前置:`opencode-ai@1.19.3` 装在 umask 0022 的独立前缀;无 `/run/user/<uid>` 时用 `ANET_OPENCODE_SAFE_BASE` 指 0700 且父目录不带组写位、不在 `$HOME` 下的目录;agent-node 必须是所用 anet 的精确配对版本。

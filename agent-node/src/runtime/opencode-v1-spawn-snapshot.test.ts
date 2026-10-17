@@ -49,7 +49,7 @@ function makePackageBinary(launchBase: string, script: string): string {
   mkdirSync(binDir, { mode: 0o700 });
   writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
     name: "opencode-ai",
-    version: "1.19.0",
+    version: "1.19.3",
     bin: { opencode: "./bin/opencode.exe" },
   }), { mode: 0o600 });
   writeFileSync(binary, script, { mode: 0o700 });
@@ -64,7 +64,7 @@ function stub(capturePath: string): string {
   return `#!/usr/bin/env bun
 import { appendFileSync } from "fs";
 const args = process.argv.slice(2);
-if (args.includes("--version")) { console.log("1.19.0"); process.exit(0); }
+if (args.includes("--version")) { console.log("1.19.3"); process.exit(0); }
 appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ argv: args, cwd: process.cwd(), env: { ...process.env } }) + "\\n");
 if (args[0] === "acp") {
   let buf = "";
@@ -92,7 +92,7 @@ if (args[0] === "acp") {
     req.resume();
     req.on("end", () => {
       const send = (v) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(v)); };
-      if (req.url === "/global/health") return send({ healthy: true, version: "1.19.0" });
+      if (req.url === "/global/health") return send({ healthy: true, version: "1.19.3" });
       if (req.url === "/session" && req.method === "POST") return send({ id: "ses_snapshot" });
       res.writeHead(404); res.end();
     });

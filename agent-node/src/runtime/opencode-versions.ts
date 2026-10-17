@@ -39,7 +39,7 @@ export interface OpencodeGenerationSupport {
 
 /** The V1 release pin. Kept as its own literal line so shell suites can
  *  read it with a single anchored sed (tests/test1225…/run.sh). */
-export const OPENCODE_V1_PIN = "1.19.0";
+export const OPENCODE_V1_PIN = "1.19.3";
 
 const OPENCODE_V1_SUPPORT: OpencodeGenerationSupport = Object.freeze({
   generation: "v1",
@@ -48,7 +48,7 @@ const OPENCODE_V1_SUPPORT: OpencodeGenerationSupport = Object.freeze({
   // Pin first, then the previous pins for one transition window (#541): a
   // host still holding an old exact install keeps starting and is told to
   // upgrade. Each entry passed the full Docker/E2E gate when it was the pin.
-  acceptedVersions: Object.freeze([OPENCODE_V1_PIN, "1.18.35", "1.18.34", "1.18.1"]),
+  acceptedVersions: Object.freeze([OPENCODE_V1_PIN, "1.19.0", "1.18.35", "1.18.34", "1.18.1"]),
   status: "supported",
 });
 
