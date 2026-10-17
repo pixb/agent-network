@@ -688,6 +688,37 @@ function renderCopresenceAuth(source: string | undefined): string {
   return rendered;
 }
 
+/**
+ * OpenCode Zen free tier classifies a model as free only from the locally
+ * cached model catalog (`.cache/opencode/models.json`). A fresh launch root
+ * has none, so a free-model request is rejected ("free tier can only be used
+ * from within OpenCode") before OpenCode gets a chance to fetch the catalog —
+ * even when tools are fully allowed. Seed the static, non-secret catalog from
+ * the operator's own cache so free models work on a cold launch root.
+ * Best-effort: when the source is absent OpenCode may still fetch it itself,
+ * so a miss must never fail the launch.
+ */
+function seedOpencodeModelCatalog(launchRoot: string, cacheRoot: string): void {
+  try {
+    const home = process.env.HOME || userInfo().homedir;
+    if (!home) return;
+    const source = join(home, ".cache", "opencode", "models.json");
+    const sourceStat = lstatIfPresent(source);
+    if (!sourceStat?.isFile()) return;
+    const targetDir = ensurePrivateChildDirectory(
+      launchRoot,
+      cacheRoot,
+      "opencode",
+      "OpenCode cache directory",
+    );
+    const target = join(targetDir, "models.json");
+    if (lstatIfPresent(target)) return;
+    atomicWritePrivateFile(target, readFileSync(source, "utf8"), "OpenCode model catalog cache");
+  } catch {
+    // Best-effort: never fail the launch over a cache warm-up.
+  }
+}
+
 function atomicWritePrivateFile(path: string, body: string, label: string,
   replace?: { original: string | undefined }): void {
   const parent = dirname(path);
@@ -1498,6 +1529,7 @@ export function buildOpencodeChildEnv(opts: BuildOpencodeChildEnvOptions): NodeJ
       "cache",
       "fresh OpenCode cache root",
     );
+    seedOpencodeModelCatalog(launchRoot, effectiveCache);
     const effectiveState = ensurePrivateChildDirectory(
       launchRoot,
       launchRoot,
