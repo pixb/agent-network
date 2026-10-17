@@ -23,6 +23,10 @@ COPY agent-node/src/runtime/opencode-timeout.ts /repo/agent-node/src/runtime/ope
 # board #656: runtime.ts imports ../capacity-retry for temporary capacity retry.
 COPY agent-node/src/runtime/capacity-retry.ts /repo/agent-node/src/runtime/capacity-retry.ts
 COPY agent-node/src/util/timeout.ts /repo/agent-node/src/util/timeout.ts
+# ded59ce7 added a runtime.test.ts case that reads ../../cli.ts as TEXT to assert
+# the resolved node model reaches the ACP opener. It is only parsed as a string
+# here (its imports are never resolved), so copying the single file is enough.
+COPY agent-node/src/cli.ts /repo/agent-node/src/cli.ts
 COPY tests/test386-opencode-agent-node-gate/ /test/
 
 # Real-package compatibility diagnostic for the common developer layout:
