@@ -1,0 +1,38 @@
+OpenCode V1 pin 1.19.0 → 1.19.3 — unit gate (test725)
+====================================================
+
+SOURCE_COMMIT   4f7942167aff1b3487c410d815c87fb6972c045b
+                 (chore(opencode): move the vetted V1 pin to opencode-ai@1.19.3)
+IMAGE           test725-pin193  (tests/test725-agent-node-unit-ci/Dockerfile)
+RUN             docker run --rm test725-pin193
+
+RESULT          PASS
+  pass          3029
+  skip          3
+  fail          0
+  files         238
+  tests_dir     executed=6 discovered=6 failed=0
+  witnessed-red MUTATION_RED readable-attachment-runtime-disconnected rc=1
+
+BASELINE        Same image on the pre-bump commit 3a0cf736 (merge of
+                origin/main + origin/pixb): 3029 pass / 3 skip / 0 fail.
+                The bump adds no test and removes none: counts match exactly.
+
+WHAT CHANGED
+------------
+Only the version table and the assertions/docs that name the pin:
+  agent-node/src/runtime/opencode-versions.ts       OPENCODE_V1_PIN = "1.19.3"
+  agent-network/src/opencode-versions.ts            byte-identical mirror
+  acceptedVersions  ["1.19.3","1.19.0","1.18.35","1.18.34","1.18.1"]  (whole window kept)
+Assertions updated: agent-node opencode-acp/binary.test.ts,
+opencode-backend.test.ts, opencode-v1-spawn-snapshot.test.ts,
+opencode-copresence/runtime.test.ts; agent-network opencode-pin.test.ts,
+opencode-package-binary.test.ts; agent-network/tests/fixtures/opencode-smoke-ignore-term.py.
+New rejected-version coverage added for 1.19.1 / 1.19.2 (never a repo pin).
+
+NOTES
+-----
+- The parity test (agent-network/src/opencode-versions-parity.test.ts) holds the
+  two table copies byte-identical; it passes.
+- targeted pre-run before the full image: agent-node opencode-* family 68 pass /
+  0 fail; agent-network opencode-pin + parity + package-binary 43 pass / 0 fail.

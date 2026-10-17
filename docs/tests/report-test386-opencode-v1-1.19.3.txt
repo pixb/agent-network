@@ -1,0 +1,392 @@
+OpenCode V1 pin 1.19.0 → 1.19.3 — real-package gate (test386)
+========================================================
+
+IMAGE   test386-pin193 (tests/test386-opencode-agent-node-gate/Dockerfile)
+RUN     docker run --rm -e REPORT_DIR=/out -v <host>:/out test386-pin193
+RESULT  OVERALL: PASS (rc=0)
+
+Key points for this pin:
+- the image installs the REAL opencode-ai@1.19.3 from npm; the non-root
+  umask-0002 identity gate passes on that real package;
+- "release pin opencode-ai@1.19.3 starts without a transition note";
+- "previous pin opencode-ai@1.18.35 still starts, hands 1.18.35 to agent-node,
+  prints the upgrade note" (note now names `anet opencode upgrade-pin 1.19.3`);
+- "unvetted opencode-ai@1.18.2 is refused with the release-pin install command"
+  (`npm install -g opencode-ai@1.19.3`);
+- agent-network typecheck and release bundle build PASS.
+
+Also repaired in this change: the five-line banner below was red before the pin
+bump too. ded59ce7 added a runtime.test.ts case that reads agent-node/src/cli.ts
+as text, but this Dockerfile never copied that file (ENOENT), so the "agent-node
+OpenCode … unit tests" step had been failing since ded59ce7 merged. Adding the
+single COPY line fixes it; cli.ts is only parsed as a string here.
+
+----- raw suite output below -----
+
+- expected pair (from source): agent-network@2.3.0-preview.180 + agent-node@2.5.0-preview.146
+- fixtures pinned to agent-node@2.5.0-preview.146
+# Test 386 — opencode-cli stale agent-node launch gate
+
+- date: 2026-10-17T18:58:08+00:00
+bun test v1.3.1 (89fa0f34)
+
+src/opencode-package-binary.test.ts:
+(pass) validateOpencodePackageBinary > accepts only the canonical exact npm package entrypoint [27.12ms]
+(pass) validateOpencodePackageBinary > rejects a same-version package impersonator inside the project [15.16ms]
+(pass) validateOpencodePackageBinary > skips a same-version project shim and selects a later trusted package [1.95ms]
+(pass) validateOpencodePackageBinary > rejects a monorepo-root package when invoked from a nested app [10.50ms]
+(pass) validateOpencodePackageBinary > ordinary 0664 checkout package.json does not abort boundary discovery [0.67ms]
+(pass) validateOpencodePackageBinary > accepts both exact registry spellings of bin.opencode [0.94ms]
+(pass) validateOpencodePackageBinary > rejects forged name, version, and bin metadata [1.54ms]
+(pass) validateOpencodePackageBinary > rejects world-writable files and package ancestors [1.40ms]
+(pass) validateOpencodePackageBinary > rejects a symlinked package.json even when its contents are exact [0.59ms]
+(pass) #739 cwd 参与信任判定 > 缺陷现状:cwd 为文件系统根时,禁止根含 / —— 与任何包路径都重叠 [0.10ms]
+(pass) #739 cwd 参与信任判定 > 缺陷现状:cwd=/ 时,一个各方面都合法的包也会被拒 [0.72ms]
+(pass) #739 cwd 参与信任判定 > 缺陷现状:cwd 是全局安装前缀的祖先时,全局安装的包被判成项目本地 [0.82ms]
+(pass) #739 cwd 参与信任判定 > 这条守卫要防的东西必须继续被防住(修 #739 时不许放宽它) [0.59ms]
+(pass) #1845 platform gate > linux and darwin are accepted, win32 is not [0.05ms]
+(pass) #1845 platform gate > win32 is refused before PATH is scanned, naming the platform [0.11ms]
+(pass) #1845 platform gate > darwin reaches the PATH scan (empty PATH → not-found, not a platform error) [0.09ms]
+(pass) resolveAcceptedOpencodePackageBinaryFromPath (transition window) > a host still on the previous pin 1.18.35 resolves and reports 1.18.35 [1.36ms]
+(pass) resolveAcceptedOpencodePackageBinaryFromPath (transition window) > the release pin wins even when the transition version is earlier on PATH [1.28ms]
+(pass) resolveAcceptedOpencodePackageBinaryFromPath (transition window) > an unvetted version is refused with the release-pin error [1.36ms]
+(pass) resolveAcceptedOpencodePackageBinaryFromPath (transition window) > the transition version still goes through the project-local identity gate [1.44ms]
+(pass) resolveAcceptedOpencodePackageBinaryFromPath (transition window) > an empty accepted set is a configuration error, not a silent pass [0.08ms]
+(pass) #543 — scoped V2 package identity (@opencode/cli) > V2 package admitted only when the caller names @opencode/cli [0.78ms]
+(pass) #543 — scoped V2 package identity (@opencode/cli) > the V2 gate refuses opencode-ai and a manifest/version mismatch [0.98ms]
+(pass) #543 — scoped V2 package identity (@opencode/cli) > PATH resolution with packageName finds the V2 entrypoint through npm's bin symlink [0.91ms]
+
+src/opencode-launch-env.test.ts:
+(pass) hardenOpencodeAgentNodeEnv > restores launcher PATH and strips every pre-entrypoint loader hook [2.80ms]
+(pass) hardenOpencodeAgentNodeEnv > does not mutate the caller's env object [0.12ms]
+(pass) hardenOpencodeAgentNodeEnv > strips case-variant loader and PATH keys for Windows semantics [0.09ms]
+
+src/opencode-preset.test.ts:
+(pass) OPENCODE_PRESETS registry > exports the two blessed presets (anthropic + openai) [0.09ms]
+(pass) OPENCODE_PRESETS registry > findOpencodePreset('anthropic') returns the record; unknown returns null [3.36ms]
+(pass) readPresetKeyFromEnv — env-only, no interactive prompt > returns the trimmed key when the env var is set [0.16ms]
+(pass) readPresetKeyFromEnv — env-only, no interactive prompt > returns null when the env var is missing / empty [0.06ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > body shape matches opencode auth.json convention [0.45ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > writes to <workdir>/.local/share/opencode/auth.json with mode 0o600 [17.45ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > writeOpencodeConfigJson lands under .config/opencode with 0o600 [16.56ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > keyless create atomically clears a private pre-planted auth file [16.80ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > default tool policy disables filesystem, shell, task, and skill tools [0.25ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > writes only blessed provider identity and strips all pre-planted routing/executable config [20.45ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > atomically replaces a private but invalid pre-planted config without parsing it [18.07ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > rejects symlink escapes in workDir, config/data ancestors, and final targets [6.80ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > validates the full tree before mutation so a bad auth side cannot partially rewrite config [0.77ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > rejects permissive modes and foreign owners without chmod-follow repair [5.10ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > prepares .anet/nodes/node before profile secrets and provides atomic private leaf I/O [50.44ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > accepts an ordinary 0775 project root for a non-root uid=gid private group [0.27ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > profile preflight rejects .anet/nodes/node and config/.env symlink chains before secret writes [5.99ms]
+(pass) buildAuthJsonBody + writeOpencodeAuthJson > profile preflight rejects writable ancestors and non-private node roots [1.25ms]
+
+src/opencode-owner-mode.test.ts:
+(pass) OpenCode owner/mode policy > accepts umask-0002 modes only for a non-root uid=gid layout [0.13ms]
+(pass) OpenCode owner/mode policy > always rejects world write and keeps root/foreign ownership strict [0.06ms]
+
+src/opencode-runtime-binding.test.ts:
+(pass) external OpenCode runtime binding > survives regular config runtime downgrade and proves the original exact runtime [30.78ms]
+(pass) external OpenCode runtime binding > read returns undefined only for absent state and deterministic keys separate nodes [31.66ms]
+(pass) external OpenCode runtime binding > an absent exact leaf does not impose POSIX modes on ordinary runtime state [1.05ms]
+(pass) external OpenCode runtime binding > unbound legacy symlink or junction-style node paths remain invisible [17.73ms]
+(pass) external OpenCode runtime binding > Windows synthetic permission bits do not disable structural security checks [0.48ms]
+(pass) external OpenCode runtime binding > secure removal is idempotent and removes the exact binding [23.63ms]
+(pass) external OpenCode runtime binding > secure removal refuses tampered content without unlinking it [15.74ms]
+(pass) external OpenCode runtime binding > rejects binding-directory and leaf symlinks [19.11ms]
+(pass) external OpenCode runtime binding > rejects dangling binding-root and exact-leaf symlinks [3.25ms]
+(pass) external OpenCode runtime binding > rejects permissive modes, hard links, and foreign ownership [19.34ms]
+(pass) external OpenCode runtime binding > rejects private but tampered runtime, identity, and extra fields [20.35ms]
+(pass) external OpenCode runtime binding > rejects binding roots that overlap the canonical project in either direction [3.70ms]
+(pass) external OpenCode runtime binding > a symlinked node workDir cannot remove another project's binding [18.73ms]
+(pass) assertOpencodeNodeStateUntracked > allows ordinary non-Git projects [1.83ms]
+(pass) assertOpencodeNodeStateUntracked > allows ordinary untracked projects inside a Git worktree checkout [305.16ms]
+(pass) assertOpencodeNodeStateUntracked > rejects forged Git worktree file markers [1.18ms]
+(pass) assertOpencodeNodeStateUntracked > allows ignored/untracked state but rejects git add -f tracked state [19.57ms]
+(pass) assertOpencodeNodeStateUntracked > rejects a force-added dotenv or any tracked file below the node directory [34.50ms]
+
+src/opencode-auth-login.test.ts:
+(pass) OpenCode manual auth-login sandbox > builds deterministic provider-specific API-key login argv [0.26ms]
+(pass) OpenCode manual auth-login sandbox > uses a fresh all-XDG tree and strips ambient credentials/config hooks [30.96ms]
+(pass) OpenCode manual auth-login sandbox > strictly consumes only the selected provider API record through a private leaf [29.05ms]
+(pass) OpenCode manual auth-login sandbox > refuses OAuth, mixed-provider and symlink auth shapes without disclosing secrets [29.64ms]
+(pass) OpenCode manual auth-login sandbox > persistent planted DB/log links are never exposed and cleanup never follows descendant links [29.26ms]
+(pass) OpenCode manual auth-login sandbox > cleanup unlinks a swapped root symlink but never removes its outside target [27.26ms]
+(pass) OpenCode manual auth-login sandbox > cleanup quarantines the tracked inode but leaves a regular root-name replacement untouched [31.11ms]
+(pass) OpenCode manual auth-login sandbox > a live tracked root whose literal name ends in deleted is still removed [31.04ms]
+(pass) OpenCode manual auth-login sandbox > Linux reports nlink zero for a removed directory retained by fd [18.83ms]
+(pass) OpenCode manual auth-login sandbox > cleanup retains inode ownership after bounded failure and succeeds on retry [33.27ms]
+(pass) OpenCode manual auth-login sandbox > refuses a concurrent live owner marker [42.84ms]
+(pass) OpenCode manual auth-login sandbox > refuses a provider that does not match the node's unique configured preset [22.28ms]
+(pass) OpenCode manual auth-login sandbox > prunes a dead owner's stale root without following its planted links [59.88ms]
+(pass) OpenCode manual auth-login sandbox > PID reuse does not retain a stale credential root [49.86ms]
+(pass) OpenCode manual auth-login sandbox > stale sweep resumes a crash-left quarantine while its owner marker remains [54.10ms]
+(pass) OpenCode manual auth-login sandbox > stale sweep removes an empty quarantine left after marker-last deletion [34.72ms]
+(pass) OpenCode manual auth-login sandbox > spawn-time revalidation rejects a hostile ancestor discovery candidate [39.44ms]
+(pass) OpenCode manual auth-login sandbox > with helper always cleans the fresh root when the action throws [32.84ms]
+
+src/opencode-agent-node-pair.test.ts:
+(pass) OpenCode agent-node release pairing > pins the exact versions being released together [0.97ms]
+(pass) OpenCode agent-node release pairing > rejects latest 2.4.x-style help and accepts the RFC-029 capability [0.10ms]
+(pass) OpenCode agent-node release pairing > codex bridge ignores stale PATH globals and resolves only the immutable pair [0.23ms]
+(pass) OpenCode agent-node release pairing > codex capability is explicit and fails closed when absent [0.09ms]
+(pass) OpenCode agent-node release pairing > admits only the exact preview package identity with safe file modes [4.40ms]
+(pass) OpenCode agent-node release pairing > skips an exact project-local impersonator and selects the later global package [4.29ms]
+
+src/opencode-smoke-env.test.ts:
+(pass) buildOpencodeSmokeEnv > locks the exact hardened ancestor candidate set [0.82ms]
+(pass) buildOpencodeSmokeEnv > rejects sticky world-writable /tmp instead of silently degrading [0.33ms]
+(pass) buildOpencodeSmokeEnv > inherits only transport/locale trust settings and controls all OpenCode roots [2.81ms]
+(pass) buildOpencodeSmokeEnv > every writable root can be precreated private, including XDG_RUNTIME_DIR [1.06ms]
+
+ 93 pass
+ 0 fail
+ 427 expect() calls
+Ran 93 tests across 8 files. [1.70s]
+PASS: exact pairing plus launch, auth-login, smoke-env, and preset security unit tests
+bun test v1.3.1 (89fa0f34)
+
+src/runtime/opencode-acp/runtime.test.ts:
+[opencode-acp] session/new — ses_selected...
+(pass) openOpencodeRuntime — selected model > new: bind before publication, never fall back on model errors [191.01ms]
+[opencode-acp] session/load ok — resumed ses_existing...
+(pass) openOpencodeRuntime — selected model > load: bind before publication, never fall back on model errors [144.34ms]
+[opencode-acp] session lost on restart — session/load(ses_existing...) failed (opencode ACP error id=2: -32602 fixture session gone); falling back to session/new. Prior conversation history is unavailable this turn.
+[opencode-acp] session/new — ses_selected...
+(pass) openOpencodeRuntime — selected model > lost-load: bind before publication, never fall back on model errors [142.17ms]
+[opencode-acp] session/new — ses_selected...
+(pass) openOpencodeRuntime — selected model > no-model: bind before publication, never fall back on model errors [115.90ms]
+[opencode-acp] session/new — ses_selected...
+(pass) openOpencodeRuntime — selected model > unavailable: bind before publication, never fall back on model errors [133.75ms]
+[opencode-acp] session/new — ses_selected...
+(pass) openOpencodeRuntime — selected model > unsupported: bind before publication, never fall back on model errors [167.48ms]
+[opencode-acp] session/load ok — resumed ses_existing...
+(pass) openOpencodeRuntime — selected model > loaded-unavailable: bind before publication, never fall back on model errors [144.34ms]
+(pass) openOpencodeRuntime — selected model > explicit empty or padded models fail before spawning [0.39ms]
+(pass) openOpencodeRuntime — selected model > headless CLI forwards the resolved node model into the ACP opener [0.97ms]
+[opencode-acp] session/new — ses_test...
+(pass) openOpencodeRuntime — cwd and tool policy > safe default keeps spawn + ACP session in one external launch workspace [111.47ms]
+[opencode-acp] session/new — ses_probe_au...
+(pass) openOpencodeRuntime — cwd and tool policy > version probe root is credential-free and gone before runtime auth is materialized [138.22ms]
+[opencode-acp] session/load ok — resumed ses_existing...
+(pass) openOpencodeRuntime — cwd and tool policy > safe session/load reuses the exact spawn PWD as its ACP cwd [114.06ms]
+[opencode-acp] session/new — ses_test...
+(pass) openOpencodeRuntime — cwd and tool policy > explicit unsafe flag restores project cwd and emits a trusted-task warning [100.46ms]
+[opencode-acp] session/new — ses_evidence...
+(pass) openOpencodeRuntime — cwd and tool policy > reports submission before exact prompt-response consumption [112.09ms]
+[opencode-acp] session/new — ses_test...
+(pass) openOpencodeRuntime — opening lifecycle > normal stop removes the launch root and copied vendor auth [104.20ms]
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+[opencode-acp] session/new — ses_test...
+(pass) openOpencodeRuntime — opening lifecycle > repeated open/stop cycles do not accumulate launch roots [2469.25ms]
+(pass) openOpencodeRuntime — opening lifecycle > an ancestor candidate planted by the version probe hard-fails before ACP spawn [71.09ms]
+(pass) openOpencodeRuntime — opening lifecycle > package replacement after credential-free probe is rejected and runtime auth root is discarded [77.81ms]
+(pass) openOpencodeRuntime — opening lifecycle > in-place binary self-modification after probe is rejected before credential spawn [77.15ms]
+(pass) openOpencodeRuntime — opening lifecycle > production rejects canonical same-version packages below project cwd or node workDir [44.21ms]
+(pass) openOpencodeRuntime — opening lifecycle > initialize failure force-kills the child before rejecting [125.12ms]
+(pass) openOpencodeRuntime — opening lifecycle > onClient exposes a stalled-handshake child synchronously for shutdown [72.78ms]
+[opencode-acp] session/new — ses_idle...
+(pass) opencodeThink — failed-turn lifecycle > prompt idle timeout force-kills the child before rejecting [155.12ms]
+[opencode-acp] session/new — ses_rescue_i...
+[opencode-acp] #383 thinking-only terminal turn (chunks=0 thoughtChunks=1) — re-prompting for plain-text final
+(pass) opencodeThink — failed-turn lifecycle > a failed thinking-only rescue discards the child before returning [145.08ms]
+
+src/runtime/opencode-acp/binary.test.ts:
+(pass) resolvePinnedOpencodeBinary > locks the non-root uid=gid umask-0002 compatibility policy [0.09ms]
+(pass) resolvePinnedOpencodeBinary > accepts the canonical package entrypoint and probes it from the external cwd [26.87ms]
+(pass) resolvePinnedOpencodeBinary > accepts an npm-style PATH shim but returns the canonical package binary [15.39ms]
+(pass) resolvePinnedOpencodeBinary > rejects a same-version fake package inside the project before executing it [1.41ms]
+(pass) resolvePinnedOpencodeBinary > rejects forged package metadata and noncanonical entrypoints [2.10ms]
+(pass) resolvePinnedOpencodeBinary > rejects unsafe file, package-directory, ancestor, and owner modes [3.25ms]
+(pass) resolvePinnedOpencodeBinary > still enforces exact --version output after package identity succeeds [16.84ms]
+(pass) resolvePinnedOpencodeBinary > refuses a caller-selected version other than the vetted release pin [0.75ms]
+(pass) resolvePinnedOpencodeBinary > rejects a same-version package in a monorepo ancestor before probing it [1.03ms]
+(pass) resolvePinnedOpencodeBinary > discovers a workspace ancestor when the configured project leaf is absent [0.49ms]
+(pass) resolvePinnedOpencodeBinary > launcher absolute path wins over a hostile search PATH [15.35ms]
+(pass) resolvePinnedOpencodeBinary > rejects non-absolute overrides [0.21ms]
+(pass) opencode pin transition > release pin is opencode-ai@1.19.3 with the retained transition window [0.28ms]
+(pass) opencode pin transition > transition note names the found version and the exact upgrade command [0.11ms]
+(pass) opencode pin transition > launcher-selected transition version is admitted and revalidates without an explicit version [12.79ms]
+(pass) opencode pin transition > without a launcher version, PATH resolution admits the pin, else the transition version [25.70ms]
+(pass) opencode pin transition > without a launcher version, an unvetted install is still rejected with the release-pin error [1.40ms]
+(pass) opencode pin transition > a package whose manifest says 1.18.35 but reports another version is rejected [14.88ms]
+
+src/runtime/opencode-acp/profile-state.test.ts:
+(pass) OpenCode private profile state > loads, atomically updates, backs up, and writes a session [59.85ms]
+(pass) OpenCode private profile state > an existing session without a model baseline keeps the TUI selection [0.05ms]
+(pass) OpenCode private profile state > a post-load config symlink cannot redirect session writeback [0.48ms]
+(pass) OpenCode private profile state > boot refuses a config symlink before self-heal can write its target [0.50ms]
+(pass) OpenCode private profile state > backup refuses a pre-planted .prev symlink [0.38ms]
+(pass) OpenCode private profile state > runtime hint rejects suspicious config leaves for every runtime [0.38ms]
+
+src/runtime/opencode-acp/events.test.ts:
+(pass) reduceOpencodeAcpNotification — session/update dispatch > agent_message_chunk with text content → replyText += content.text [0.07ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > agent_thought_chunk with text → thoughtText, NOT replyText (grok discipline) [0.06ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > tool_call and tool_call_update both bump toolCalls [0.04ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > usage_update snaps totalTokens into state.usage [0.04ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > available_commands_update consumed silently (session-init only) [0.03ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > agent_message_chunk without text content adds a warning [0.04ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > unknown method returns ignored without mutating state [0.03ms]
+(pass) reduceOpencodeAcpNotification — session/update dispatch > unknown sessionUpdate subtype returns ignored (forward-compat) [0.02ms]
+(pass) reduceOpencodeAcpResponse — session/prompt terminal response > captures stopReason + usage from result [0.10ms]
+(pass) reduceOpencodeAcpResponse — session/prompt terminal response > missing stopReason still marks turn complete [0.04ms]
+(pass) reduceOpencodeAcpFrames — replay the Phase 0b captured turn > full one-word turn: 10 thought chunks + 1 message chunk + usage + response [0.18ms]
+(pass) reduceOpencodeAcpFrames — replay the Phase 0b captured turn > thinking-only terminal turn (no agent_message_chunk) — replyText stays empty [0.06ms]
+
+src/runtime/opencode-acp/child-env.test.ts:
+(pass) buildOpencodeChildEnv — deny-by-default boundary > locks the exact hardened ancestor candidate set [0.04ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > rejects sticky world-writable /tmp instead of silently degrading [1.47ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > passes only runtime/network allowlist and controls all state roots [20.14ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > safe inline policy disables every local tool without replacing provider/model [20.61ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > unsafe opt-in explicitly overrides the wizard's persisted safe policy [12.28ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > Zen free-tier model catalog seeding > seeds models.json from the operator cache so free models work on a cold launch root [16.46ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > Zen free-tier model catalog seeding > skips seeding (best-effort) when the operator has no cached catalog [9.43ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > detects exact managed config sources across Linux, Windows, and macOS [0.63ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > safe runtime renders ordinary same-uid config through a strict allowlist [19.82ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > copies only blessed API auth fields into fresh data and keeps persistent state outside the child [26.72ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > never exposes planted persistent DB/log/cache/state/tmp descendants in safe or unsafe mode [29.41ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > removes a partially built launch tree when env construction fails [18.21ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > pre-spawn revalidation hard-fails when an ancestor discovery candidate appears [19.49ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > keeps active roots but reclaims a dead-owner crash root without following symlinks [60.62ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > reclaims dead-owner roots after the node workDir is deleted or recreated [85.63ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > a transient cleanup pathname swap is retried after child exit [36.38ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > a dead owner marker is retained while an orphan child still references the root [107.87ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > an exact exited-process identity exemption never hides a live descendant or PID mismatch [179.83ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > #517 a process caught inside execve() is never read as unrelated to the launch root [98.51ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > rejects symlinks at workDir and every security-sensitive state layer [13.87ms]
+(pass) buildOpencodeChildEnv — deny-by-default boundary > rejects permissive modes and foreign ownership without repairing them [1.20ms]
+
+src/runtime/opencode-acp/client.test.ts:
+(pass) OpencodeAcpClient — request/response correlation > request() resolves with the matching response's result [41.29ms]
+(pass) OpencodeAcpClient — request/response correlation > error response rejects the promise with a shaped message [42.64ms]
+(pass) OpencodeAcpClient — streaming notifications > emits 'notification' for every session/update frame [42.19ms]
+(pass) OpencodeAcpClient — streaming notifications > id-carrying reverse requests get an explicit method-not-found response [40.48ms]
+(pass) OpencodeAcpClient — process lifecycle > child exit rejects all pending requests [29.41ms]
+(pass) OpencodeAcpClient — process lifecycle > requestWithIdleTimeout(…, 0) disables the idle deadline (OPENCODE_TIMEOUT_MS=0) [537.04ms]
+(pass) OpencodeAcpClient — process lifecycle > isRunning flips false after stop() [1.34ms]
+(pass) OpencodeAcpClient — process lifecycle > explicit child env is not merged with the client's process.env [35.48ms]
+
+ 89 pass
+ 0 fail
+ 838 expect() calls
+Ran 89 tests across 6 files. [6.80s]
+PASS: agent-node OpenCode package, child-env, profile-state, ACP client/events, and runtime unit tests
+Error: opencode safe mode refuses OS-managed config source /etc/opencode/opencode.json; managed MCP/tools load after inline config
+PASS: safe runtime rejects exact /etc/opencode managed source before hostile MCP/version spawn
+$ tsc --noEmit
+PASS: agent-network typecheck
+$ bun build src/client.ts --outdir dist/src --target node --minify && bun build src/daemon-capability-display.ts --outdir dist/src --target browser --minify && bun build bin/cli.ts --outdir dist/bin --target node --minify --external @sleep2agi/commhub-server --external bun:sqlite --external '../../server/*' && bun build src/node-server.ts --outdir dist/src --target node --minify && bun build src/im/feishu/worker.ts --outdir dist/src/im/feishu --target node --minify --external @larksuiteoapi/node-sdk && tsc --emitDeclarationOnly --declaration --outDir dist && bun x javascript-obfuscator dist/bin/cli.js --output dist/bin/cli.js --compact true --string-array true --string-array-encoding base64 && bun x javascript-obfuscator dist/src/client.js --output dist/src/client.js --compact true --string-array true && bun x javascript-obfuscator dist/src/node-server.js --output dist/src/node-server.js --compact true --string-array true && node scripts/stamp-node-server-version.mjs && cp bin/anet.cjs dist/bin/anet.cjs
+Bundled 3 modules in 45ms
+
+  client.js  5.79 KB  (entry point)
+
+Bundled 1 module in 4ms
+
+  daemon-capability-display.js  5.34 KB  (entry point)
+
+Bundled 346 modules in 292ms
+
+  cli.js  1.71 MB  (entry point)
+
+Bundled 248 modules in 235ms
+
+  node-server.js  0.33 MB  (entry point)
+
+Bundled 601 modules in 624ms
+
+  worker.js  2.30 MB  (entry point)
+
+
+[javascript-obfuscator-cli] Obfuscating file: dist/bin/cli.js... 
+
+[javascript-obfuscator-cli] Obfuscating file: dist/src/client.js... 
+
+[javascript-obfuscator-cli] Obfuscating file: dist/src/node-server.js... 
+stamped /repo/agent-network/dist/src/node-server.js with 2.3.0-preview.180
+PASS: agent-network release bundle build
+PASS network validator: /home/bun/prefix/node_modules/opencode-ai/bin/opencode.exe
+PASS agent-node validator + version probe: /home/bun/prefix/node_modules/opencode-ai/bin/opencode.exe
+PASS private uid=gid group-write paths: 6
+PASS: non-root uid=gid=1000 umask-0002 real opencode-ai@1.19.3 passes network and agent-node gates
+[anet] OpenCode anthropic API-key login for 'auth-gate' (exact opencode-ai@1.19.3, fresh private state).
+[anet] Persistent auth changes only after upstream exits 0 and the credential shape validates.
+[anet] ✗ OpenCode auth-login failed; persistent auth unchanged: upstream login exited without success (code=64 signal=none)
+PASS: failed upstream auth-login exits nonzero, preserves old auth, and cleans its disposable root
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] using installed exact @sleep2agi/agent-node@2.5.0-preview.146.
+[anet] Token: ntok_…tial
+PASS: stale global bypassed; later exact global received protected PATH/binary/version/base; npx was not executed
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] opencode-ai@1.18.35 is the previous release pin and is still accepted for now; upgrade to the vetted opencode-ai@1.19.3 with: anet opencode upgrade-pin 1.19.3
+[anet] using installed exact @sleep2agi/agent-node@2.5.0-preview.146.
+[anet] Token: ntok_…tial
+PASS: previous pin opencode-ai@1.18.35 still starts, hands 1.18.35 to agent-node, prints the upgrade note
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] using installed exact @sleep2agi/agent-node@2.5.0-preview.146.
+[anet] Token: ntok_…tial
+PASS: release pin opencode-ai@1.19.3 starts without a transition note
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] Incompatible opencode-ai runtime.
+[anet] Expected trusted opencode-ai@1.19.3; opencode package identity/version check failed: no trusted exact opencode-ai package entrypoint found on PATH; first rejected candidate: resolved executable is not exact opencode-ai@1.19.3 package identity
+  → Install/reinstall exact: npm install -g opencode-ai@1.19.3
+PASS: unvetted opencode-ai@1.18.2 is refused with the release-pin install command
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] using installed exact @sleep2agi/agent-node@2.5.0-preview.146.
+[anet] Token: ntok_…tial
+PASS: same-version project-local OpenCode/agent-node payloads skipped; canonical external packages launched
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] Incompatible agent-node for opencode-cli.
+[anet] ANET_AGENT_NODE_BIN is not the exact trusted @sleep2agi/agent-node@2.5.0-preview.146: project/node-local agent-node package payload is not trusted
+Install the exact vetted pair: npm install -g @sleep2agi/agent-network@2.3.0-preview.180 @sleep2agi/agent-node@2.5.0-preview.146
+[anet] Refusing to start: an unsupported agent-node could silently select another runtime.
+PASS: explicit exact project-local agent-node is rejected before execution and without npx
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] using installed exact @sleep2agi/agent-node@2.5.0-preview.146.
+[anet] Token: ntok_…tial
+PASS: capable-looking global preview.21 rejected; later exact global 2.5.0-preview.146 launched without npx
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] Incompatible agent-node for opencode-cli.
+[anet] ANET_AGENT_NODE_BIN is not the exact trusted @sleep2agi/agent-node@2.5.0-preview.146: resolved agent-node package is not exact version 2.5.0-preview.146
+Install the exact vetted pair: npm install -g @sleep2agi/agent-network@2.3.0-preview.180 @sleep2agi/agent-node@2.5.0-preview.146
+[anet] Refusing to start: an unsupported agent-node could silently select another runtime.
+PASS: ANET_AGENT_NODE_BIN cannot bypass the exact hardened pair
+[anet] Starting new session for "gate" [opencode-cli]...
+
+[anet] Incompatible agent-node for opencode-cli.
+[anet] No exact trusted global @sleep2agi/agent-node@2.5.0-preview.146 is available (no exact trusted @sleep2agi/agent-node@2.5.0-preview.146 package entrypoint found on PATH; first rejected candidate: @sleep2agi/agent-node@2.5.0-preview.146 entrypoint is outside node_modules/@sleep2agi/agent-node); automatic npx execution is disabled for opencode-cli
+Install the exact vetted pair: npm install -g @sleep2agi/agent-network@2.3.0-preview.180 @sleep2agi/agent-node@2.5.0-preview.146
+[anet] Refusing to start: an unsupported agent-node could silently select another runtime.
+PASS: no exact global rejects startup, executes no npx, and prints exact dual-package remediation
+
+OVERALL: PASS

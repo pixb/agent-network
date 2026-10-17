@@ -1,0 +1,101 @@
+OpenCode V1 pin vetting: 1.19.0 → 1.19.3
+========================================
+
+Board #541 / RFC-029 §8 D6 — before a new upstream version may replace the
+vetted exact pin, the five safety surfaces must be compared item by item and
+the object-form wildcard deny precedence re-checked. Only then may the
+item-by-item deny list be reused (docs/runbooks/opencode-tui-copresence.md,
+"安全与生命周期"). This file is that evidence.
+
+UPSTREAM
+--------
+repo            github.com/sst/opencode (API: repositories/975734319)
+compare         v1.19.0...v1.19.3
+total_commits   10
+files_changed   87
+npm identity    opencode-ai@1.19.3, bin { opencode: bin/opencode.exe }  (name/bin unchanged vs 1.19.0)
+dist-tag        `latest` == 1.19.3 at vetting time
+
+commits in range
+  dfb56f76 sync release versions for v1.19.0
+  abce98e0 docs(web): add Cat Jam Free to Zen docs (#55028)
+  a95d9c0f docs(web): correct Cat Jam Free data policy in Zen docs (#55500)
+  d320177a fix(opencode): discontinue session sharing (#55718)
+  bc7c890d sync release versions for v1.19.1
+  3be03959 fix(opencode): keep OpenCode 1 updates on 1.x using npm discovery (#54904)
+  e03feec3 sync release versions for v1.19.2
+  d12161ee feat(opencode): build variants from configured reasoning options (#55854)
+  60c9be09 chore: generate
+  e3c4eb24 release: v1.19.3
+
+INTERVENING PATCH RELEASES 1.19.1 / 1.19.2
+------------------------------------------
+Both are release-version syncs (`sync release versions for v1.19.1/.2`); 1.19.1
+also carries #54904 (OpenCode 1 update discovery pinned to 1.x via npm), 1.19.2
+carries #55854 (reasoning variants). Neither touches a safety surface. Neither
+1.19.1 nor 1.19.2 was ever a pin in this repo, so neither is in the accepted
+set for 1.19.3 (only the four former pins are).
+
+FIVE SURFACES — item by item
+----------------------------
+① env-var switches our safety layer sets
+  Verdict: UNCHANGED (net -1 unrelated var).
+  The ONLY OPENCODE_* env read removed anywhere in the diff is
+  `OPENCODE_DISABLE_SHARE`, deleted together with the whole share-next module
+  (packages/opencode/src/share/share-next.ts, removed). agent-node does not set
+  it. The vars this repo depends on —
+  OPENCODE_PERMISSION / OPENCODE_PURE / OPENCODE_CONFIG_CONTENT /
+  OPENCODE_DISABLE_PROJECT_CONFIG — appear in no diff hunk.
+
+② config path / managed config / instruction discovery
+  Verdict: UNCHANGED. No file under packages/opencode/src/config/* is in the
+  diff; `Config.node` stays in the same layer groups
+  (effect/bootstrap-runtime.ts, project/bootstrap.ts). The only `directory`
+  reference in any patch belongs to the removed share-next.ts.
+
+③ permission module
+  Verdict: UNCHANGED. No file under packages/opencode/src/permission/* in the
+  diff. Because the module is byte-identical, the object-form wildcard ordering
+  (object wildcards sorted last) is unchanged, so the item-by-item deny list
+  keeps its proven precedence. No need to regenerate the deny list.
+
+④ built-in tool set
+  Verdict: UNCHANGED. No file under packages/opencode/src/tool/* in the diff.
+
+⑤ serve/attach flags + session REST routes
+  Verdict: UNCHANGED. The `serve` and `attach` command files are untouched; no
+  route definition is added or removed. packages/sdk/openapi.json changes are
+  purely additive (+53/-0): one optional `reasoning_options` field on the model
+  config schema. The only server.ts hunk drops the ShareNext layer node (share
+  feature retired); SessionShare and every session route stay.
+  Note (not this surface): the `run` command's `--share` flag is now
+  deprecated/hidden — a headless `run` flag, not serve/attach.
+
+NON-SURFACE CHANGES (recorded, not safety-relevant)
+---------------------------------------------------
+- session sharing discontinued (#55718): share-next removed, `OPENCODE_DISABLE_SHARE` gone.
+- model `reasoning_options` → reasoning variants (#55854).
+- `opencode upgrade` / update check (#54904): `Installation.latest` now discovers
+  1.x releases from npm for every install method and `isUpdate()` only offers
+  updates within the same major; `Installation.latest` failures are swallowed so
+  /update reports "Couldn't check for updates." It remains notify/prompt only —
+  there is still no auto-install, which is what an exact pin requires.
+- packages/migrations, TUI/session-UI, web/docs, install/publish scripts — no
+  safety surface.
+
+VERDICT
+-------
+Five surfaces: 0 changes. The existing item-by-item deny list and the safe
+runtime preset (renderSafeRuntimeConfig / renderCopresenceAuth / child-env
+allowlist) remain valid for opencode-ai@1.19.3. Pin bump approved on the
+source-comparison gate; the runtime gate is recorded in
+docs/tests/report-test386-opencode-v1-1.19.3.txt and
+docs/tests/report-test725-opencode-v1-1.19.3.txt.
+
+METHOD / REPRO
+--------------
+Read-only, run from the host through the build proxy; no host or production
+change. `curl -sSL https://api.github.com/repos/sst/opencode/compare/v1.19.0...v1.19.3`
+then inspected each changed file's patch, filtering for the five surface paths
+and for `OPENCODE_`. Package identity from `npm view opencode-ai@1.19.3 name
+version bin` and `npm view opencode-ai dist-tags.latest`.
