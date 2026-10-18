@@ -40,15 +40,66 @@ cd agent-network && npm run build && npm pack --pack-destination <out>
 
 ## 安装（目标机器）
 
+两个 tgz **必须一起装**（本次改动横跨两包）。两条路子：
+
 ```bash
-# 装进一个新的私有 prefix，不要覆盖正在运行的节点
-npm install --prefix "$HOME/.anet-bin/pair182-147" --ignore-scripts --no-audit --no-fund \
+cd /path/to/tgz          # ← 关键：裸文件名按 cwd 解析
+
+# A. 全局（像 tests/qa-*/Dockerfile 那样；会覆盖该机已有的全局 anet/agent-node）
+npm i -g --allow-scripts=node-pty,protobufjs \
+  sleep2agi-agent-network-2.3.0-preview.182.tgz \
+  sleep2agi-agent-node-2.5.0-preview.147.tgz
+
+# B. 私有 prefix（不扰动在跑的节点；需自己把 <prefix>/node_modules/.bin 加进 PATH）
+npm install --prefix "$HOME/.anet-bin/pair182-147" --allow-scripts=node-pty,protobufjs \
+  --no-audit --no-fund \
   ./sleep2agi-agent-network-2.3.0-preview.182.tgz \
   ./sleep2agi-agent-node-2.5.0-preview.147.tgz
-# 或像 tests/qa-*/Dockerfile 那样：npm install -g <两个 tgz>
 ```
 
+安装路径解析（实测 `npm-package-arg` 判定）：
+
+- `*.tgz` / `*.tar.gz` 结尾的**裸文件名会被当成文件规格**（`type: "file"`），解析成
+  `$PWD/<name>`——所以 `cd` 到 tgz 目录后直接写文件名是**可用**的（已实测装成）。
+  换个目录跑就会 ENOENT；要不就写 `./` 或绝对路径，最稳。
+- 注意这里**不能用 `--ignore-scripts`**：npm 12 默认就拦截安装脚本，再叠一层
+  `--ignore-scripts` 会让 node-pty 永远编不出来（见下）。
+
+⚠️ **npm 12 的 install-scripts 默认拦截（本次踩到）**
+
+npm 12 默认不跑未被 `allowScripts` 覆盖的安装脚本，`npm i -g` 会提示：
+
+```
+npm warn install-scripts 2 packages had install scripts blocked ...
+npm warn install-scripts   node-pty@1.1.0 (install: node scripts/prebuild.js || node-gyp rebuild; postinstall: ...)
+npm warn install-scripts   protobufjs@7.6.6 (postinstall: node scripts/postinstall)
+```
+
+- 🔴 **`node-pty` 必须放行**（agent-node 的 optionalDependency）。它的 `prebuilds/` 只有
+  `darwin-arm64 / darwin-x64 / win32-arm64 / win32-x64`——**没有 linux**；`prebuild.js`
+  只是一段**纯本地检查**（存在就 exit 0，不下载任何东西），Linux 上必然回退到
+  `node-gyp rebuild`。被拦 → 没有 `build/Release/pty.node`。
+  影响面精确只有一处：**grok co-presence 运行时**
+  （`agent-node/src/runtime/grok-copresence/runtime.ts:4115`，catch 里抛
+  `grok copresence requires optional dependency node-pty`）；claude / codex / opencode
+  三个运行时不受影响。
+  放行后 node-gyp 会在本机编译，**要求目标机器有工具链**：python3 / make / g++(cc) /
+  node-gyp（本次实测 python 3.12.13 + make + g++ + node-gyp 齐备即编成）。
+- `protobufjs` 的 postinstall **无害**：它只在 `pkg.versionScheme` 存在时才做事，否则直接
+  return，属告警性质；且本机那个 `protobufjs@7.6.6` 是全局提升的，同时被一个与我们无关的
+  全局包（`@earendil-works/pi-coding-agent` → `pi-ai` → `@google/genai`）依赖。
+  放不放行都不影响本包。
+
+其余：
+
+- 两个 tgz 都声明了 registry 依赖（agent-network：`smol-toml`/`@inquirer/prompts`/
+  `@larksuiteoapi/node-sdk`/`markdown-it`/`puppeteer-core`/`ws`；agent-node：
+  `@anthropic-ai/claude-agent-sdk`/`undici`/`ws`/`zod` + optional `@openai/codex*`/
+  `node-pty`），所以目标机器**必须能连 npm registry**（本次 278 packages，约 1–2 分钟）。
+- `agent-network` 声明 `engines: node >=22.13, bun >=1.2`；`bun` 只在 `anet hub start` 时用得上。
 - 装完**重启节点**才生效；**保留旧 prefix / 旧 tgz 以便回滚**。
+- 方式 A 与 AGENTS「不改本地全局 npm 包」相抵触——**开发机上优先用 B（私有 prefix）**，
+  生产目标机上若该机本来就靠全局 `anet` 跑，用 A 并接受覆盖全局。
 - 🔴 **不要用 `anet upgrade` 装这个**：它走 npm dist-tag，只会拉到官方已发布版本，
   拿不到我们的 182/147。
 - agent-node 运行时会自己去取 `opencode-ai@1.19.3`，目标机器需要能连 npm（或预先铺好二进制）。
@@ -65,6 +116,19 @@ npm install --prefix "$HOME/.anet-bin/pair182-147" --ignore-scripts --no-audit -
   `dist/src/node-server-payload.d.ts:62` 的一句注释（`` `Bun.build()` ``），非可执行代码。
 - 该容器里 `anet --version` 会打印「Bun (bunx) not found」——这是**容器现象**：镜像只有
   `/usr/local/bin/bun`，没有 `bunx` 这个入口，与包本身无关。
+
+**全局 `-g` 实装（2026-10-18，develop 机，node v26.8.1 / npm 12.0.2）**：
+
+- 在 tgz 目录下 `npm i -g <两个裸文件名>` 直接装成：`added 278 packages in 2m`，
+  无 E404、无路径报错——证明裸文件名当文件规格这条路可用。
+- 第一次没放行脚本 → `node-pty` 无 `build/Release/`、`prebuilds` 无 linux 目录。
+- 加 `--allow-scripts=node-pty,protobufjs` 重装（不必先卸载）→
+  `changed 278 packages in 1m`，随后 `build/Release/pty.node`（76536 B）生成，
+  `require('node-pty')` 成功、导出 `spawn/fork/createTerminal/open/native`。
+- 落点：全局 `@sleep2agi/agent-network@2.3.0-preview.182`、
+  `@sleep2agi/agent-node@2.5.0-preview.147`；`@sleep2agi/commhub-server` 未安装（预期，
+  由 `anet hub start` 走 bunx 拉）。
+- 该机当时**没有 agent-node / anet 进程在跑**，故无「重启节点」动作。
 
 ## 未做的（缺口）
 
