@@ -1,0 +1,75 @@
+# 本方配对 tgz：agent-network 2.3.0-preview.182 + agent-node 2.5.0-preview.147
+
+本仓库（`pixb`）**不进上游、不发 npm**，所以本方改动要装到别的机器上，只能用我们自己
+构建并打包的 tgz。本次改动横跨两个包，**必须成对安装**。
+
+- 构建来源：`pixb` @ `f6e3fc29f54d6cb8549e28a4dc82f98433f4bf64`
+  （产品代码与发版准备尖端 `30aad91b` 一致：`agent-node/src`、`agent-network/src`、
+  `agent-network/bin` 的 diff 为空；`30aad91b` 之后的提交只改 `AGENTS.md` 和文档）
+- 日期：2026-10-18
+
+## 产物
+
+| 文件 | 大小 | SHA256 |
+|---|---|---|
+| `sleep2agi-agent-network-2.3.0-preview.182.tgz` | 2107483 | `557ebeca41a283562686a46d09e83e51fae1d5e99a7618d1525c3b4e03e819e2` |
+| `sleep2agi-agent-node-2.5.0-preview.147.tgz` | 610510 | `86e057be68e6d0093e819b933150d5b8f3ea0f64e727f55c789da19bf76e4f20` |
+
+两个包各承载什么：
+
+- `agent-network` → `dist/bin/anet.cjs`：OpenCode V1 pin 表**镜像**、RFC-029 release pair 常量。
+- `agent-node` → `dist/cli.js`：pin 的**实际执行方**（`opencode-ai@1.19.3`）、OpenCode Zen 目录种子。
+- `server/`（hub）本次未改动，**沿用已发布的那版**即可，不必跟着换。
+
+## 重建
+
+`files` 都只有 `["dist"]`，而 `npm pack` **不会**跑 `prepublishOnly`（那只在 `npm publish`
+时触发）——所以**必须先 build 再 pack**，否则打出来的是旧构建（实测过：旧的
+`agent-node/dist/cli.js` 里还是 pin `1.19.0`）甚至空包（`agent-network/dist` 当时根本不存在）。
+
+```bash
+# 需要 bun（本次用 bun 1.4.0 / node v26.8.1）
+cd agent-node    && npm run build && npm pack --pack-destination <out>
+cd agent-network && npm run build && npm pack --pack-destination <out>
+```
+
+`agent-network` 的 build 还要求依赖装齐（本次 `node_modules` 缺 `smol-toml`，补了一次
+`npm install`）。
+
+## 安装（目标机器）
+
+```bash
+# 装进一个新的私有 prefix，不要覆盖正在运行的节点
+npm install --prefix "$HOME/.anet-bin/pair182-147" --ignore-scripts --no-audit --no-fund \
+  ./sleep2agi-agent-network-2.3.0-preview.182.tgz \
+  ./sleep2agi-agent-node-2.5.0-preview.147.tgz
+# 或像 tests/qa-*/Dockerfile 那样：npm install -g <两个 tgz>
+```
+
+- 装完**重启节点**才生效；**保留旧 prefix / 旧 tgz 以便回滚**。
+- 🔴 **不要用 `anet upgrade` 装这个**：它走 npm dist-tag，只会拉到官方已发布版本，
+  拿不到我们的 182/147。
+- agent-node 运行时会自己去取 `opencode-ai@1.19.3`，目标机器需要能连 npm（或预先铺好二进制）。
+
+## 已验证
+
+在 Docker（`test725-release182` 镜像，node v22.23.3）里装进私有 prefix 后：
+
+- `anet --version` → `anet v2.3.0-preview.182`，且同一输出里
+  **Components → ✅ agent-node v2.5.0-preview.147** —— 配对识别成立。
+- `agent-node --version` → `agent-node v2.5.0-preview.147`。
+- 落点版本：agent-network `2.3.0-preview.182`、agent-node `2.5.0-preview.147`。
+- 产物卫生：`dist` 里的 **JS 产物 `Bun.` 计数 = 0**。整个 `dist` 只命中 1 处，位置是
+  `dist/src/node-server-payload.d.ts:62` 的一句注释（`` `Bun.build()` ``），非可执行代码。
+- 该容器里 `anet --version` 会打印「Bun (bunx) not found」——这是**容器现象**：镜像只有
+  `/usr/local/bin/bun`，没有 `bunx` 这个入口，与包本身无关。
+
+## 未做的（缺口）
+
+- 这两个 tgz **没有上游四门来源**（它们是本仓库自建），所以不能按「必须来自精确 merged
+  main 且四门全绿」那条给生产做发版依据；本记录只声明「这两个字节来自上面那个提交，
+  且能装、能起、版本与配对正确」。
+- 未做真实 hub + 真实节点的 E2E（本次只做了安装与版本烟测）；如需，应照
+  `tests/test384-opencode-local-package-e2e` 的形状补一个 Docker 套件。
+- 产物文件目前放在 `/tmp/opencode/pair182-147/`，**未入库**；入库策略（是提交 tgz 还是只
+  提交本记录 + 重建步骤）待定，按「可重建」规则，本记录 + sha256 是可复现输入的权威来源。
