@@ -1,0 +1,41 @@
+# test725 单元门 — OpenCode V1 1.19.3 / 发版 2.3.0-preview.182 + 2.5.0-preview.147
+
+- 套件：`tests/test725-agent-node-unit-ci`（bun 单元域，完整 agent-node src）
+- 镜像：`test725-release182`（`docker build -f tests/test725-agent-node-unit-ci/Dockerfile`）
+- SOURCE_COMMIT：`211f2b5c22255d4e3570c80dcea03a75c4a8ab6f`
+  （`docs(release): 2.3.0-preview.182 / 2.5.0-preview.147 发布说明`）
+- 日期：2026-10-18
+
+## 结果
+
+| 轮次 | pass | skip | fail | RESULT |
+|---|---|---|---|---|
+| 第 1 轮（整域） | 3027 | 3 | 2 | （2 条 grok 用例红） |
+| 第 2 轮（整域） | **3029** | **3** | **0** | **PASS** |
+
+被跳过（预期，非失败）：native Windows 生成/TCP 归属、#1957 attach TUI 记录重启、
+真实 V2 shared server 加载 project 级 registry —— 三条都需要真 tmux / 真平台。
+
+## 第 1 轮的两条失败 = 负载下的顺序敏感抖动，不是回归
+
+```
+(fail) runGrokAcpTurn runtime evidence > separates prompt submission from exact prompt-response consumption
+(fail) runGrokAcpTurn model selection (#1958) > configured model goes on argv, is applied with session/set_model, and the readback is reported
+```
+
+判据是**隔离复跑**：`agent-node/src/runtime/grok-build-acp/runtime.test.ts`
+在同一镜像里连跑 3 次，每次 **6 pass / 0 fail**。整域第 2 轮也 0 fail。
+⇒ 两条用例在整域并行下的时间窗口里会抖，与本次 pin 提升 / 版本号无关。
+（同一镜像、同一提交，两轮整域一红一绿，是抖动而非确定性回归。）
+
+## 与本版相关的门
+
+- `agent-network/src/opencode-agent-node-pair.test.ts`：提 pin 之后**由红转绿**。
+  上游 `2.3.0-preview.181` 的 release 提交漏跑 `scripts/sync-pinned-versions.sh`，
+  把 `PAIRED_AGENT_NETWORK_VERSION` 留在 `2.3.0-preview.180` 而 `package.json` 已是
+  `181`，该断言（常量 == package.json 版本）在**上游 main 上即为红**。
+  本次按 SOP §2 Step 2 跑全同步脚本，常量随两包一起前移，红转绿。
+- pin 相关断言（`opencode-acp/binary.test.ts`、`opencode-backend.test.ts`、
+  `opencode-v1-spawn-snapshot.test.ts`、`opencode-copresence/runtime.test.ts`、
+  `agent-network/src/opencode-pin.test.ts`、`opencode-versions-parity.test.ts`）
+  均在整域内通过。
