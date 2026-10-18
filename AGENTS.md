@@ -13,10 +13,37 @@
 ## 开发规则
 
 - **不频繁发 npm preview**：本地源码开发，大版本完成时统一发
-- **对外 npm 产物只从 main 发布**：功能分支可构建、打包和测试，但不得向 npm 发布包或 executable；release 变更必须先合入 `main`，再从该 `main` 精确提交发布
+- **不在 `main` 上提交任何东西**：`main` 只用来同步上游，见下面的「分支与仓库」。
+- **npm 发布只走 GitHub Actions 的 release 流程**：本机只开发、构建、打包、测试，不向 npm 发布任何包或 executable；且只发 preview 通道，`latest` 升迁是单独一步。
 - **不改本地全局 npm 包**：只改 git 仓库源码
 - **Docker 先验证**：所有改动 Docker E2E 通过后再合并
 - **向后兼容**：旧 atok_ token 仍然有效
+
+## 分支与仓库
+
+本仓库是官方仓库的**独立副本**，不是官方的开发分支。分工只有一条线：
+
+| 分支 | 作用 | 规则 |
+|---|---|---|
+| `main` | **只做 `upstream/main` 的镜像** | 🔴 不在上面提交任何东西 |
+| `pixb` | 我们唯一的开发 / 运行分支 | 我们所有提交都进这里 |
+
+- **两个远端**：`origin` = 我们自己的仓库（`github.com/pixb/agent-network`）；`upstream` = 官方仓库（`github.com/sleep2agi/agent-network`）。上游**没有** `pixb` 分支。
+- **同步上游**（`main` 唯一的工作）：
+  ```bash
+  git fetch upstream
+  git checkout main
+  git merge --ff-only upstream/main
+  git push origin main
+  ```
+  `--ff-only`：上游走了非快进历史就该停下来看清楚，不要用 merge commit 把本方的提交混进 `main`。
+- **所有本方提交进 `pixb`**：功能、修复、测试报告、**release 准备**（版本号同步 `scripts/sync-pinned-versions.sh`、发布说明 `docs/tests/release-v*.md`、docs-site 版本断言）全部提交在 `pixb`，推到 `origin/pixb`。
+- **不进上游**：不向 `upstream` 提 PR、不推送任何分支到 `upstream`。
+- **`pixb` 要定期吸收上游**，否则会悄悄落后于官方：
+  ```bash
+  git fetch upstream && git checkout pixb && git merge upstream/main
+  ```
+- 🔴 **文档里的「release 变更必须先合入 `main`，再从该 `main` 发布」是上游仓库的发版规程，对本仓库不适用** —— 本仓库的 `main` 上永远不会出现我们的改动，所以照那条走会得到「发出去的还是官方旧提交」。本仓库要发布本方改动时，先确认走哪条发布路径（`pixb` 自身的构建/发布流程，或另立一条），不要默认 `release.yml --ref main` 能拿到 `pixb` 的内容。
 
 ## 可重建与灾难恢复规则
 
