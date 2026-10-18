@@ -7,8 +7,8 @@
      Change the prose, change the stamp — the gate also fails when the two disagree.
      The latest stamp records the checked channel version; the preview stamp records the validated
      release candidate, not npm publication. Historical references (e.g. `<= 2.3.0-preview.37`) are not stamped. -->
-<!-- version-claim: package=agent-network channel=latest version=2.3.0-preview.180 -->
-<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.181 -->
+<!-- version-claim: package=agent-network channel=latest version=2.3.0-preview.181 -->
+<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.182 -->
 
 From starting a Hub to chatting with your first agent in the Dashboard: **4 steps**, each with one command and one check.
 
@@ -60,7 +60,7 @@ The first `anet hub start` prints the admin credentials once:
    Store this password now; it will not be shown again.
 ```
 
-The checked `latest` (`2.3.0-preview.180`) prints a random password: `anet-` followed by 22 hex characters. Candidate `2.3.0-preview.181` changes only two product paths versus `.180`: the two `Accept` negotiations in `notifyServerOffline` (`#1344`/PR `#2800` — declaring only `application/json` previously drew a 406 from Streamable HTTP), and the Windows stop orchestration (`#1335`/`#1339`: decide gone/alive/unknown by exact `PID`+`CreationDate`; a non-zero `taskkill` no longer exits early). **The default bootstrap / random-password path is unchanged** (the `agent-network/src`+`bin` diff over `7b159c95..a54c6290` contains only those two changes). This installation gate uses an explicit password; the default path was not rerun separately. Publication requires all release gates to pass.
+The checked `latest` (`2.3.0-preview.181`) prints a random password: `anet-` followed by 22 hex characters. `.181` changes only two product paths versus the line-by-line-tested `.180` (the two `Accept` negotiations in `notifyServerOffline`, `#1344`/PR `#2800`, and the Windows stop orchestration, `#1335`/`#1339`), and **the default bootstrap / random-password path is unchanged** — so this behavioural claim carries over from `.180`. Candidate `2.3.0-preview.182` likewise avoids the bootstrap path versus `.181`: the mirrored OpenCode V1 pin table (`opencode-ai` `1.18.34` → `1.19.3`, which must ship together with the matching `agent-node`), the RFC-029 release pair constants, and one sample version number in a `bin/cli.ts` comment (the `agent-network/src`+`bin` diff over `a54c6290..058664d3` is exactly those three files, 7 lines; everything else is tests and docs). This installation gate uses an explicit password; the default path was not rerun separately. Publication requires all release gates to pass.
 **Candidate validation does not mean publication.** Run `npm view @sleep2agi/agent-network dist-tags` for the currently installable channel versions; do not treat the candidate number as the current npm `preview`.
 The fixed `admin / anethub` only exists on `2.2.x` and earlier; it will not log you in to a freshly installed Hub.
 
