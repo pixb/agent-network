@@ -10,6 +10,8 @@
 
 ## 产物
 
+存放位置：`/vol2/1000/Download/agent-network-tgz/`（该主机上的固定目录，非 Git 仓库内）。
+
 | 文件 | 大小 | SHA256 |
 |---|---|---|
 | `sleep2agi-agent-network-2.3.0-preview.182.tgz` | 2107483 | `557ebeca41a283562686a46d09e83e51fae1d5e99a7618d1525c3b4e03e819e2` |
@@ -71,5 +73,7 @@ npm install --prefix "$HOME/.anet-bin/pair182-147" --ignore-scripts --no-audit -
   且能装、能起、版本与配对正确」。
 - 未做真实 hub + 真实节点的 E2E（本次只做了安装与版本烟测）；如需，应照
   `tests/test384-opencode-local-package-e2e` 的形状补一个 Docker 套件。
-- 产物文件目前放在 `/tmp/opencode/pair182-147/`，**未入库**；入库策略（是提交 tgz 还是只
-  提交本记录 + 重建步骤）待定，按「可重建」规则，本记录 + sha256 是可复现输入的权威来源。
+- 产物文件目前放在 `/vol2/1000/Download/agent-network-tgz/`，**未入库**（不在 Git 仓库内，
+  该路径不可从仓库复现）；入库策略（是提交 tgz 还是只提交本记录 + 重建步骤）待定，
+  按「可重建」规则，本记录 + sha256 是可复现输入的权威来源。目标机器取包时按上面的
+  SHA256 核对，不一致就重建。
