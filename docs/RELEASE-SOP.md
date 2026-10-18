@@ -4,6 +4,15 @@
 > `@sleep2agi/commhub-server` / `@sleep2agi/agent-network-dashboard`
 > 任一包发版时，跑这份 SOP 把版本号同步到所有 hardcoded 引用位置。
 
+> 🔴 **这份 SOP 是上游仓库（`sleep2agi/agent-network`）的发版规程，对本仓库只作参考，不完全适用。**
+> 本仓库的 `main` 只做 `upstream/main` 的镜像、不在上面提交任何东西；我方所有提交
+> （功能、修复、测试报告、**release 准备**：版本号同步、发布说明、docs-site 版本断言）都在
+> `pixb`。所以下文 Step 1 起的「改 `package.json` → sync → commit」请照做，但**提交目标是 `pixb`**；
+> 而 Step 6 `gh workflow run release.yml … --ref main` 在本仓库会拿到**上游的提交**而不是我们的，
+> 不是「发出去的还是官方旧提交」就是根本发不出本方改动。
+> 本方改动的发布路径尚未确立，先按根目录 `AGENTS.md` 的「分支与仓库」一节判断。
+> 版本号同步脚本 `scripts/sync-pinned-versions.sh` 与发布门（gate 1–4）本身仍有效、仍应照跑。
+
 ---
 
 ## 0. 版本号在仓库里的两种 lifecycle

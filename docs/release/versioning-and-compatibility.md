@@ -73,6 +73,9 @@ dashboard 跟 commhub 的 REST 契约（C3）要版本约束——纳入本文�
 - 发版走 `gh workflow run release.yml -f package=<pkg> -f version=<精确版> -f publish=true --ref main`
   （🔴 **本机不发包**，Vincent 2026-08-27 定；四门全绿才 publish，且只发 preview 通道）
   权威步骤见 [RELEASE-SOP](../RELEASE-SOP.md)
+  🔴 **`--ref main` 这条对本仓库不适用**：本仓库的 `main` 只做 `upstream/main` 的镜像，
+  我方提交全在 `pixb`（见根目录 `AGENTS.md` → 「分支与仓库」）。照这条敲会发出上游的提交，
+  不是我们的。本方改动的发布路径尚未确立。
 - 验：dist 关键串在 + `grep -c 'Bun\.' dist` = 0
 - **npm publish 顺序** = **server → agent-node → agent-network**（被依赖的先发；矩阵新行也按这条顺序试）
 - 每 preview 带一句 changelog；latest 严格两阶段（preview 亲测 + 30min 窗口）
