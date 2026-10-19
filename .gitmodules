@@ -1,0 +1,3 @@
+[submodule ".agents/skills/agent-network-skill"]
+	path = .agents/skills/agent-network-skill
+	url = git@github.com:pixb/agent-network-skill.git
