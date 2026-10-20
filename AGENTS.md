@@ -67,6 +67,8 @@
   - `anet grok attach` 在 `@preview` CLI 有命令；`@latest` 返回 `Unknown: grok`。Hub 不得把死 TUI 报成 idle（见 #1005）
 - `tests/testN-xxx/` — 独立 Docker 测试套件 (每个有 Dockerfile + run.sh)
 - `docs/` — 设计文档 + 测试报告
+- `.agents/skills/agent-network-skill/` — 协议 skill（submodule，指向 `github.com:pixb/agent-network-skill`）
+  - 手动节点（无 MCP runtime）的状态管理脚本在 `scripts/anet_manual_node.sh`，说明在 `references/manual-node.md`；本仓库不再自带副本
 
 ## 通信
 
