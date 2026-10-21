@@ -242,6 +242,13 @@ describe("session contract is honest per runtime", () => {
     expect(c.detail).toContain("not a private deep copy");
   });
 
+  test("pi-cli session file is copied when present (RFC-043 M0/S2)", () => {
+    const c = sessionContractForRuntime("pi-cli");
+    expect(c.mode).toBe("transcript_when_present");
+    expect(c.detail).toContain("session file");
+    expect(sessionContractForRuntime("pi").mode).toBe("transcript_when_present");
+  });
+
   test("an unknown runtime does not claim a session copy", () => {
     expect(sessionContractForRuntime("not-a-runtime").mode).toBe("unsupported");
   });

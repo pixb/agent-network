@@ -137,6 +137,13 @@ export function sessionContractForRuntime(runtime: string): SessionContract {
       detail: "OpenCode sessions live in the OpenCode server, not in the node directory. The daemon copies the session id so session/load addresses that same server session. That is not a private deep copy: both nodes share one server-side transcript. There is no local transcript to fork.",
     };
   }
+  if (runtime === "pi-cli" || runtime === "pi") {
+    return {
+      mode: "transcript_when_present",
+      runtime,
+      detail: "pi RPC sessions live in a session file under the node's session dir (agent-node passes --session-id/--session-dir; RFC-043 M0/S2 verified sessionFile persistence + durable since-cursor across processes). The daemon copies that file and keeps the session id when present. auth.json is not copied.",
+    };
+  }
   return {
     mode: "unsupported",
     runtime,
