@@ -214,6 +214,8 @@
 | 2026-10-22 | 问题 | hub V3 认证（L2 E2E 卡点） | agent-node 无 token 连 hub 401；anet node create 报 Not logged in；MCP send_task 需 from_session=认证用户名（否则 identity_mismatch）+ 显式 network_id=节点注册网络（否则 network_id_required / alias_not_found） | 套件内 register→token→network（注册自动建）→anet login→node create 固化 |
 | 2026-10-22 | 里程碑 | **M4/L2 全链路 E2E 完成（12 PASS / 0 FAIL）** | 套件 `tests/test-pi-e2e/`（镜像 anet-pi-e2e）：stub 模型服务 → CommHub（/health 轮询）→ `anet node create pi-e2e --runtime pi-cli`（M2 接线实证：agent-node 日志 `runtime: pi (input: pi-cli)`）→ agent-node 注册 → MCP send_task `Reply with exactly PI_E2E_OK` → 轮询 `"replied"` → **result = `[pi-e2e] PI_E2E_OK`**（1s）；负控制 pi-bad（no-such model）被 preflight 拦截不挂起；报告 docs/tests/report-pi-e2e.txt | **M4 完成** |
 | 2026-10-22 | 记录 | 容器内工具缺失与权限 | M0 镜像无 curl/python3 → 套件内嵌 bun http-cli.ts（METHOD URL [JSON]，Bearer 走 HUB_TOKEN）+ jq.ts（点路径 + 数组下标）；MCP 端点需 `Accept: application/json, text/event-stream`；工作区新建源文件为 600 权限导致容器 USER bun 读不了 → Dockerfile `chmod -R a+rX /check` | 后续套件复用该工具与权限处理 |
+| 2026-10-22 | 问题 | 收尾盘点发现 4 处枚举缺口 | ①server `create-node-validate.ts` RUNTIMES 数组仍 7 项（daemon create_node 建 pi 节点报 `runtime_invalid`）；②goals 调度拒 pi bucket（`RuntimeBucket` 无 pi，启动警告 `unknown runtime bucket`，pi 节点无法参与定时目标）；③`clone-node.ts sessionContractForRuntime` 无 pi 分支（克隆落 unsupported）；④`cli-help.ts` node create 帮助列表缺 pi-cli | 全部补齐：RUNTIMES +`"pi-cli"`；goals/store `RuntimeBucket` +`"pi"` + PI_RUNTIME_NAMES（pi/pi-cli）；sessionContract pi 分支（transcript_when_present，依据 M0/S2 sessionFile 持久化实测）；cli-help 列表 +`pi-cli`（别名 pi）；配套单测全绿（store 38 / create-node-validate 47 / clone 6），compile-check 与 L2 E2E 复跑 12/12 全绿，启动日志 `goals scheduler: enabled (runtime=pi)` | 功能完整 |
+| 2026-10-22 | 决策 | **TUI 共存（copresence）不做——实测依据** | pi 1.3.0 **无 server 会话架构**（`--mode` 仅 text/json/rpc，无 ACP/远端 server），opencode V2 共存模式（server 会话共享）**不适用**；claude-code 式 tmux 读屏 hack 对第三方全屏 TUI 脆弱且 pi 官方不支持；RPC mode 已是官方自动化接口（M0 验证完整多轮协议 + 会话持久化）。RFC §12 原「参照 opencode V2 共存」基于错误假设，更正为明确非目标 | §12 更新；support-matrix TUI 列标 — |
 
 ## 11. 验收标准（交接/验收 checklist）
 
@@ -224,10 +226,11 @@
 - [x] **文档**：runtimes.md canonical 表、support-matrix.md、cli.md、getting-started.md、agent-node.md 与实现一致（M4 末已同步，见 git diff）。
 - [x] **Docker**：所有测试在 Docker 内跑通；本机无 pi/bun/node_modules 污染（宿主仅源码 + 报告）。
 - [x] **本 RFC**：§10 日志已按实际记录；无未闭环的已知问题（未闭环的须在 §12 明确列出）。
+- [x] **收尾核验（M4 后）**：daemon create_node 集合含 pi-cli（create-node-validate RUNTIMES=8）；goals 调度 pi bucket 生效（`goals scheduler: enabled (runtime=pi)`）；clone 会话语义有 pi 分支（transcript_when_present）；`node create --help` 列表含 pi-cli；agent-node.md 提及 pi-cli；相关单测 + compile-check + L2 E2E 复跑全绿。
 
 ## 12. 非目标 / 二期预留
 
-- **TUI 共存（copresence）**：二期参照 opencode V2 共存模式（tmux + 会话共享 + launcher-health）；一期不做。
+- **TUI 共存（copresence）**：**不做**（2026-10-22 实测决策）。pi 1.3.0 无 server 会话架构（`--mode` 仅 text/json/rpc），opencode V2 共存模式不适用；tmux 读屏 hack 脆弱且 pi 官方不支持；RPC mode 已是官方自动化接口（M0 完整验证）。若未来 pi 官方提供 server/ACP 模式再评估。
 - **Windows 验证**：pi 官方支持 Windows，但一期只在 Linux（容器）/macOS（宿主）验证；Windows 进支持矩阵 ❓。
 - **MCP 注入、skills 预置**：一期不做（安全默认禁扩展）；后续按需评估。
 - **多节点共享 pi 登录**：不做（一个登录一个节点，照 codex 先例）。

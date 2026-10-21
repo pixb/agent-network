@@ -46,6 +46,7 @@ export const RUNTIMES = [
   "grok-build-acp",
   "grok-build-cli",
   "opencode-cli",
+  "pi-cli", // RFC-043 — daemon create_node 集合,与 normalize-runtime SUPPORTED_RUNTIME_NAMES 对齐
 ] as const;
 export type Runtime = typeof RUNTIMES[number];
 

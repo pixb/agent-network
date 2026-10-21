@@ -48,6 +48,7 @@ anet node start my-agent --tmux
 - Codex TUI 共存是 preview 功能，必须使用 `--copresence` 的完整启动/恢复路径，见 [Codex TUI 共存](/guide/codex-copresence)。
 - OpenCode 当前是任务 runtime，不是共享 TUI。
 - Grok 共享 TUI 尚未发布；当前可用的 `grok-build-acp` 不支持 attach，见 [Grok 节点](/guide/grok)。
+- `pi-cli`（公版 pi，BYOK）走 RPC mode，headless 收任务；安全默认只读工具，`flags.piUnsafeTools` 放宽。见 [RFC-043](/rfcs/RFC-043-pi-cli-runtime-integration)。
 
 切换 runtime 前先停止旧进程。不要让两个不同进程以同一 alias / node identity 同时连接 Hub。
 
