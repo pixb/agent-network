@@ -4532,6 +4532,13 @@ function checkRuntimeDependency(runtime: RuntimeName, phase: "create" | "start")
     console.warn(`[anet] Warning: codex CLI not found in PATH.`);
     console.warn(`[anet] Install/login codex first: https://developers.openai.com/codex/cli`);
   }
+  // RFC-043 — pi-cli (public `@earendil-works/pi-coding-agent`, command
+  // `pi`, pi.dev). BYOK via custom provider (pi models.json / auth.json);
+  // needs the `pi` binary on PATH for create and start alike.
+  if (runtime === "pi-cli" && !commandExists("pi")) {
+    console.warn(`[anet] Warning: pi CLI not found in PATH.`);
+    console.warn(`[anet] Install: npm install -g @earendil-works/pi-coding-agent`);
+  }
 }
 
 // ── Help ──
@@ -6166,6 +6173,7 @@ function createRuntimeChoices() {
     { value: "codex-app-server", name: "codex-cli — Codex 共存 TUI（人和 Agent 共用一个 thread）" },
     { value: "grok-build-acp", name: "grok-build-acp — Grok（推荐 / default：headless ACP）, 复用 `grok` CLI 登录态" },
     { value: "opencode-cli", name: "opencode-cli — 公版 OpenCode CLI, Anthropic/OpenAI preset (RFC-029)" },
+    { value: "pi-cli", name: "pi-cli — pi coding agent (pi.dev), RPC mode, 自定义 provider（本地模型服务 / API key）(RFC-043)" },
     // Owner decision 2026-09-25: Grok co-presence is experimental — listed last,
     // behind the default ACP choice, with its limitations on the same line.
     { value: "grok-build-cli", name: `grok-build-cli — Grok 共存 TUI（实验性 / experimental）— ${GROK_COPRESENCE_EXPERIMENTAL_NOTE_ZH}` },
@@ -6236,7 +6244,7 @@ async function createInteractiveCommand() {
 
 This wizard creates one agent node for this project:
   - node config: .anet/nodes/<node-name>/config.json
-  - runtime: claude-agent-sdk / claude-code-cli / codex-sdk / codex-app-server / grok-build-acp / grok-build-cli / opencode-cli
+  - runtime: claude-agent-sdk / claude-code-cli / codex-sdk / codex-app-server / grok-build-acp / grok-build-cli / opencode-cli / pi-cli
   - optional Telegram channel: text + images from an allowlist user
 `);
 

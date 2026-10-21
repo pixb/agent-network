@@ -1,0 +1,43 @@
+=== M4/L2: pi-cli full-chain E2E (hub + agent-node + pi RPC, stub) ===
+pi version: 1.3.0
+node version: v22.19.0
+bun version: 1.3.14
+stub listening on 127.0.0.1:32123
+--- hub ---
+error: Unable to connect. Is the computer able to access the url?
+  path: "http://127.0.0.1:9200/health",
+ errno: 0,
+  code: "ConnectionRefused"
+
+
+Bun v1.3.14 (Linux arm64)
+error: Unable to connect. Is the computer able to access the url?
+  path: "http://127.0.0.1:9200/health",
+ errno: 0,
+  code: "ConnectionRefused"
+
+
+Bun v1.3.14 (Linux arm64)
+  PASS: CommHub started
+--- hub auth bootstrap ---
+  PASS: hub auth bootstrap
+  PASS: network ready
+  PASS: anet login
+--- node create ---
+-rw------- 1 bun bun 369 Oct 21 18:04 /e2e/.anet/nodes/pi-e2e/config.json
+  PASS: anet node create wrote config
+  PASS: pi-cli node registered
+--- send task ---
+  PASS: task sent
+  resp head: event: message
+data: {"result":{"content":[{"type":"text","text":"{\"ok\":true,\"message_id\":\"d3ca4914-7f44-4f19-8a69-af4ec5b29be0\",\"actual_to\":{\"alias\":\"pi-e2e\",\"to_node_id\":\"n_2272135a\",\"network_id\":\"net_a3da4e7ad946\"},\"session_status\":\"idle\",\"queue_ahead\":0,\"target_busy\":false,\"est_wait_minutes\":0}"}]},"jsonrpc":"2.0","id":2}
+  PASS: message_id=d3ca4914-7f44-4f19-8a69-af4ec5b29be0
+--- poll result ---
+  PASS: pi-cli processed task (1s)
+  Result: [pi-e2e] PI_E2E_OK
+  PASS: pi returned correct answer
+--- negative: bad model preflight ---
+  PASS: bad-model task sent
+  PASS: bad model rejected by preflight (no hang)
+
+=== L2 result: 12 passed, 0 failed ===

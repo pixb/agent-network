@@ -2,16 +2,16 @@
 
 > 这一页讲「怎么装、怎么认证」。想知道某个功能在哪个 runtime / 操作系统上能不能用，看 [支持矩阵](/guide/support-matrix)：那张表用三态（✅ 验过 / ❌ 验过不行 / ❓ 没验过），没验过的格子不会被写成可用。
 
-每个 Agent Node 都有一个 **Runtime**（运行时内核），决定这个节点用什么方式调用大模型、跑工具。Agent Network 内置 7 种 Runtime：4 种正式（`claude-code-cli` / `claude-agent-sdk` / `codex-sdk` / `grok-build-acp`），3 种预览（`codex-app-server`、`grok-build-cli`、`opencode-cli`）。`anet node create` 的选单 7 个全部列出。同一个 Hub 上可以混搭，比如一个 Claude Code CLI agent 把翻译任务派给 MiniMax agent，再让 Codex agent 写代码，最后把结果汇总回来。
+每个 Agent Node 都有一个 **Runtime**（运行时内核），决定这个节点用什么方式调用大模型、跑工具。Agent Network 内置 8 种 Runtime：5 种正式（`claude-code-cli` / `claude-agent-sdk` / `codex-sdk` / `grok-build-acp` / `pi-cli`），3 种预览（`codex-app-server`、`grok-build-cli`、`opencode-cli`）。`anet node create` 的选单 8 个全部列出。同一个 Hub 上可以混搭，比如一个 Claude Code CLI agent 把翻译任务派给 MiniMax agent，再让 Codex agent 写代码，最后把结果汇总回来。
 
 ## Runtime 对比（canonical 表） {#runtime-对比-canonical-表}
 
 > 本表是全站 runtime 信息的**单一权威来源**。其他页面（`cli` / `agent-node` / `getting-started` / `clean-server`）都引用这里，不在那些页面重复整表。
 
 ::: tip 哪些 runtime 在哪个通道可用
-agent-network `≥ 2.3.0-preview.47` 在 `latest` 与 `preview` 两个通道上，`anet node create` 的 runtime 选单**都列出全部 7 个**：
+agent-network `≥ 2.3.0-preview.47` 在 `latest` 与 `preview` 两个通道上，`anet node create` 的 runtime 选单**都列出全部 8 个**：
 
-`claude-agent-sdk` / `claude-code-cli` / `codex-sdk` / `codex-app-server` / `grok-build-acp` / `grok-build-cli` / `opencode-cli`
+`claude-agent-sdk` / `claude-code-cli` / `codex-sdk` / `codex-app-server` / `grok-build-acp` / `grok-build-cli` / `opencode-cli` / `pi-cli`
 
 这些版本同时带 `anet daemon` 与 `anet grok attach`。
 
@@ -34,6 +34,7 @@ Grok TUI 共存的当前状态见 [Grok 节点](/guide/grok)；`grok-build-acp` 
 | `grok-build-acp` | spawn 本机 `grok` ACP server | 用 xAI Grok Build 跑任务 / 协作 | xAI Grok (grok-build 系列) | 已 `grok login` + `GROK_CODE_XAI_API_KEY` env（该 runtime 另需该 env，非 wizard 输出） | 选完打印 `grok login` 提示，跳过 vendor |
 | `codex-cli`（内部存为 `codex-app-server`，preview） | 节点自有的 codex app-server + 桥 | Codex TUI 人机共存（人和 agent 共用一个 thread） | OpenAI Codex（默认 gpt-5.6-sol） | 已 `codex login` | 向导选中即启用共存，无第二次模式选择 |
 | `opencode-cli` (preview) | V1：spawn 本机 `opencode`（`opencode-ai` pin）。V2：同一 runtime，包 `@opencode/cli@2.0.22`，只共存 | V1：多 vendor 前端。V2：用这台机器已经写好的 OpenCode `model` / `providers` | V1：Anthropic 原生 / OpenAI preset。V2：本机 OpenCode 配置里的 `provider/model` | V1：`npm i -g opencode-ai@<pin>` + vendor preset。V2：独立前缀安装 `@opencode/cli@2.0.22`，两个包装出来的命令都叫 `opencode` | V1：提示装 CLI → 选 anthropic / openai preset。V2 不是向导默认项，要 `--opencode-generation v2 --opencode-unsafe-tools`。见 [OpenCode V2](/guide/opencode) |
+| `pi-cli` | spawn 本机 `pi` 命令（`@earendil-works/pi-coding-agent`，node ≥22.19，走 RPC mode） | headless 编程 agent；BYOK 直连任意 OpenAI 兼容端点（本地 ollama / vLLM / OpenAI 等） | 任意 `provider/model`（如本地 ollama `ollama/qwen2.5:14b`） | 已 `pi login`（BYOK；信任边界由 agent-node 安全预设收紧） | 提示装 CLI（`npm install -g @earendil-works/pi-coding-agent`）→ 填 provider/model；安全默认只读工具，`flags.piUnsafeTools` 放宽。见 [RFC-043](/rfcs/RFC-043-pi-cli-runtime-integration) |
 
 > ⚠️ **`opencode-cli` 仍是预览**：它已在 `latest` 与 `preview` 两条通道的 `anet node create` 选单里，但成熟度按预览看待。V1 与 V2 共用这个 runtime id。省略 `--opencode-generation` 就是 V1，下面的安全预设、免费 Zen 模型和网关说明都是 V1。V2 的创建路径是真的（preview 通道、只共存、必须 `--opencode-unsafe-tools`），npm `latest` 上还没有这条标志。步骤、Hub 对话、daemon 和尚未接线的模型目录见 [OpenCode V2](/guide/opencode)。
 

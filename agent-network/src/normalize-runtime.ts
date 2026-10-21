@@ -20,7 +20,8 @@ export type RuntimeName =
   | "grok-build-acp"
   | "grok-build-cli"
   | "opencode-cli"
-  | "codex-app-server";
+  | "codex-app-server"
+  | "pi-cli";
 
 /** 一个 runtime 复用的是哪种**外部登录态**，而不是 API key。 */
 export type ReusedLogin = "claude" | "codex" | "grok";
@@ -59,6 +60,7 @@ export const SUPPORTED_RUNTIME_NAMES: readonly RuntimeName[] = [
   "grok-build-acp",
   "grok-build-cli",
   "opencode-cli",
+  "pi-cli",
 ] as const;
 
 // Subset of Profile fields this helper inspects. Keeping it narrow so
@@ -106,6 +108,11 @@ function canonicalizeRuntime(runtime: string): RuntimeName | undefined {
   // `opencode` (short), `opencode-cli` (canonical, matches
   // claude-code-cli precedent).
   if (runtime === "opencode" || runtime === "opencode-cli") return "opencode-cli";
+  // RFC-043 — pi coding agent (public @earendil-works/pi-coding-agent,
+  // command `pi`, pi.dev). Aliases: `pi` (short), `pi-cli` (canonical).
+  // BYOK — no RUNTIME_REUSED_LOGIN entry (it uses an API key / custom
+  // provider, never an external login state).
+  if (runtime === "pi" || runtime === "pi-cli") return "pi-cli";
   return undefined;
 }
 

@@ -331,6 +331,8 @@ const INITIAL_OPENCODE_BIN = process.env.ANET_OPENCODE_BIN;
 const INITIAL_OPENCODE_VERSION = process.env.ANET_OPENCODE_VERSION;
 const INITIAL_LAUNCH_PATH = process.env.PATH || "";
 const INITIAL_OPENCODE_SAFE_BASE = process.env.ANET_OPENCODE_SAFE_BASE;
+// RFC-043 — pi coding agent binary override (anet may pin an exact version).
+const INITIAL_PI_BIN = process.env.ANET_PI_BIN;
 
 // ── 参数解析 ──
 const argv = process.argv.slice(2);
@@ -381,7 +383,7 @@ for (let i = 0; i < argv.length; i++) {
   --config <path>     配置文件 (.anet/nodes/<name>/config.json)
   --opencode-borrowed-attach <config>  Attach the exact existing borrowed V1 TUI
   --alias <name>      Agent 别名 / CommHub alias (必需)
-  --runtime <type>    claude-agent-sdk (default) | codex-sdk | codex-app-server | grok-build-acp | grok-build-cli | opencode-cli
+  --runtime <type>    claude-agent-sdk (default) | codex-sdk | codex-app-server | grok-build-acp | grok-build-cli | opencode-cli | pi-cli
                       (claude-code-cli is NOT here: it runs via \`anet node start\`, not by passing --runtime to agent-node — see the Runtime section)
   --model <name>      AI 模型 (codex 默认: ${DEFAULT_CODEX_MODEL}, claude-agent-sdk 默认: 账号默认模型)
   --hub <url>         CommHub URL
@@ -403,6 +405,7 @@ Runtime:
   grok-build-acp    Grok Build ACP — xAI Grok Build via "grok agent stdio"
   grok-build-cli    Grok Build CLI — headless 或 grokCopresence 共存 TUI 模式
   opencode-cli      opencode CLI — Anthropic/OpenAI vendor preset via ACP
+  pi-cli            pi coding agent (pi.dev) — RPC mode，自定义 provider（本地模型服务等）
 
 Capabilities: ANET_CAPABILITY_GROK_COPRESENCE_V2 ANET_CAPABILITY_OPENCODE_BORROWED_TUI_V1
 `);
@@ -677,6 +680,11 @@ const RUNTIME_MAP: Record<string, string> = {
   // bucket from `codex` (that's the @openai/codex-sdk transport). Aliases:
   // `codex-app-server` (canonical) / `codex-tui` / `codex-appserver`.
   "codex-app-server": "codex-app-server", "codex-appserver": "codex-app-server", "codex-tui": "codex-app-server",
+  // RFC-043 — pi coding agent (public `@earendil-works/pi-coding-agent`,
+  // command `pi`, pi.dev). `pi-cli` is the canonical launcher name;
+  // `pi` is the short alias. Internal bucket is `"pi"` — RPC mode
+  // transport, see src/runtime/pi-rpc/.
+  "pi-cli": "pi", "pi": "pi",
 };
 // 🔴 `claude-code-cli` is intentionally NOT a key here (#909). Its execution lane lives in the LAUNCHER
 //    (`agent-network/bin/cli.ts` — `anet node start` → launchAgent → spawns the real `claude` CLI, ~:5096)
@@ -701,7 +709,7 @@ if (!Object.prototype.hasOwnProperty.call(RUNTIME_MAP, rawRuntime)) {
   console.error(`[${ALIAS}] Unsupported runtime "${rawRuntime}". Supported: ${supported}`);
   process.exit(1);
 }
-const RUNTIME = RUNTIME_MAP[rawRuntime] as "claude" | "codex" | "grok" | "opencode" | "codex-app-server";
+const RUNTIME = RUNTIME_MAP[rawRuntime] as "claude" | "codex" | "grok" | "opencode" | "codex-app-server" | "pi";
 const RUNTIME_LABEL = rawRuntime; // 日志用原始名
 // `grok-build-cli` defaults to the compatible `grok -p` headless lane.
 // `grokCopresence:true` explicitly switches it to the single PTY-owner bridge
@@ -2487,6 +2495,10 @@ let grokModelSource: "readback" | "argv" | "default" | undefined;
 let opencodeSessionId: string | undefined = RUNTIME === "opencode" ? (SESSION_ID || undefined) : undefined;
 let clearBorrowedLaunchHealth: (() => void) | undefined;
 let opencodeRuntimeSession: import("./runtime/opencode-acp/runtime").OpencodeRuntimeSession | null = null;
+// RFC-043 — pi RPC runtime state. Lazy open on first turn, reused for the
+// node lifetime; crash-restart resets the holder (next turn re-spawns).
+let piSessionId: string | undefined = RUNTIME === "pi" ? (SESSION_ID || undefined) : undefined;
+let piRuntimeSession: import("./runtime/pi-rpc/runtime").PiRuntimeSession | null = null;
 // Set synchronously immediately after spawn, before initialize or session/new
 // resolves. shutdown() uses this handle during the handshake window.
 let opencodeRuntimeClient: import("./runtime/opencode-acp/client").OpencodeAcpClient | null = null;
@@ -4195,6 +4207,95 @@ async function processWithOpencode(
   return outcome.replyText || "（无回复）";
 }
 
+// RFC-043 — pi coding agent (bucket "pi"). RPC mode long-running session.
+const PI_PROCESS_BUNDLE_MARKER = "processWithPi";
+
+/** Per-turn pi idle budget. Read per turn (like opencode) so a hot-applied
+ *  flags.piTimeoutMs / flags.timeout takes effect; 0 disables. Default 30min. */
+function currentPiTimeout(): { valueMs: number } {
+  const raw =
+    fileConfig.flags?.piTimeoutMs ??
+    fileConfig.flags?.timeout ??
+    process.env.PI_TIMEOUT_MS;
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  const v = Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000;
+  return { valueMs: v };
+}
+
+async function processWithPi(
+  task: string,
+  _from: string,
+  _images?: string[],
+  evidence?: TaskRuntimeEvidenceReporter,
+): Promise<string> {
+  debug(`[${PI_PROCESS_BUNDLE_MARKER}] dispatch`);
+  const { openPiRuntime, think: piThink } = await import("./runtime/pi-rpc/runtime");
+  const { checkPiAuth, piAuthFailureMessage } = await import("./runtime/pi-rpc/preflight");
+
+  // Crash-restart: if the RPC child exited, reopen next turn (sessionId
+  // persisted via onSession so the same pi session resumes).
+  if (piRuntimeSession && !piRuntimeSession.client.isRunning) {
+    log(`[pi] previous child exited — reopening on this turn`);
+    piRuntimeSession = null;
+  }
+
+  if (!piRuntimeSession) {
+    // RFC-043 D5 — preflight BEFORE spawn (M0 S3: a bad provider/model
+    // hangs the pi prompt instead of failing fast).
+    if (MODEL) {
+      const preflight = await checkPiAuth({
+        model: MODEL,
+        binary: INITIAL_PI_BIN,
+        cwd: process.cwd(),
+      }).catch((e: unknown) => {
+        throw new Error(`pi preflight failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      if (preflight.state !== "ready") {
+        throw new Error(piAuthFailureMessage(preflight, undefined, MODEL));
+      }
+    } else {
+      warn(`[pi] no --model set; skipping preflight — pi will resolve a default model`);
+    }
+
+    // RFC-043 D3 — unsafe tool widening is an explicit opt-in; the caller
+    // (anet) warns about the non-sandbox reality.
+    if (fileConfig.flags?.piUnsafeTools === true) {
+      warn(`[pi] EXPERIMENTAL/DANGEROUS piUnsafeTools enabled — bash/edit/write are reachable by the model. Trusted tasks only.`);
+    }
+    const opened = await openPiRuntime({
+      workDir: NODE_DIR,
+      unsafeTools: fileConfig.flags?.piUnsafeTools === true,
+      model: MODEL,
+      sessionId: piSessionId,
+      onSession: async (id: string) => {
+        piSessionId = id;
+        writebackSession(id);
+      },
+      log,
+      warn,
+      binary: INITIAL_PI_BIN,
+    });
+    if (!opened.client.isRunning) {
+      throw new Error("pi RPC child exited while opening the runtime session");
+    }
+    piRuntimeSession = opened;
+  }
+
+  const outcome = await piThink(piRuntimeSession, {
+    prompt: task,
+    idleTimeoutMs: currentPiTimeout().valueMs,
+    log,
+    warn,
+    onSubmitted: evidence?.submitted,
+    onConsumed: evidence?.consumed,
+  });
+  log(
+    `[pi] turn done | reply=${outcome.replyText.length}ch ` +
+    `rescued=${outcome.rescued} settled=${outcome.state.settled} deltas=${outcome.state.deltaCount}`,
+  );
+  return outcome.replyText || "（无回复）";
+}
+
 async function ensureOpencodeCopresenceRuntime(): Promise<
   import("./runtime/opencode-copresence/runtime").OpenCodeCopresenceSession
 > {
@@ -5784,6 +5885,9 @@ function think(
       }
       if (RUNTIME === "opencode") {
         return await processWithOpencode(task, from, images, evidence);
+      }
+      if (RUNTIME === "pi") {
+        return await processWithPi(task, from, images, evidence);
       }
       if (RUNTIME === "codex-app-server") {
         return await processWithCodexAppServer(task, from, taskId, steerIfExternalTurn, evidence, trackReceipt);

@@ -2,7 +2,7 @@
 
 这一页回答两个问题：
 
-1. 一个功能，在 7 个 runtime 上分别能不能用？
+1. 一个功能，在 8 个 runtime 上分别能不能用？
 2. 一台机器，装什么操作系统才能用哪些能力？
 
 ## 怎么读这张表
@@ -34,22 +34,22 @@
 
 ## 一、功能 × Runtime
 
-7 个 runtime：
-`claude-agent-sdk` · `claude-code-cli` · `codex-sdk` · `codex-app-server` · `grok-build-acp` · `grok-build-cli` · `opencode-cli`
+8 个 runtime：
+`claude-agent-sdk` · `claude-code-cli` · `codex-sdk` · `codex-app-server` · `grok-build-acp` · `grok-build-cli` · `opencode-cli` · `pi-cli`
 
-| 功能 | claude-agent-sdk | claude-code-cli | codex-sdk | codex-app-server | grok-build-acp | grok-build-cli | opencode-cli |
-|---|---|---|---|---|---|---|---|
-| CLI 直接创建节点<br>`anet node create --runtime X` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| daemon 代创建节点<br>经 `create_node` | ✅ | ❓ | ✅ | ❓ ^1^ | ✅ | ❓ ^1^ | ❓ ^1^ |
-| TUI 人机共存<br>人和 agent 共用一个会话 | — | — | — | ✅ | — | ✅ | ✅ |
-| 节点层日志<br>`.anet/nodes/<alias>/logs/` | ✅ | ❓ ^2^ | ✅ | ❓ | ❓ | ❓ | ❓ |
-| 飞书 IM 直聊 | ✅ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ |
-| 任务结果正确标记失败<br>坏结果不会被记成成功 | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❌ ^4^ |
+| 功能 | claude-agent-sdk | claude-code-cli | codex-sdk | codex-app-server | grok-build-acp | grok-build-cli | opencode-cli | pi-cli |
+|---|---|---|---|---|---|---|---|---|
+| CLI 直接创建节点<br>`anet node create --runtime X` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ ^5^ |
+| daemon 代创建节点<br>经 `create_node` | ✅ | ❓ | ✅ | ❓ ^1^ | ✅ | ❓ ^1^ | ❓ ^1^ | ❓ |
+| TUI 人机共存<br>人和 agent 共用一个会话 | — | — | — | ✅ | — | ✅ | ✅ | — ^6^ |
+| 节点层日志<br>`.anet/nodes/<alias>/logs/` | ✅ | ❓ ^2^ | ✅ | ❓ | ❓ | ❓ | ❓ | ❓ |
+| 飞书 IM 直聊 | ✅ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ | ❓ ^3^ |
+| 任务结果正确标记失败<br>坏结果不会被记成成功 | ❓ | ❓ | ❓ | ❓ | ❓ | ❓ | ❌ ^4^ | ✅ ^5^ |
 
 **脚注**
 
 - ^1^ 较早的版本上，经 daemon 创建这三个共存 runtime 会被 Hub 以 `runtime_invalid` 拒绝。
-  Hub 与 daemon 的 runtime 清单此后都已放开到全部 7 个
+  Hub 与 daemon 的 runtime 清单此后都已放开到当时的全部 7 个
   （[#1298](https://github.com/sleep2agi/agent-network/issues/1298)），但经 daemon 创建的共存节点还没有端到端重新验证。
   另外请注意：这三个 runtime 的用途是「人和 agent 共用一个 TUI 会话」，而 daemon 建出来的是无人值守的后台进程；
   需要它们时，更稳妥的做法是在目标机器上用 `anet node create` 创建。
@@ -61,6 +61,9 @@
   见 [#1259](https://github.com/sleep2agi/agent-network/issues/1259)。
 - ^4^ opencode 节点可能把未执行的 `<tool_call>` 原文当作任务结果返回，而 Hub 会把它记为正常完成，
   所以只看任务状态发现不了。同类问题是否也影响其他 runtime 尚未验证。
+- ^5^ pi-cli 的「创建/收任务/回结果/失败标记」已在 RFC-043 M4/L2 的 Docker E2E（tests/test-pi-e2e/）实测：
+  `anet node create --runtime pi-cli` → agent-node 注册 → MCP send_task → 真实回复；坏模型节点被 preflight 拦截并回传 failed。
+- ^6^ pi-cli 一期为 headless（RPC mode），TUI 人机共存留二期（RFC-043 §12）。
   见 [#943](https://github.com/sleep2agi/agent-network/issues/943)。
 
 ---
