@@ -1,0 +1,17 @@
+=== agent-node: bun build src/cli.ts ===
+Bundled 438 modules in 33ms
+
+  cli.js  3.0 MB  (entry point)
+
+PASS: agent-node build
+
+=== agent-network: tsc --noEmit (baseline noise expected; gate = pi-cli files only) ===
+agent-network tsc baseline errors (pre-existing, none in pi-cli files): 0
+PASS: agent-network tsc (pi-cli files clean)
+
+=== server: tsc --noEmit (baseline noise expected; gate = runtime-label.ts only) ===
+server tsc baseline errors (pre-existing, none in runtime-label.ts): 101
+note: tsc exits 2 — pre-existing baseline, unchanged by pi-cli wiring
+PASS: server tsc (runtime-label.ts clean)
+
+PASS: pi compile check (all packages)

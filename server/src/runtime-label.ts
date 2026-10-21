@@ -14,6 +14,8 @@ export function normalizeSessionRuntime(agent: unknown): string | null {
     "claude-agent-sdk": "claude-agent-sdk",
     grok: "grok-build-acp",
     "grok-build-acp": "grok-build-acp",
+    pi: "pi-cli",
+    "pi-cli": "pi-cli",
   };
   if (exact[reported]) return exact[reported];
   if (agent === "http-api" || agent === "http" || agent === "api") return "http-api";

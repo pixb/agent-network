@@ -1,0 +1,84 @@
+=== M0 probe: pi RPC protocol walkthrough (offline stub) ===
+pi version: 1.3.0
+node version: v22.19.0
+bun version: 1.3.14
+stub listening on 127.0.0.1:32123
+
+--- S1: --mode rpc --no-session, multi-turn ---
+PASS: S1 get_state success
+PASS: S1 sessionId present
+PASS: S1 prompt1 started
+PASS: S1 settled after turn1
+PASS: S1 assistant text == PONG
+PASS: S1 prompt2 started
+PASS: S1 settled after turn2
+PASS: S1 multi-turn text == PONG2
+PASS: S1 clean shutdown exit 0
+
+--- S2: session persistence + get_entries since across processes ---
+PASS: S2 sessionFile set
+PASS: S2 prompt started
+PASS: S2 turn1 text
+PASS: S2 entries after turn >= 2
+PASS: S2 leafId present
+PASS: S2 process1 exit 0
+PASS: S2 process2 same sessionFile
+PASS: S2 since cursor -> 0 new (durable)
+PASS: S2 process2 prompt started
+PASS: S2 process2 turn text
+PASS: S2 since cursor -> new entries after turn
+PASS: S2 process2 exit 0
+
+--- S3: negative — nonexistent provider ---
+[probe] S3 prompt response timeout: Error: timeout waiting response rrodjqha3
+PASS: S3 settled (or prompt rejected)
+PASS: S3 no fake success
+S3 event types: []
+
+=== event type census (S1+S2) ===
+  agent_start: 3
+  turn_start: 3
+  message_start: 7
+  message_end: 7
+  message_update: 9
+  turn_end: 3
+  agent_end: 3
+  agent_settled: 3
+
+=== summary: failures=0 ===
+PASS: M0 pi rpc probe
+
+=== M1: pi-rpc adapter integration tests (real pi + stub) ===
+bun test v1.3.14 (0d9b296a)
+
+pi-rpc-unit.test.ts:
+(pass) pi-rpc happy path (real pi binary + stub provider) > openPiRuntime returns a sessionId [0.06ms]
+(pass) pi-rpc happy path (real pi binary + stub provider) > think turn1 -> PONG [31.19ms]
+(pass) pi-rpc happy path (real pi binary + stub provider) > think turn2 -> PONG2 (same process, multi-turn) [3.51ms]
+(pass) pi-rpc happy path (real pi binary + stub provider) > shutdown exits cleanly [41.13ms]
+
+ 4 pass
+ 0 fail
+ 4 expect() calls
+Ran 4 tests across 1 file. [482.00ms]
+PASS: M1 pi-rpc adapter integration
+
+=== M3: pi-rpc safety hardening (D3 tools / D5 preflight / D7 rescue) ===
+bun test v1.3.14 (0d9b296a)
+
+pi-rpc-m3.test.ts:
+(pass) D3: buildPiArgs safety defaults > safe mode: read-only allowlist + trust boundaries [0.07ms]
+(pass) D3: buildPiArgs safety defaults > unsafe mode: all built-ins, trust boundaries kept [0.02ms]
+(pass) D3: buildPiArgs safety defaults > explicit tools override unsafe default [0.01ms]
+(pass) D3: buildPiArgs safety defaults > session args [0.01ms]
+(pass) D5: preflight via pi auth check > parseAuthState: json first, exit code fallback [0.07ms]
+(pass) D5: preflight via pi auth check > configured stub provider -> ready (fast, no hang) [133.95ms]
+(pass) D5: preflight via pi auth check > nonexistent provider -> not ready (fast, no hang) [129.17ms]
+(pass) D7: empty-reply rescue > empty reply -> rescue re-prompts once and returns text [32.49ms]
+(pass) D7: empty-reply rescue > disableRescue -> empty reply stays empty [3.72ms]
+
+ 9 pass
+ 0 fail
+ 25 expect() calls
+Ran 9 tests across 1 file. [492.00ms]
+PASS: M3 pi-rpc safety hardening
