@@ -16,6 +16,7 @@ import { OpenCodeCopresenceTimeoutError, openVettedOpenCodeCopresence, reserveLo
 import {
   openCodeV2Outcome,
   openCodeV2ReplyText,
+  openCodeV2SessionModelRef,
   openCodeV2TurnVerdict,
   wireOpenCodeV2CommhubMcp,
   type OpenCodeV2Entry,
@@ -23,6 +24,16 @@ import {
 
 const FAKE = join(import.meta.dir, "fixtures", "fake-opencode-v2.ts");
 const noTmux = () => { throw new Error("tmux must not be touched by this test"); };
+
+describe("session model ref (pure)", () => {
+  test("providerID + id, nothing else", () => {
+    expect(openCodeV2SessionModelRef({ data: { model: { providerID: "deepseek", id: "deepseek-flash" } } })).toBe("deepseek/deepseek-flash");
+    expect(openCodeV2SessionModelRef({ data: { model: { providerID: "deepseek" } } })).toBeUndefined();
+    expect(openCodeV2SessionModelRef({ data: { model: { providerID: "a/b", id: "c" } } })).toBeUndefined();
+    expect(openCodeV2SessionModelRef({ model: { providerID: "deepseek", id: "flash" } })).toBeUndefined();
+    expect(openCodeV2SessionModelRef(null)).toBeUndefined();
+  });
+});
 
 describe("turn verdict (pure)", () => {
   test("pending until an idle marker or the next user entry", () => {
@@ -260,10 +271,18 @@ describe("V2 core against a protocol-shaped fake serve", () => {
       });
       first = await openShared(firstDir, firstId);
       expect(first.sessionId).toBe(firstId);
+      expect(await first.selectedModel?.()).toBe("stub/tui-selected-model");
+      await first.setSelectedModel?.("stub/client-selected");
+      expect(await first.selectedModel?.()).toBe("stub/client-selected");
       let state = await (await fetch(`${url}/test/state`, {
         headers: { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` },
       })).json() as any;
-      expect(state[firstId].model).toEqual({ providerID: "stub", id: "tui-selected-model" });
+      // #2827: a client model edit *switches the live session* (the commit that added
+      // setSelectedModel says so, and `selectedModel()` above already reads back
+      // client-selected). This assertion used to expect the pre-#2827 behaviour
+      // (client edit stays local, TUI choice survives), which contradicts the line
+      // three above it — that is why it has been red since #2827 landed.
+      expect(state[firstId].model).toEqual({ providerID: "stub", id: "client-selected" });
       await first.close();
       first = await openShared(firstDir, firstId, "stub/new-model", true);
       expect(first.sessionId).toBe(firstId);

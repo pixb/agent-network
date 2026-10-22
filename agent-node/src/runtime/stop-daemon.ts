@@ -287,7 +287,10 @@ function tailText(s: unknown, n = 600): string {
   return t.length > n ? `…${t.slice(-n)}` : t;
 }
 
-async function defaultStopCopresenceNode(alias: string, childWorkDir: string): Promise<CopresenceTeardownResult> {
+/** `anet node stop <alias>` with the pinned binary and the daemon's minimal env.
+ *  Exported (#1625) so a failed create runs the *same* stop authority as the stop
+ *  doorbell instead of inventing a second, weaker one. */
+export async function stopCopresenceChild(alias: string, childWorkDir: string): Promise<CopresenceTeardownResult> {
   const { getAnetBinAbs, minimalEnv } = await import("./create-node-daemon.js");
   let bin: string;
   try { bin = getAnetBinAbs(); }
@@ -318,7 +321,7 @@ async function teardownCopresenceIfAny(
   // workdirRoot = <childWorkDir>/.anet/nodes —— `anet node stop` 按 cwd 解析 .anet/nodes。
   const childWorkDir = dirname(dirname(workdirRoot));
   deps.log(`[stop-daemon] co-presence child ${alias}: managed local config → pinned \`anet node stop ${alias}\` in ${childWorkDir}`);
-  const run = deps.stopCopresenceNode ?? defaultStopCopresenceNode;
+  const run = deps.stopCopresenceNode ?? stopCopresenceChild;
   let r: CopresenceTeardownResult;
   try { r = await run(alias, childWorkDir); }
   catch (e: any) { r = { ok: false, detail: String(e?.message || e) }; }

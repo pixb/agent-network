@@ -216,6 +216,8 @@ daemon 会在子节点 config 里写 `codexCopresence: true`，之后的 `anet n
 - 只对 `codex-app-server` 有效；其他 runtime 带这个键会被 Hub 拒绝（`flag_not_applicable_to_runtime`）。
 - 不认识这个键的旧 Hub / 旧 daemon 会拒绝请求（`flag_key_unknown`），不会悄悄建出无头节点。
 
+校验失败时不会留下活着的三段会话。判据是子节点自己的身份标记：`copresence-identity.json` 在盘上且本 daemon 写的 config 对得上，才会用 `anet node stop <name>` 走同一套身份收据收尾；标记不在盘上时**一律不跑 stop**（那条路会退回按显示名清扫，等于按名字杀），也不会认领同名 tmux 会话。ack 的 `error` 末尾带与 OpenCode V2 相同的 `cleanup=` 结果，残留会话以 `residue_sessions=` 列出（daemon 不直接 `kill-session`）。
+
 ### 经 daemon 创建 OpenCode V2 共存节点 {#opencode-v2-via-daemon}
 
 `runtime` 仍是 `opencode-cli`。要建 V2 共存节点，`create_node` 的 `node_spec.flags` 同时带 `"opencodeGeneration": "v2"` 和 `"opencodeUnsafeTools": true`，`model` 必须是 OpenCode 自己的 `provider/model`（恰好一个斜杠）：
@@ -226,7 +228,11 @@ daemon 会在子节点 config 里写 `codexCopresence: true`，之后的 `anet n
 
 这个接口不接收 anet 的 provider 预设，密钥留在目标节点已有的 OpenCode 配置里。daemon 在写子节点配置之前，要求 PATH 上的 `opencode --version` 是本发行接受的 `@opencode/cli@2.0.22`。显式 `v1` 同样必须对上接受的 `opencode-ai` 版本（当前 pin `1.18.34`，过渡版 `1.18.1`）。对不上的错误码是 `opencode_generation_mismatch`。省略 `opencodeGeneration` 仍按旧的 V1 创建，不因为机器上碰巧是 V2 二进制而拒绝。`--version` 超时不在这一步拒绝。
 
+同一台机器上同时装着 V1 与 V2 两份 `opencode` 是常见情况，而子进程 PATH 的第一命中未必是请求的那一代。自 #1611 起，显式 `v1` / `v2` 建节点会按 PATH 顺序逐个探测候选，取第一个版本被该代际接受的；启动侧同样按代际挑二进制，不再停在第一命中。所以「机器上两份都有」不再是阻塞项——但把 anet 管理的 V2 前缀（`~/.anet/oe-v2-prefix/node_modules/.bin`）留在 `daemonExtraPath` 里仍然是好习惯：它让探测少走几步，也让 PATH 顺序在别的工具里可预测。
+
 读回：daemon 上报的配置快照 `flags` 会带上 `opencodeGeneration`、`opencodeMode`、`opencodeUnsafeTools`，只读。`update_node_config` 不能改这三项。`runtime_readiness` 里的 `opencode-cli` 可带 `generation` 与 `accepted`；V2 的 `state` 仍是 `unknown`（provider 与登录取决于目标节点配置）。`accepted: false` 表示这个 2.x 不是接受的 pin，显式创建会被拒绝。
+
+post-spawn 校验失败不会留下活着的 generation。启动器没退出、退出非 0，或 launch-health / attach 记录缺失、不安全时，daemon 先停掉这次刚起的启动器，再用 `anet node stop <name>` 走与 stop doorbell 同一套生命周期收据，最后只对**本 generation 自己写的** launch-health / attach 记录里点名的进程兜底（pid 与启动时刻都要对上）。ack 的 `error` 末尾带 `cleanup=reaped | no_live_generation | handed_to_host | residue`；`cleanup=residue` 同时给出 `residue_pids=…`，表示按记录仍有进程活着、需要人工 `anet node stop <name>` 收尸 —— Hub 上的「失败」与磁盘真实状态因此在同一条 ack 里对得上。
 
 ### 任务超时 `flags.timeout` 的单位是毫秒 {#create-node-timeout-ms}
 

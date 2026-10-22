@@ -80,6 +80,9 @@ L1_TESTS=(
   # 这道闸门自己的回归。放在最前:它跑的是本脚本,若闸门坏了应当最先暴露。
   # (注册这一步不是可选的 —— 一个没被任何东西调用的套件等于不存在。)
   "test823-l1-concurrency-cap"
+  # #812: tmux target 语义。命令从 docs/node-liveness-criterion.md 抽出来实跑,
+  # 容器里现造 session。只依赖 alpine 的 tmux,不碰机群、不碰凭据。
+  "test812-tmux-target-semantics"
   # RFC-036 PR1: credential-free SideThread state machine + Codex adapter
   # contract. Exact-version fail-closed has a witnessed-red mutation.
   "test1193-side-thread-contract"
@@ -89,6 +92,9 @@ L1_TESTS=(
   "test1195-side-thread-hub-security"
   "test1195-side-thread-hub-race"
   "test1200-side-thread-command-transport"
+  # #497/#175 cross-layer App fixture -> Hub HTTP -> dedicated node port ->
+  # terminal -> hydrate. Pins the App-vendored contract bytes by sha256.
+  "test1199-btw-cross-layer-contract"
   "test1203-btw-production-e2e"
   "test1181-codex-durable-poll"
   # #1027: deterministic reproduction of the historical test225 foreground

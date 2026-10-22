@@ -4,10 +4,10 @@
      本页有多处**带版本号的行为断言**(某个版本上第一条命令会怎样),它们在发版那一刻
      同时变假。release gate 会拿正在发的版本和这两条戳比对,不一致就拦下发布并列出
      每一处需要改的行。改了正文也要改戳,反之亦然 —— 两边不一致时门同样会红。
-     latest 标记已核对的通道版本，preview 标记已验证的发布候选，不代表 npm 已发布；
+     latest 标记已核对的通道版本，preview 标记本页核对的版本；是否发布另核 npm 精确版本；
      讲历史的版本引用(如 `≤ 2.3.0-preview.37`)故意不标。 -->
 <!-- version-claim: package=agent-network channel=latest version=2.3.0-preview.181 -->
-<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.182 -->
+<!-- version-claim: package=agent-network channel=preview version=2.3.0-preview.190 -->
 
 从启动 Hub 到在 Dashboard 里和第一个 Agent 对话，**4 步**。每步一条命令 + 一句验证。
 
@@ -59,8 +59,8 @@ anet hub dashboard
    Store this password now; it will not be shown again.
 ```
 
-已核对的 `latest`（`2.3.0-preview.181`）打印随机密码，形如 `anet-` 加 22 位十六进制字符；`.181` 相对已逐条实跑过的 `.180` 只改了两处产品代码（`notifyServerOffline` 的两处 `Accept` 协商（`#1344`/PR `#2800`）与 Windows 停止编排（`#1335`/`#1339`）），**默认初始化/随机密码路径未改动**，所以这条行为断言从 `.180` 沿用。本次 `preview` 候选（`2.3.0-preview.182`）相对 `.181` 同样不碰引导路径：OpenCode V1 pin 表镜像（`opencode-ai` `1.18.34`→`1.19.3`，须与 `agent-node` 同版本一起升）与 RFC-029 release pair 常量，外加 `bin/cli.ts` 一处注释里的示例版本号（`a54c6290..058664d3` 的 `agent-network/src`+`bin` diff 仅上述三处、共 7 行，其余为测试与文档）。本次安装门使用显式密码，未额外重跑默认密码路径。候选须通过全部发布门后才公开。
-**候选验证不代表已经发布**；当前可安装的通道版本请运行 `npm view @sleep2agi/agent-network dist-tags` 查询，不要把候选版本号当作当前 npm `preview`。
+已核对的 `latest`（`2.3.0-preview.181`）打印随机密码，形如 `anet-` 加 22 位十六进制字符。**已发布**的 CLI `2.3.0-preview.190` 相对 `.189` 的配对变更指向已发布的 agent-node `2.5.0-preview.153`；这两个精确版本已核实可从 npm 查询。节点新增行为限于 V1 admission（提交前等待）路径：标记 task 与提交者，并在 session 查询的 404 计数达到门槛后以 `owner_left` 结束等待。**404 不证明 TUI 负责人离开**；`.153` 的部分 status 错误路径尚未重置计数，该发布包不包含后续连续缺失修复。这不代表 V2 等价支持、已提交 turn 的收尾或舰队升级已经验收；默认 30 分钟预算不变。**默认初始化 / 随机密码路径未改动。**
+精确版本已发布不代表通道标记永远指向它，也不代表现役节点已升级。当前通道版本请运行 `npm view @sleep2agi/agent-network dist-tags` 查询。
 固定的 `admin / anethub` 只存在于 `2.2.x` 及更早的版本，新装的 Hub 上用它登不进去。
 
 凭据也落在 `~/.anet/server/admin-utok.json`,里面只有
@@ -89,9 +89,9 @@ anet node create my-bot
 ::: tip 新手最省事 — 手动选 `claude-code-cli`
 向导**默认高亮 `claude-agent-sdk`**, 一路 Enter 会落到要填 vendor + API Key 的复杂路径。如果已经 `claude auth login`, **手动选 `claude-code-cli`** = 零配置最快路径。
 
-`anet node create` 的选单列出全部 8 个 runtime（5 个正式：`claude-agent-sdk` / `claude-code-cli` / `codex-sdk` / `grok-build-acp` / `pi-cli`；3 个预览：`codex-app-server`（选单里叫 `codex-cli`）/ `grok-build-cli` / `opencode-cli`）；完整对照见 [Runtime 对比](/guide/runtimes#runtime-对比-canonical-表)。
+`anet node create` 的选单列出全部 7 个 runtime（4 个正式：`claude-agent-sdk` / `claude-code-cli` / `codex-sdk` / `grok-build-acp`；3 个预览：`codex-app-server`（选单里叫 `codex-cli`）/ `grok-build-cli` / `opencode-cli`）；完整对照见 [Runtime 对比](/guide/runtimes#runtime-对比-canonical-表)。
 
-OpenCode V2 不是独立 runtime，向导也不会默认选它。它仍是 `opencode-cli`，要显式 `--opencode-generation v2 --opencode-unsafe-tools`，并且只做人机共存。成熟度仍是 preview（npm `latest` 上还没有这条创建标志）。步骤、Hub 对话和还没接上的模型目录见 [OpenCode V2](/guide/opencode)。
+OpenCode V2 不是第 8 个 runtime，向导也不会默认选它。它仍是 `opencode-cli`，要显式 `--opencode-generation v2 --opencode-unsafe-tools`，并且只做人机共存。成熟度仍是 preview（npm `latest` 上还没有这条创建标志）。步骤、Hub 对话和还没接上的模型目录见 [OpenCode V2](/guide/opencode)。
 :::
 
 启动节点：

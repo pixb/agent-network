@@ -232,6 +232,8 @@ missing is reported at start (the request ends as `runtime_capability_check_fail
 - Only valid for `codex-app-server`; the Hub rejects the key on any other runtime (`flag_not_applicable_to_runtime`).
 - An older Hub or daemon that does not know the key rejects the request (`flag_key_unknown`) instead of quietly creating a headless node.
 
+A failed check leaves no live trio behind. The gate is the child's own identity marker: only when `copresence-identity.json` is on disk and the config is the one this daemon wrote does it run `anet node stop <name>` through the same lifecycle receipts. Without the marker it **never** runs stop (that path falls back to a display-name sweep, i.e. killing by name) and never claims same-named tmux sessions. The ack's `error` ends with the same `cleanup=` result as OpenCode V2, and surviving sessions are listed as `residue_sessions=` (the daemon never `kill-session`s directly).
+
 ### Creating an OpenCode V2 co-presence node through the daemon {#opencode-v2-via-daemon}
 
 `runtime` stays `opencode-cli`. To create a V2 co-presence node, `create_node`'s `node_spec.flags` must include both `"opencodeGeneration": "v2"` and `"opencodeUnsafeTools": true`, and `model` must be OpenCode's own `provider/model` (exactly one slash):
@@ -243,6 +245,8 @@ missing is reported at start (the request ends as `runtime_capability_check_fail
 This API does not take an anet provider preset; keys stay in the OpenCode config already on the target node. Before the daemon writes the child config, `opencode --version` on PATH must be the accepted `@opencode/cli@2.0.22`. An explicit `v1` must likewise match an accepted `opencode-ai` version (current pin `1.18.34`, transition `1.18.1`). A mismatch is `opencode_generation_mismatch`. Omitting `opencodeGeneration` still creates a legacy V1 node, even if the binary on the machine happens to be V2. A `--version` timeout is not rejected at this step.
 
 Readback: the daemon's config snapshot `flags` echo `opencodeGeneration`, `opencodeMode`, and `opencodeUnsafeTools` as read-only fields. `update_node_config` cannot change those three. `runtime_readiness` for `opencode-cli` may include `generation` and `accepted`. V2 `state` stays `unknown` (provider and login depend on the target node's own configuration). `accepted: false` means this 2.x is not the accepted pin, so an explicit create is refused.
+
+A failed post-spawn check does not leave a live generation behind. When the launcher does not exit, exits non-zero, or the launch-health / attach record is missing or unsafe, the daemon stops the launcher it just spawned, then runs `anet node stop <name>` through the same lifecycle receipts the stop doorbell uses, and finally signals anything the generation's own launch-health / attach records still name (pid **and** start ticks must match). The ack's `error` ends with `cleanup=reaped | no_live_generation | handed_to_host | residue`; `cleanup=residue` also carries `residue_pids=…`, meaning those processes are still alive per the records and need a manual `anet node stop <name>` — so the Hub's "failed" and what is actually on disk agree in the same ack.
 
 ### Task timeout: `flags.timeout` is in milliseconds {#create-node-timeout-ms}
 

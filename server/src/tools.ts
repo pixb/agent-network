@@ -729,12 +729,12 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
 
   server.tool(
     "report_status",
-    "Report agent status. Returns inbox_count so you know if there are pending tasks.",
+    "Report agent status. Returns inbox_count.",
     {
       resume_id: z.string().min(1).max(200).describe("Claude Code session UUID (unique per session)"),
       alias: z.string().min(1).max(200).describe("Human-readable session name for dispatching (e.g. 指挥室/知识哥)"),
       status: z.enum(["working", "idle", "blocked", "error", "waiting_input", "offline"]),
-      task: z.string().max(TASK_CONTENT_MAX).optional().describe("Current task description (the hub stores only the first 200 chars on the session row; the full text is matched against tasks.content)"),
+      task: z.string().max(TASK_CONTENT_MAX).optional().describe("Task (session stores 200 chars; full text matches tasks.content)"),
       output: z.string().max(50000).optional().describe("Recent output (max 4000 chars stored)"),
       score: z.number().min(0).max(10).optional().describe("Self-score 1-10"),
       progress: z.number().min(0).max(100).optional().describe("Progress 0-100"),
@@ -742,6 +742,15 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       hostname: z.string().max(200).optional().describe("Agent hostname"),
       agent: z.string().max(100).optional().describe("Agent type (claude-code / codex / opencode)"),
       project_dir: z.string().max(1000).optional().describe("Agent working directory"),
+      // #1198 — OS account the process runs as (platform identity only; no env fallback).
+      os_user: z.string().min(1).max(256).optional().describe("OS account"),
+      // #1474 — names of the env keys this node actually has. Never values; the
+      // node-side collector parses and drops them. Capped at 50 * 64 chars so a
+      // pathological secrets.env cannot grow this row without bound.
+      secret_keys: z.array(z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/)).max(50).optional().describe("Env key names only"),
+      // #1510 — how the node reaches this hub. Reported by the node because only
+      // it knows the last hop. Reporting only; no write path reads it yet.
+      env_transport: z.enum(["loopback", "https", "plain"]).optional().describe("Hub link kind"),
       version: z.string().max(100).optional().describe("Agent version"),
       tmux_name: z.string().max(200).optional().describe("tmux session name"),
       // V2 fields
@@ -964,7 +973,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       // instead of rejecting the whole report (see node-health-store.ts).
       health: nodeHealthSchema,
     },
-    async ({ resume_id, alias, status, task, output, score, progress, server: srv, hostname: hn, agent: ag, project_dir: pd, version: ver, tmux_name: tmux, node_id, session_id, config_path, channels, model: mdl, node_name: nn, network_id: netId, host, process_telemetry: proc, external_schedules: externalSchedules, config_snapshot: cfgSnap, rules_file_capable: rulesFileCapable, skills_capable: skillsCapable, files_capable: filesCapable, logs_capable: logsCapable, health: nodeHealth }) => {
+    async ({ resume_id, alias, status, task, output, score, progress, server: srv, hostname: hn, agent: ag, project_dir: pd, os_user: osUser, version: ver, tmux_name: tmux, node_id, session_id, config_path, channels, model: mdl, node_name: nn, network_id: netId, host, process_telemetry: proc, external_schedules: externalSchedules, config_snapshot: cfgSnap, rules_file_capable: rulesFileCapable, skills_capable: skillsCapable, files_capable: filesCapable, logs_capable: logsCapable, health: nodeHealth, secret_keys: secretKeys, env_transport: envTransport }) => {
       const effectiveNetId = getNetworkId(netId);
       const sessionNetId = effectiveNetId ?? "default";
       if (!callerTokenIsNetwork || !enforceNetworkId) {
@@ -1111,7 +1120,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
                   channels, model, cpu_load_1min, cpu_cores, mem_total_gb, mem_used_gb, mem_avail_gb, disk_total_gb,
                   disk_used_gb, disk_avail_gb, process_rss_bytes, process_rss_mb, process_cpu_pct,
                   process_uptime_seconds, process_in_flight_count, external_schedules, registered_at,
-                  rules_file_capable, skills_capable, files_capable, logs_capable
+                  rules_file_capable, skills_capable, files_capable, logs_capable, os_user, secret_keys
              FROM sessions WHERE alias = ?1 AND resume_id != ?2 AND network_id = ?3
              ORDER BY updated_at DESC LIMIT 1`,
           effectiveAlias, resume_id, sessionNetId,
@@ -1156,6 +1165,43 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
              last_seen_at = datetime('now'), updated_at = datetime('now')`,
           [resume_id, effectiveAlias, tmux ?? null, srv ?? null, hostIp, hostHostname, ag ?? null, pd ?? null, ver ?? null, storedStatus, sessionTask, trimmedOutput ?? null, progress ?? null, score ?? null, node_id ?? null, session_id ?? null, config_path ?? null, channels ?? null, sessionNetId, mdl ?? null, cpuLoad1m, cpuCores, memTotalGb, memUsedGb, memAvailGb, diskTotalGb, diskUsedGb, diskAvailGb, processRssBytes, processRssMb, processCpuPct, processUptimeSeconds, processInFlightCount, externalSchedulesJson, peerReplyInboxCapable ? 1 : 0]
         );
+        // #1198 — os_user is its own UPDATE so the INSERT/UPSERT shape stays
+        // pinned (test698). Absent means "not reported": keep the stored value.
+        // A resume_id handover DELETE+INSERTs a row that starts NULL, so copy
+        // the replaced row only when this report omits the field. COALESCE
+        // keeps a value already on the surviving row.
+        if (osUser) {
+          db.run(
+            `UPDATE sessions SET os_user = ?2, updated_at = datetime('now') WHERE resume_id = ?1`,
+            [resume_id, osUser],
+          );
+        }
+        // #1474 — its own UPDATE for the same reason as os_user: the INSERT /
+        // UPSERT placeholder bytes stay untouched. An EMPTY array is a real
+        // report ("this node has no secrets") and must overwrite the old list;
+        // only `undefined` (field absent) keeps the previous value.
+        if (envTransport) {
+          db.run(
+            `UPDATE sessions SET env_transport = ?2, updated_at = datetime('now') WHERE resume_id = ?1`,
+            [resume_id, envTransport],
+          );
+        }
+        if (Array.isArray(secretKeys)) {
+          db.run(
+            `UPDATE sessions SET secret_keys = ?2, updated_at = datetime('now') WHERE resume_id = ?1`,
+            [resume_id, JSON.stringify(secretKeys)],
+          );
+        } else if (typeof handover?.secret_keys === "string" && handover.secret_keys) {
+          db.run(
+            `UPDATE sessions SET secret_keys = COALESCE(secret_keys, ?2) WHERE resume_id = ?1`,
+            [resume_id, handover.secret_keys],
+          );
+        } else if (typeof handover?.os_user === "string" && handover.os_user) {
+          db.run(
+            `UPDATE sessions SET os_user = COALESCE(os_user, ?2) WHERE resume_id = ?1`,
+            [resume_id, handover.os_user],
+          );
+        }
         if (handover) {
           // 换 resume_id 那条路径上 ON CONFLICT 不会触发;INSERT 完再把没上报(仍为 NULL)的
           // 描述性列从被替换的那行接手。INSERT 语句与参数列表保持原样 —— test698 的变异
@@ -1909,8 +1955,8 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       // (db.ts) write back into A's task result + inbox — cross-tenant
       // write. Verify ownership, reject on mismatch.
       if (parentIn) {
-        const parentRow = db.get<{ network_id: string | null }>(
-          "SELECT network_id FROM tasks WHERE task_id = ?1",
+        const parentRow = db.get<{ network_id: string | null; from_name: string; to_name: string }>(
+          "SELECT network_id, from_name, to_name FROM tasks WHERE task_id = ?1",
           [parentIn]
         );
         if (!parentRow) {
@@ -1925,6 +1971,24 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
             ok: false, error: "cross_network_parent",
             message: "parent_task_id belongs to a different network",
           }) }] };
+        } else {
+          // Node-TMAI#4 (D): same-network is NOT sufficient. The dispatcher
+          // must be a party to the task it claims as parent — either its
+          // originator or its assignee. Without this, a same-network caller
+          // could attach its dispatch to any third party's task and the
+          // chain would later surface that child's result to the third
+          // party's originator. Compare canonical aliases so a committed
+          // rename on either side cannot defeat the check.
+          const parentFromAlias = resolveCanonicalAlias(effectiveNetId, parentRow.from_name).alias;
+          const parentToAlias = resolveCanonicalAlias(effectiveNetId, parentRow.to_name).alias;
+          const childFromAlias = resolveCanonicalAlias(effectiveNetId, from_session).alias;
+          if (childFromAlias !== parentFromAlias && childFromAlias !== parentToAlias) {
+            console.log(`[${ts()}] 🚫 send_task: non-participant parent rejected, parent=${parentIn.slice(0, 8)} caller=${childFromAlias}`);
+            return { content: [{ type: "text" as const, text: JSON.stringify({
+              ok: false, error: "parent_not_participant",
+              message: "parent_task_id is not a task this sender took part in",
+            }) }] };
+          }
         }
       }
 
@@ -4096,6 +4160,28 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
   );
 
 
+  // #1511 — stop_node（§4.3 D4）与 restart_node 共用的「在途任务」计数。
+  // 计数规则见 stop_node 内的长注释（#2022/#2029 修订：能成为「本节点正在做的
+  // 工作」的行才算——tasks 行按状态判、终态不算且不设龄上限；无状态行按 60 分钟
+  // 龄判）。抽成一处后，两个闸门共享同一份 SQL，不再各自漂移。
+  const IN_FLIGHT_MAX_AGE_MINUTES = 60;
+  function countInFlightTasks(alias: string, networkId: string | null): number {
+    const row = db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM inbox i
+         LEFT JOIN tasks t
+           ON i.type = 'task'
+          AND t.task_id = COALESCE(i.task_id, i.id)
+        WHERE i.session_name = ?1 AND i.acked = 0
+          AND COALESCE(i.network_id, ?2) = ?2
+          AND ((t.task_id IS NOT NULL
+                AND t.status NOT IN ('replied', 'failed', 'cancelled', 'expired'))
+            OR (t.task_id IS NULL
+                AND i.created_at >= datetime('now', ?3)))`,
+      alias, networkId, `-${IN_FLIGHT_MAX_AGE_MINUTES} minutes`,
+    );
+    return row?.n ?? 0;
+  }
+
   server.tool(
     "restart_node",
     "Trigger a node restart without changing config. RFC-024 Vincent 2026-06-28 increment. Network-scoped (SEC-1); member+ role suffices (lifecycle ops are not privilege elevation).",
@@ -4124,6 +4210,27 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       if (!createdDaemon(nodeId) && activeBinding(nodeId)) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false,
           error: "adopted_restart_requires_daemon", message: "Use Stop, then Start for this adopted node." }) }] };
+      }
+      // #1511 — 正在跑任务时不自动重启，只提示。节点侧 exit-75 的 drain 只等
+      // 60 秒、超时会硬打断当前回合（agent-node cli.ts drainInFlightThink），
+      // 所以 Hub 端在派发前就按 stop_node 同一条在途计数规则拒绝，客户端拿到
+      // 明确二选一：等任务完成后重试，或到节点所在机器手动重启。
+      //
+      // 只对 active 节点生效。stopped 节点的进程已死、任务不可能正在跑，其
+      // unacked 行是 stop 留下的尸体；restart_node 在 stopped 节点上是把
+      // lifecycle 翻回 active 的出口，不能用尸体行把这条路堵死。
+      // lifecycle_state 需单独取：resolveTargetNode 的 SELECT 不含该列。
+      const restartLifecycle = db.get<{ lifecycle_state: string | null }>(
+        "SELECT lifecycle_state FROM nodes WHERE node_id = ?1", nodeId,
+      )?.lifecycle_state ?? null;
+      if (restartLifecycle === "active") {
+        const busyCount = countInFlightTasks(node.alias, node.network_id);
+        if (busyCount > 0) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            ok: false, error: "node_busy_in_flight", in_flight_count: busyCount,
+            hint: "节点正在执行任务，本次未安排重启；等它完成后再试，或到节点所在机器手动重启",
+          }) }] };
+        }
       }
       // F-B reaper: same stale-supersede semantics as update_node_config,
       // with same acked_at-anchored liveness clock (see update_node_config
@@ -5385,21 +5492,8 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     //      ever retire them, so they get the age ceiling
     //      IN_FLIGHT_MAX_AGE_MINUTES on inbox.created_at.
     // The count stays a per-alias inbox count: one PK join per row.
-    const IN_FLIGHT_MAX_AGE_MINUTES = 60;
-    const inFlightRow = db.get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM inbox i
-         LEFT JOIN tasks t
-           ON i.type = 'task'
-          AND t.task_id = COALESCE(i.task_id, i.id)
-        WHERE i.session_name = ?1 AND i.acked = 0
-          AND COALESCE(i.network_id, ?2) = ?2
-          AND ((t.task_id IS NOT NULL
-                AND t.status NOT IN ('replied', 'failed', 'cancelled', 'expired'))
-            OR (t.task_id IS NULL
-                AND i.created_at >= datetime('now', ?3)))`,
-      node.alias, node.network_id, `-${IN_FLIGHT_MAX_AGE_MINUTES} minutes`,
-    );
-    const inFlight = inFlightRow?.n ?? 0;
+    // 计数实现在上方 countInFlightTasks。#1511 让 restart_node 共用同一份规则，判据本身未变。
+    const inFlight = countInFlightTasks(node.alias, node.network_id);
     if (inFlight > 0 && !args.force) {
       return { ok: false, error: "node_busy_in_flight", in_flight_count: inFlight, hint: "set force=true to override (audit logged)" };
     }
@@ -6575,7 +6669,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     project_id: z.string().max(200).nullable().optional(),
     owner: reqPerson.nullable().optional().describe("负责人 (a person): {kind:'user', id | username} (ids / usernames from requirements_people; names resolve in the task's network); a node is rejected with owner_must_be_human — use agent_owner"),
     agent_owner: reqPerson.nullable().optional().describe("负责 Agent: {kind:'node', id | alias}"),
-    participants: z.array(reqPerson).max(100).optional().describe("REPLACES the whole list (written like owner / agent_owner; omitted people are removed, [] clears). To add or remove a few, use participants_add / participants_remove on requirements_update."),
+    participants: z.array(reqPerson).max(100).optional().describe("REPLACES the whole list (like owner/agent_owner; omitted people are removed, [] clears). For a few, use participants_add/participants_remove."),
     external_url: z.string().max(500).nullable().optional(),
     parent_id: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/).nullable().optional().describe("parent requirement (same network, no cycles, ≤ 5 levels); null detaches"),
   };
@@ -6610,13 +6704,13 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     parent_id: z.string().max(200).optional().describe("children of this requirement ('none' = top level)"),
     department_id: z.string().max(64).optional().describe("owner (or its Agent's owner) in this department or below"),
     top_level: z.boolean().optional(), q: z.string().max(200).optional(),
-    overdue: z.boolean().optional().describe("true = open tasks past their due (date-only due: before today, Asia/Shanghai); false = everything else"),
+    overdue: z.boolean().optional().describe("true = open tasks whose due is past (date-only: before today, Asia/Shanghai); false = rest"),
     due_within_days: z.number().int().min(0).max(365).optional().describe("open tasks not yet overdue, due by the end of today + N days (0 = later today)"),
     limit: z.number().int().min(1).max(1000).optional().describe(`page size, default ${REQ_LIST_MCP_DEFAULT_LIMIT}`),
     cursor: z.string().max(600).optional().describe("next_cursor from the previous page"),
-    view: z.enum(["full", "summary"]).optional().describe("default summary (no description / checklist bodies; has_description, checklist_count instead); full = everything"),
-    changes: z.boolean().optional().describe("with updated_since: only tasks changed since then (archived included; with include_last_event also ones with a newer event, e.g. a comment) + deleted ids + server_time"),
-    include_last_event: z.boolean().optional().describe("default false; true adds last_event per row (newest event incl. comments: type, field, actor, at, summary; null if none), ~150 B/row"),
+    view: z.enum(["full", "summary"]).optional().describe("default summary (no bodies; has_description/checklist_count instead); full = everything"),
+    changes: z.boolean().optional().describe("with updated_since: only tasks changed since then (incl. archived; +deleted ids +server_time; with include_last_event also newer events)"),
+    include_last_event: z.boolean().optional().describe("default false; true adds last_event per row (~150 B/row: type, field, actor, at, summary; null if none)"),
   };
   const reqListKeys = Object.keys(reqListShape);
   server.registerTool(

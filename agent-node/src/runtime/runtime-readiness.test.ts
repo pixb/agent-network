@@ -19,6 +19,7 @@ import {
   probeRuntimeReadiness,
   proxyFor,
   realReadinessDeps,
+  requiredCliStatus,
   type ExecResult,
   type ReadinessDeps,
 } from "./runtime-readiness.js";
@@ -401,5 +402,37 @@ describe("#622 调度与上报", () => {
     expect(out.daemon_capabilities?.runtime_readiness?.["opencode-cli"].state).toBe("ready");
     // 首轮未完成 / 非 daemon:逐字不变。
     expect(attachRuntimeReadiness(snap, undefined)).toBe(snap);
+  });
+});
+
+// #1611 — 显式代际建节点：PATH 第一命中可能是另一代 opencode，必须按顺序扫到被接受的那份。
+describe("#1611 显式代际按 PATH 顺序取可接受候选", () => {
+  const CHILD = { PATH: "/opt/v1/bin:/opt/v2/bin", HOME, LANG: "C.UTF-8" };
+  const io = {
+    resolveOnPath: () => "/opt/v1/bin/opencode",
+    candidatesOnPath: () => ["/opt/v1/bin/opencode", "/opt/v2/bin/opencode"],
+    execVersion: async (bin: string): Promise<ExecResult> => ({
+      kind: "ok",
+      stdout: bin.includes("/v2/") ? "opencode v2.0.22" : "1.18.1",
+    }),
+  };
+
+  test("v2 请求跳过第一命中的 1.18.1，命中后面的 2.0.22", async () => {
+    const st = await requiredCliStatus("opencode-cli", CHILD.PATH, CHILD, io, 1_000,
+      (v) => v === "2.0.22");
+    expect(st).toEqual({ cli: "found", command: "opencode", version: "2.0.22" });
+  });
+
+  test("没有候选被接受时回落成第一命中版本，交给 mismatch 报错", async () => {
+    const st = await requiredCliStatus("opencode-cli", CHILD.PATH, CHILD, io, 1_000,
+      (v) => v === "1.18.34");
+    expect(st).toEqual({ cli: "found", command: "opencode", version: "1.18.1" });
+    const m = opencodeExplicitGenerationMismatch("v2", st as any);
+    expect(m).toContain("opencode_generation_mismatch");
+  });
+
+  test("缺省 acceptVersion 时行为与之前一致（只看第一命中）", async () => {
+    const st = await requiredCliStatus("opencode-cli", CHILD.PATH, CHILD, io, 1_000);
+    expect(st).toEqual({ cli: "found", command: "opencode", version: "1.18.1" });
   });
 });

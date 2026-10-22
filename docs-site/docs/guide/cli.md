@@ -461,11 +461,34 @@ Hub 数据备份；只 clone 仓库不会恢复绑定、账号或密钥。撤销
 ## Preview 专属能力
 
 **开发中、尚未发布（#1053）**：Daemon/节点环境密钥管理不再只依赖演示表单。
-客户端经 `daemon_provider_snapshot` 的 `secret_*` 管理动作发起 owner/admin 请求，所属 Daemon 用
-`anet daemon secret <daemon>` 低层适配器读取私有 JSON stdin，回读只有名称/来源。
-该适配器不接受命令行密钥值，也不启动或重启节点。Daemon 默认值由节点继承，
-节点同名值优先；已有显式进程/config/Provider 配置保持优先。
+
+### 节点环境密钥：`anet node secret`
+
+```bash
+anet node secret list  <node> [--json]
+anet node secret set   <node> <KEY> [--from-env VAR]
+anet node secret unset <node> <KEY>
+```
+
+写 `nodes/<node>/secrets.env`（0600、原子替换、拒符号链接），只列 key 名；
+值只从 `--from-env` 或 stdin 来，**不接受命令行参数直接给值**。
+
+### Daemon 下发密钥：`anet daemon secret`
+
+```bash
+anet daemon secret list  <daemon> [--node <alias>] [--json]
+anet daemon secret set   <daemon> <KEY> --from-env VAR (--node <alias> | --all)
+anet daemon secret unset <daemon> <KEY> (--node <alias> | --all)
+```
+
+管理 `daemon 目录/scoped-secrets.json`（0600、revision CAS、目标必须已绑定）。
+`set`/`unset` **必须**带 `--node` 或 `--all`：不带范围的写会下发给每个子节点，
+属于权限决定，不能靠手滑。回执与 `list` 只出 key 名与来源（`daemon`/`node`）。
+
+底层仍是 `daemon_provider_snapshot` 的 `secret_*` 管理动作；CLI 只是同一套读写的入口，
+不新增第二条路径。Daemon 默认值由节点继承，节点同名值优先；已有显式进程/config/Provider 配置保持优先。
 值在节点下次**完整启动**时加载，单独重启 Bridge 不等于原生 TUI/server 已更新。
+Hub 令牌页上的金库名字不会自动进这个进程；启动优先级见 [节点文件](/guide/agent-node#启动时的环境变量优先级)。
 完整契约与恢复边界见仓库 `docs/scoped-secrets.md`；0.2.248 演示入口不能计为已支持。
 
 以下能力存在于当前 preview，不应写成 stable 已支持：

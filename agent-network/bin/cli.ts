@@ -15,7 +15,7 @@ import { hasBorrowedV1Intent, readBorrowedLaunchConfig, waitForBorrowedLaunchHea
 import { checkDaemonAnetBin, daemonAnetBinEnv, shouldPinDaemonOnNodeStart } from "../src/daemon-anet-bin.js";
 import { runDaemonAdopt } from "../src/daemon-adopt.js";
 import { readProviderInput, runDaemonProvider } from "../src/daemon-provider-command.js";
-import { runDaemonSecret } from '../src/scoped-secrets.js';
+import { runDaemonSecret, runDaemonSecretCli } from '../src/scoped-secrets.js';
 import { readScopedNodeEnv } from '../src/shared/scoped-secret-env.js';
 import { runDaemonProviderApply } from '../src/daemon-provider-apply-command.js';
 import { runDaemonProviderInitialize } from '../src/daemon-provider-initialize.js';
@@ -2937,6 +2937,7 @@ import { clearLocalCredentials, describeRevokeOutcome, normalizeHubUrl, revokeCu
 import { finalExitCode, markFailed, markUsageError } from "../src/cli-exit";
 import { describeHubRemoval, removeNodeFromHub } from "../src/node-delete-hub";
 import { COMMAND_HELP, NODE_DELETE_USAGE, lookupCommandHelp } from "../src/cli-help";
+import { nodeSecretFileModeWarning, nodeSecretFilePath, readNodeSecretKeys, removeNodeSecret, writeNodeSecret } from "../src/node-secret-file";
 import { errorText, formatTopLevelError, hubErrorText, nodeTokenReissueError, hubReachReason, isNetworkError, maskSecret, redactSecretFields, redactSecrets } from "../src/cli-errors";
 import { defaultHubStopProbes, resolveHubListener, stopHub, type HubPidRecord } from "../src/hub-stop";
 export { normalizeRuntime, type RuntimeName };
@@ -2990,6 +2991,100 @@ function normalizeStoredProfile(id: string, project: Record<string, any>, global
     env: project.env && typeof project.env === "object" ? { ...project.env } : {},
     flags: project.flags && typeof project.flags === "object" ? { ...project.flags } : {},
   };
+}
+
+// #2056 (#909) — `anet node secret list <node>`: show the KEY NAMES the node's
+// own secrets.env will load. Values are never read out of that file, so there is
+// nothing here that could print one.
+//   * list  — names only, one per line (or --json)
+//   * no secrets.env  — a normal state, exit 0
+//   * symlink / unreadable / non-regular — error, exit 1 (do not guess)
+/** 读 stdin 到 EOF。值不回显、不进 argv、不进日志。 */
+async function readAllStdin(): Promise<string> {
+  if (process.stdin.isTTY) process.stdin.setRawMode?.(false);
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function nodeSecretCommand(argv: string[]) {
+  const usage = `Usage: anet node secret list  <node> [--json]
+       anet node secret set   <node> <KEY> [--from-env VAR]     (value on stdin)
+       anet node secret unset <node> <KEY>
+
+Manage <node>/secrets.env — the file the node loads at startup (0600, one
+KEY=VALUE per line; reserved keys like PATH/LD_* are ignored).
+
+"list" prints key NAMES only; values are never printed by any verb.
+"set" reads the value from stdin (one line) or from an existing env var with
+--from-env, never from argv — the value must not land in shell history or ps.`;
+  const verb = argv[0];
+  if (!verb || verb === "--help" || verb === "-h") { console.log(usage); return; }
+  if (verb !== "list" && verb !== "set" && verb !== "unset") {
+    console.error(`Unknown: anet node secret ${verb}\n\n${usage}`);
+    process.exit(2);
+  }
+  const asJson = argv.includes("--json");
+  const ref = argv.slice(1).find(a => !a.startsWith("-"));
+  if (!ref) { console.error(usage); process.exit(2); }
+  const resolved = resolveNodeRef(ref);
+  if (!resolved) { console.error(nodeNotFound(ref)); process.exit(1); }
+  const nodeDir = join(nodesDir(), resolved.id);
+  const display = resolved.profile.node_name || resolved.profile.name || resolved.profile.alias || resolved.id;
+
+  if (verb === "set" || verb === "unset") {
+    const key = argv.slice(1).find(a => !a.startsWith("-") && a !== ref);
+    if (!key) { console.error(`缺少 KEY。\n\n${usage}`); process.exit(2); }
+    if (verb === "unset") {
+      const r = removeNodeSecret(nodeDir, key);
+      if (r.kind === "rejected") { console.error(`[anet] ${display}: ${r.reason}`); process.exit(1); }
+      console.log(r.changed ? `[anet] ${display}: 已删除 ${key}` : `[anet] ${display}: 没有 ${key}（未改动）`);
+      return;
+    }
+    // set：值只从 stdin 或既有 env 变量来，绝不从 argv。
+    const fromEnvIdx = argv.indexOf("--from-env");
+    let value: string;
+    if (fromEnvIdx >= 0) {
+      const name = argv[fromEnvIdx + 1];
+      if (!name) { console.error(`--from-env 需要变量名。\n\n${usage}`); process.exit(2); }
+      const v = process.env[name];
+      if (v === undefined) { console.error(`[anet] 环境变量 ${name} 不存在（未改动）`); process.exit(1); }
+      value = v;
+    } else {
+      if (process.stdin.isTTY) {
+        console.error(`[anet] 从 stdin 读取 ${key} 的值（不会回显，Ctrl-D 结束）。\n[anet] 也可以: ... set ${ref} ${key} --from-env VAR`);
+      }
+      value = (await readAllStdin()).replace(/\r?\n$/, "");
+      if (value === "") { console.error(`[anet] 没有从 stdin 读到值（未改动）`); process.exit(1); }
+    }
+    const r = writeNodeSecret(nodeDir, key, value);
+    if (r.kind === "rejected") { console.error(`[anet] ${display}: ${r.reason}`); process.exit(1); }
+    console.log(`[anet] ${display}: 已写入 ${key}（值不显示）。节点需要重启才会加载。`);
+    return;
+  }
+
+  const r = readNodeSecretKeys(nodeDir);
+  if (r.kind === "unsafe") {
+    console.error(`[anet] ${display}: ${r.reason}\n[anet] path: ${nodeSecretFilePath(nodeDir)}`);
+    process.exit(1);
+  }
+  if (r.kind === "missing") {
+    if (asJson) console.log(JSON.stringify({ ok: true, node: display, path: nodeSecretFilePath(nodeDir), keys: [], present: false }, null, 2));
+    else console.log(`[anet] ${display}: 没有 secrets.env（没有配置任何密钥）`);
+    return;
+  }
+  const warning = nodeSecretFileModeWarning(nodeDir);
+  if (warning) console.error(`[anet] ⚠ ${display}: ${warning}`);
+  if (asJson) {
+    console.log(JSON.stringify({ ok: true, node: display, path: nodeSecretFilePath(nodeDir), keys: r.keys, present: true }, null, 2));
+    return;
+  }
+  if (r.keys.length === 0) {
+    console.log(`[anet] ${display}: secrets.env 存在，但没有可加载的 key 名`);
+    return;
+  }
+  console.log(`[anet] ${display}: ${r.keys.length} 个 key（只有名字，值不显示）`);
+  for (const k of r.keys) console.log(`  ${k}`);
 }
 
 function resolveNodeRef(ref: string): { id: string; profile: Profile } | null {
@@ -4734,6 +4829,7 @@ Node Management:
   anet node stop <name> --remote Act on a node on another machine via its daemon (also start / restart) [--yes] [--wait <s>]
   anet node edit <n> --remote   Switch a node on another machine to --model <id>
   anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|canary|start|restart|resume|fork|account|rollback
+  anet node secret <verb> <ref> Daemon-issued node secret: list|set|unset (owner/admin; the value never leaves the hub)
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -11331,10 +11427,14 @@ Run \`anet hub start\` first if you don't yet have a CommHub.`);
   }
   switch (sub) {
     case 'secret': {
-      const code = runDaemonSecret(args.slice(2), { nodesDir: nodesDir(), readInput: () => {
+      const secretArgs = args.slice(2);
+      const readPrivate = () => {
         if (process.stdin.isTTY) throw Error('private stdin required');
         return readProviderInput();
-      }, print: console.log });
+      };
+      const code = ['list', 'set', 'unset'].includes(secretArgs[0] ?? '')
+        ? runDaemonSecretCli(secretArgs, { nodesDir: nodesDir(), readInput: readPrivate, print: console.log })
+        : runDaemonSecret(secretArgs, { nodesDir: nodesDir(), readInput: readPrivate, print: console.log });
       if (code === 2) markUsageError(); else if (code) markFailed();
       break;
     }
@@ -11703,8 +11803,23 @@ async function fetchDaemonCapabilities(): Promise<CapabilityFetchResult> {
   const gc = loadGlobal();
   const hub = parseOpts().hub || gc.hub;
   if (!hub) return { ok: false, failure: { why: "no-hub" } };
+  // 🔴 hub 的 /api/host-supervisors 需要 network_id，缺了就是 400 missing_network_id，
+  // 而 400 会被下面归到「hub 那边出事了」——2026-10-20 实测：hub 好得很，是这条请求
+  // 自己少带了参数，`anet daemon list` 因此长期印「创建能力:查不到 —— hub 返回 HTTP 400」。
+  // 网络取自登录态（一次登录可能属于多个网络，但 daemon 只属于当前那个），
+  // 登录态里没有时才去 /api/networks 现取。
+  let netId = String((gc as any).network_id || "");
+  if (!netId) {
+    try {
+      const nets = await fetch(`${hub}/api/networks`, { headers: authHeaders() });
+      const nb = await nets.json() as any;
+      const list = Array.isArray(nb?.networks) ? nb.networks : [];
+      if (list.length === 1) netId = String(list[0]?.network_id || list[0]?.id || "");
+    } catch { /* 取不到就按无 network_id 发,让下面的错误分支说清楚 */ }
+  }
+  const netQ = netId ? `?network_id=${encodeURIComponent(netId)}` : "";
   try {
-    const res = await fetch(`${hub}/api/host-supervisors`, { headers: authHeaders() });
+    const res = await fetch(`${hub}/api/host-supervisors${netQ}`, { headers: authHeaders() });
     if (!res.ok) {
       // 🔴 401/403 单独成一类:它们说的是「凭据」,其余 HTTP 错说的是「hub 那边出事了」。
       const why = (res.status === 401 || res.status === 403) ? "unauthorized" : "http";
@@ -19849,6 +19964,7 @@ switch (command) {
       case "clone": await nodeCloneCommand(args.slice(2), "clone"); break;
       case "edit": args.splice(0, 1); await nodeEditCommand(); break;
       case "loop": args.splice(0, 1); await nodeLoopCommand(); break;
+      case "secret": await nodeSecretCommand(args.slice(2)); break;
       case "ls": case "list": await lsCommand(); break;
       case "restart": {
         // #173 / F7-03 — node restart = stop + start, alias for symmetry
@@ -19873,7 +19989,7 @@ switch (command) {
       case "codex": args.splice(0, 1); await codexLifecycleCommand(); break; // #1856 —— Codex TUI 共存节点生命周期控制器
       default: {
         const sub = args[1];
-        const nodeUsage = `Usage: anet node <create|clone|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|migrate-token-to-envref> [name]`;
+        const nodeUsage = `Usage: anet node <create|clone|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|secret|migrate-token-to-envref> [name]`;
         // #561 — bare `anet node`: a menu for every runtime (TTY) / table + cheat sheet + usage (piped). src/node-menu.ts
         if (!sub) process.exit(await runNodeMenu(listProfileIds().map((id) => { const p = loadProfile(id); return { id, alias: nodeDisplayName(id, p), profile: p as Record<string, any> | null }; }), { nodesDir: nodesDir(), home, usageLine: nodeUsage }));
         if (sub) {
@@ -19881,7 +19997,7 @@ switch (command) {
           const redirect = nodeSubcommandRedirect(sub, args[2]);
           if (redirect) { for (const line of redirect) console.log(line); }
           else {
-            const suggestion = suggestSimilar(sub, ["create", "clone", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop", "codex"]);
+            const suggestion = suggestSimilar(sub, ["create", "clone", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop", "codex", "secret"]);
             if (suggestion) console.log(`Unknown node subcommand "${sub}". Did you mean: anet node ${suggestion}?`);
           }
         }

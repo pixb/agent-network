@@ -109,6 +109,41 @@ export function classifyTuiArgv(args: string[], generation: string): "match" | "
   return sawSession ? "wrong_session" : "pre_exec";
 }
 
+/** #1625 — what a *failed* create would leave behind.
+ *
+ *  `inspectLaunchHealth` answers "is this a healthy generation?"; the reaper needs
+ *  the other half: "which processes of the generation I just launched are still
+ *  alive?", answered **only** from the records this generation wrote and only when
+ *  the pid's start ticks still match. No records (the launcher died before it
+ *  wrote any) = nothing proven alive, and nothing to signal.
+ *
+ *  A borrowed V1 host generation is reported as `borrowed` and never enumerated:
+ *  its server belongs to the host, so the only honest outcome is handing it back. */
+export interface LaunchResidue {
+  borrowed: boolean;
+  alive: Array<{ pid: number; role: "bridge" | "serve" | "tui"; ticks: string }>;
+}
+
+export function liveLaunchResidue(dir: string, configPath: string): LaunchResidue {
+  let borrowed = false;
+  try { borrowed = hasBorrowedV1Intent(dir, readRecord(configPath)); } catch { /* no config yet */ }
+  if (borrowed) return { borrowed, alive: [] };
+  const alive: LaunchResidue["alive"] = [];
+  const add = (raw: any, role: "bridge" | "serve" | "tui") => {
+    const pid = Number(raw?.pid);
+    const live = Number.isSafeInteger(pid) && pid > 1 ? readLiveProcess(pid) : undefined;
+    if (live && live.ticks === String(raw?.ticks)) alive.push({ pid, role, ticks: live.ticks });
+  };
+  try {
+    const record = readRecord(join(dir, LAUNCH_HEALTH_FILE));
+    add(record?.bridge, "bridge");
+    add(record?.serve, "serve");
+    const attach = readRecord(join(dir, "opencode-attach.json"));
+    add({ pid: attach?.pid, ticks: String(attach?.startTicks) }, "tui");
+  } catch { /* unreadable/missing record: nothing provable */ }
+  return { borrowed, alive };
+}
+
 export function inspectLaunchHealth(dir: string, configPath: string, launchedAt: number) {
   if (process.platform !== "linux") return { ok: false as const, reason: "daemon V2 launch health requires Linux process identity" };
   try {

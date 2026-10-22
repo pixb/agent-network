@@ -695,10 +695,23 @@ jobs:
           RELEASE_COMMIT: ${{ inputs.commit }}
         run: bash .github/scripts/verify-release-main.sh
 
-      - uses: actions/setup-node@v4
+      # 两种认证形态只能二选一:
+      #   · token(默认)—— setup-node 写 .npmrc,发布用 secrets.NPM_TOKEN;
+      #   · trusted publishing(OIDC)—— **不能**写 .npmrc 的 _authToken,
+      #     否则 npm 会拿空 token 去撞 401,永远不会走 OIDC 交换。
+      #     由仓库变量 NPM_TRUSTED_PUBLISHING=true 选中。
+      - name: setup-node (NPM_TOKEN)
+        if: vars.NPM_TRUSTED_PUBLISHING != 'true'
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: setup-node (trusted publishing / OIDC)
+        if: vars.NPM_TRUSTED_PUBLISHING == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - uses: actions/download-artifact@v4
         with:
@@ -734,12 +747,24 @@ jobs:
       - name: npm publish --tag preview
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TRUSTED_PUBLISHING: ${{ vars.NPM_TRUSTED_PUBLISHING }}
         run: |
           set -euo pipefail
+          if [ "${TRUSTED_PUBLISHING:-}" = "true" ]; then
+            echo "trusted publishing(OIDC):不注入 token;npm 用本次运行的 OIDC 短时凭据发布,"
+            echo "凭据作用域只限这次运行、这个仓库(this workflow)。"
+            echo "前置条件:npmjs.com → 该包 → Settings → Trusted Publisher 已配置"
+            echo "  org/repo=sleep2agi/agent-network  workflow=release.yml  environment=(空)"
+            npm publish "$TARBALL" --tag preview --provenance --access public
+            exit 0
+          fi
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::缺少 secrets.NPM_TOKEN。"
-            echo "更好的做法是 npm trusted publishing(OIDC):在 npmjs.com 上把这个仓库+workflow"
-            echo "配成该包的 trusted publisher,然后删掉 NPM_TOKEN —— 短时凭据,作用域只在这次运行。"
+            echo "::error::缺少 secrets.NPM_TOKEN,且未开启 trusted publishing。"
+            echo "两条路选一条:"
+            echo "  1) 设仓库变量 NPM_TRUSTED_PUBLISHING=true,并在 npmjs.com 把该包配成"
+            echo "     trusted publisher(org/repo=sleep2agi/agent-network, workflow=release.yml);"
+            echo "  2) 继续用 secrets.NPM_TOKEN(**长期 token**;npm 已开始限制免 2FA 的发布 token,"
+            echo "     2026-10-19 起我们的 preview 发布会静默停在 staged,不要再走这条)。"
             exit 1
           fi
           npm publish "$TARBALL" --tag preview --provenance --access public
@@ -748,8 +773,14 @@ jobs:
         env:
           # 轮询上限(分钟)。npm publish 成功后 registry 可能要几分钟才可见(#582),
           # provenance 发布历史上最长约 6 小时;超时只说明「尚未核实」,不是「没生效」。
-          VERIFY_TIMEOUT_MIN: '15'
-          VERIFY_INTERVAL_S: '25'
+          # 2026-10-20 实测：`npm publish` 打印 "being processed" 后，
+          # @sleep2agi/agent-network@2.3.0-preview.186/.187 与
+          # @sleep2agi/agent-network-dashboard@…-60 都是 **约 40 分钟后**才出现在 registry。
+          # 原来 15 分钟的上限会把「慢」判成「没生效」，人再去重发就会撞
+          # `E409 Cannot publish over previously staged version`。
+          # 45 分钟覆盖实测最坏值，超时仍然只是「尚未核实」，不是「没生效」。
+          VERIFY_TIMEOUT_MIN: '45'
+          VERIFY_INTERVAL_S: '30'
           EXPECTED: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -767,3 +798,11 @@ jobs:
 
           echo "✅ $n@${{ inputs.version }} 已发布到 preview 通道"
           echo "下一步(人工):至少 30 分钟真实环境烟测 + owner ACK 后,用 promote-latest 升 latest"
+
+      # RFC-029 published-pair guard (#1811): the tree keeps the two versions in
+      # lockstep, but a release can still leave a HALF pair on npm — 2026-10-19
+      # shipped agent-node .150 while the CLI that declares it was only staged.
+      # Runs after the node publish so the failure names the surviving half.
+      - name: 配对断言(agent-node 发布后 CLI 也必须在 npm 上)
+        if: inputs.package == 'agent-node'
+        run: node scripts/check-pair-published.mjs

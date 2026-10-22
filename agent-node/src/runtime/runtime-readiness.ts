@@ -187,25 +187,72 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | typeof DEADLINE
   });
 }
 
+/** PATH 上所有同名可执行文件，按 PATH 顺序。显式代际时不能用「第一个命中」就收工：
+ *  同一台机器可能同时装着 V1(1.18.x) 与 V2(2.0.22)，第一命中未必是请求的那一代。 */
+export function cliCandidatesOnPath(command: string, pathValue: string): string[] {
+  const dirs = pathValue.split(pathDelimiter);
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  const out: string[] = [];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = join(dir, command + ext);
+      try {
+        const stat = statSync(candidate);
+        if (stat.isFile() && (process.platform === "win32" || (stat.mode & 0o111) !== 0)) {
+          if (!out.includes(candidate)) out.push(candidate);
+          break;
+        }
+      } catch {
+        // 并发被删掉的 PATH 目录项，直接跳过。
+      }
+    }
+  }
+  return out;
+}
+
 /** 某个 runtime 的必选 CLI 在子进程 PATH 上的结论。没有必选 CLI 时是 `not_required`。
  *  `missing` 与就绪状态 `missing_cli` 是同一条判据(找不到,或 `--version` 失败)。
- *  `--version` 超时是 `unknown`,不是 missing。建节点拒绝与自检必须走这里,避免两套结论。 */
+ *  `--version` 超时是 `unknown`,不是 missing。建节点拒绝与自检必须走这里,避免两套结论。
+ *
+ *  `acceptVersion`(#1611):显式代际(v1/v2)时按 PATH 顺序继续扫，取第一个版本被该代际
+ *  接受的候选；都不接受则回落成第一命中的结论(错误信息保持不变)。缺省时行为与之前逐字相同。 */
 export async function requiredCliStatus(
   runtime: string,
   pathValue: string,
   childEnv: Record<string, string | undefined>,
-  io: Pick<ReadinessDeps, "resolveOnPath" | "execVersion">,
+  io: Pick<ReadinessDeps, "resolveOnPath" | "execVersion"> & {
+    candidatesOnPath?: (command: string, pathValue: string) => string[];
+  },
   stepTimeoutMs: number,
+  acceptVersion?: (version: string | undefined) => boolean,
 ): Promise<{ cli: "found" | "missing" | "unknown" | "not_required"; command?: string; version?: string }> {
   const spec = SPECS[runtime];
   if (!spec?.cli) return { cli: "not_required" };
   const command = spec.cli;
-  const abs = io.resolveOnPath(command, pathValue);
-  if (!abs) return { cli: "missing", command };
-  const r = await io.execVersion(abs, childEnv, stepTimeoutMs);
-  if (r.kind === "ok") return { cli: "found", command, version: extractVersion(r.stdout) };
-  if (r.kind === "error") return { cli: "missing", command };
-  return { cli: "unknown", command };
+  if (!acceptVersion) {
+    const abs = io.resolveOnPath(command, pathValue);
+    if (!abs) return { cli: "missing", command };
+    const r = await io.execVersion(abs, childEnv, stepTimeoutMs);
+    if (r.kind === "ok") return { cli: "found", command, version: extractVersion(r.stdout) };
+    if (r.kind === "error") return { cli: "missing", command };
+    return { cli: "unknown", command };
+  }
+  const candidates = (io.candidatesOnPath ?? cliCandidatesOnPath)(command, pathValue);
+  if (candidates.length === 0) return { cli: "missing", command };
+  let first: { kind: ExecResult["kind"]; version?: string } | undefined;
+  for (const abs of candidates) {
+    const r = await io.execVersion(abs, childEnv, stepTimeoutMs);
+    const version = r.kind === "ok" ? extractVersion(r.stdout) : undefined;
+    if (r.kind === "ok" && acceptVersion(version)) return { cli: "found", command, version };
+    first ??= { kind: r.kind, version };
+    // 超时说明这台机器跑不动这个候选，继续扫也只会再等一轮，直接按 unknown 收口。
+    if (r.kind === "timeout") break;
+  }
+  if (first?.kind === "error") return { cli: "missing", command };
+  if (first?.kind === "timeout") return { cli: "unknown", command };
+  // 找到了但不被该代际接受：把第一命中的版本交给 opencodeExplicitGenerationMismatch 报错。
+  return { cli: "found", command, version: first?.version };
 }
 
 /**

@@ -378,7 +378,9 @@ function resolveCanonicalPackageEntrypoint(
   return binary;
 }
 
-function commandFromPath(name: string, searchPath: string): string {
+/** PATH 上所有 `opencode` 候选（按顺序，含 npm 风格 shim）。#1611 起按代际逐个试。 */
+function commandsFromPath(name: string, searchPath: string): string[] {
+  const out: string[] = [];
   for (const dir of searchPath.split(delimiter)) {
     if (!dir) continue;
     const candidate = join(dir, name);
@@ -386,13 +388,13 @@ function commandFromPath(name: string, searchPath: string): string {
     try {
       const stat = statSync(candidate);
       if (stat.isFile() && (process.platform === "win32" || (stat.mode & 0o111) !== 0)) {
-        return candidate;
+        if (!out.includes(candidate)) out.push(candidate);
       }
     } catch {
       // A concurrently removed PATH entry is simply not a candidate.
     }
   }
-  throw new Error(`opencode not found on the trusted launch PATH`);
+  return out;
 }
 
 /**
@@ -425,42 +427,56 @@ export function resolvePinnedOpencodeBinaryAttestation(
   }
   const packageName = opencodeGenerationSupport(generation).packageName;
 
-  let candidate: string;
+  const attestCandidate = (candidate: string): PinnedOpencodeBinaryAttestation => {
+    const binary = realpathSync(candidate);
+    resolveCanonicalPackageEntrypoint(binary, expectedVersion, opts.forbiddenRoots ?? [], packageName);
+    const packageJson = join(dirname(dirname(binary)), "package.json");
+    const binaryFile = attestRegularFile(binary, "binary");
+    const packageJsonFile = attestRegularFile(packageJson, "package.json");
+
+    let raw: string;
+    try {
+      raw = execFileSync(binary, ["--version"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 5_000,
+        env: opts.probeEnv,
+        cwd: opts.probeCwd,
+      }).trim();
+    } catch (error: any) {
+      throw new Error(`opencode version probe failed: ${error?.message || error}`);
+    }
+    // V1 prints a bare semver ("1.18.35"); V2 prints "opencode v2.0.22".
+    const found = raw.match(/(\d+\.\d+\.\d+)/)?.[1] ?? raw;
+    if (found !== expectedVersion) {
+      throw new Error(`expected ${packageName}@${expectedVersion}; resolved binary reports ${found || "no version"}`);
+    }
+    return generation === "v1"
+      ? { binary, packageJson, expectedVersion, binaryFile, packageJsonFile }
+      : { binary, packageJson, expectedVersion, binaryFile, packageJsonFile, generation };
+  };
+
   if (opts.requestedBinary) {
     if (!isAbsolute(opts.requestedBinary)) {
       throw new Error("ANET_OPENCODE_BIN must be an absolute path");
     }
-    candidate = opts.requestedBinary;
-  } else {
-    candidate = commandFromPath("opencode", opts.searchPath ?? "");
+    return attestCandidate(opts.requestedBinary);
   }
 
-  const binary = realpathSync(candidate);
-  resolveCanonicalPackageEntrypoint(binary, expectedVersion, opts.forbiddenRoots ?? [], packageName);
-  const packageJson = join(dirname(dirname(binary)), "package.json");
-  const binaryFile = attestRegularFile(binary, "binary");
-  const packageJsonFile = attestRegularFile(packageJson, "package.json");
-
-  let raw: string;
-  try {
-    raw = execFileSync(binary, ["--version"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 5_000,
-      env: opts.probeEnv,
-      cwd: opts.probeCwd,
-    }).trim();
-  } catch (error: any) {
-    throw new Error(`opencode version probe failed: ${error?.message || error}`);
+  // #1611 — 同一台机器可能同时装着 V1 与 V2 两份 opencode。PATH 第一命中未必是要的
+  // 那一代，所以按 PATH 顺序逐个做完整 attestation（包身份 + 精确版本），取第一个
+  // 通过 expectedVersion 的；都不通过就把第一条错误原样抛出（错误信息不变）。
+  const candidates = commandsFromPath("opencode", opts.searchPath ?? "");
+  if (candidates.length === 0) throw new Error(`opencode not found on the trusted launch PATH`);
+  let firstError: unknown;
+  for (const candidate of candidates) {
+    try {
+      return attestCandidate(candidate);
+    } catch (error) {
+      if (firstError === undefined) firstError = error;
+    }
   }
-  // V1 prints a bare semver ("1.18.35"); V2 prints "opencode v2.0.22".
-  const found = raw.match(/(\d+\.\d+\.\d+)/)?.[1] ?? raw;
-  if (found !== expectedVersion) {
-    throw new Error(`expected ${packageName}@${expectedVersion}; resolved binary reports ${found || "no version"}`);
-  }
-  return generation === "v1"
-    ? { binary, packageJson, expectedVersion, binaryFile, packageJsonFile }
-    : { binary, packageJson, expectedVersion, binaryFile, packageJsonFile, generation };
+  throw firstError;
 }
 
 export function resolvePinnedOpencodeBinary(

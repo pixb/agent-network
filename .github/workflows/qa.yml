@@ -56,12 +56,17 @@ on:
       - 'tests/test-codex-appserver-watchdog/**'
       - 'tests/test-codex-copresence-first-start/**'
       - 'tests/test812-paired-resolve-timeout/**'
+      # test812 从 docs/node-liveness-criterion.md 抽出 tmux 命令实跑。
+      # 只改那份文档也必须重跑这道门。
+      - 'tests/test812-tmux-target-semantics/**'
+      - 'docs/node-liveness-criterion.md'
       - 'tests/test1183-sync-pinned-dryrun/**'
       - 'tests/test1193-side-thread-contract/**'
       - 'tests/test1195-side-thread-hub-contract/**'
       - 'tests/test1195-side-thread-hub-security/**'
       - 'tests/test1195-side-thread-hub-race/**'
       - 'tests/test1200-side-thread-command-transport/**'
+      - 'tests/test1199-btw-cross-layer-contract/**'
       - 'tests/test1203-btw-production-e2e/**'
       - 'tests/test1181-codex-durable-poll/**'
       - 'tests/test1204-btw-production-wiring/**'
@@ -367,6 +372,10 @@ on:
       - 'tests/test-codex-appserver-watchdog/**'
       - 'tests/test-codex-copresence-first-start/**'
       - 'tests/test812-paired-resolve-timeout/**'
+      # test812 从 docs/node-liveness-criterion.md 抽出 tmux 命令实跑。
+      # 只改那份文档也必须重跑这道门。
+      - 'tests/test812-tmux-target-semantics/**'
+      - 'docs/node-liveness-criterion.md'
       - 'tests/test1271-daemon-start-node/**'
       # A test directory belongs here exactly when CI executes it — otherwise
       # editing the test cannot re-run the gate that runs it. The four below are
@@ -635,6 +644,7 @@ on:
       - 'tests/test1195-side-thread-hub-security/**'
       - 'tests/test1195-side-thread-hub-race/**'
       - 'tests/test1200-side-thread-command-transport/**'
+      - 'tests/test1199-btw-cross-layer-contract/**'
       - 'tests/test1203-btw-production-e2e/**'
       - 'tests/test1181-codex-durable-poll/**'
       - 'tests/test1204-btw-production-wiring/**'

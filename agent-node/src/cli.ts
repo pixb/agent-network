@@ -11,6 +11,7 @@
  * 配置加载: --config > CLI args > env > .anet/nodes/<name>/config.json > ~/.anet/config.json > defaults
  */
 
+import { MODEL_SWITCH_DEADLINE_MS, withDeadlineMs } from "./runtime/deadline.js";
 import {
   bundledCodexVersion,
   createCodex,
@@ -24,6 +25,7 @@ import { readFileSync, existsSync, writeFileSync, chmodSync, realpathSync, renam
 import { runtimeErrorReplyText } from "./runtime/unverified-reply-text";
 import { resolveOpencodeTimeout, describeOpencodeTimeout } from "./runtime/opencode-timeout";
 import { startTurnHeartbeat } from "./runtime/turn-heartbeat";
+import { envTransportFor } from "./runtime/env-transport.js";
 import { createStderrTurnAggregator } from "./runtime/stderr-turn-aggregator";
 import { resolveLogLevel } from "./log-level";
 import {
@@ -73,6 +75,7 @@ import { claudeCommhubToolAliases } from "./claude-tool-aliases";
 import { buildClaudeSystemPrompt, claudeAiConnectorsOptIn, claudeSdkChildEnv } from "./claude-sdk-turn-options";
 import { getHostTelemetry } from "./host-telemetry";
 import { getProcessTelemetry, getInFlightCount, incrementInFlight, decrementInFlight } from "./process-telemetry";
+import { busyNote } from "./runtime/opencode-copresence/busy-note.js";
 import { readExternalSchedulesSnapshot } from "./external-schedules";
 import { TASK_CONTENT_MAX } from "./shared/task-content-limit";
 import { createOwnerScheduleConsumer, type OwnerScheduleConsumer } from "./owner-schedule-consumer";
@@ -1752,7 +1755,8 @@ const register = async () => {
     // so the last description stays. A mismatch still sends the warning.
     task: projectDirTask("idle") ?? "",
     // #1958 — grok: prefer the agent's readback once a turn has run.
-    model: (RUNTIME === "grok" ? grokEffectiveModel : undefined) || MODEL || undefined,
+    // OpenCode V2: prefer the TUI-selected session model once polled.
+    model: (RUNTIME === "grok" ? grokEffectiveModel : RUNTIME === "opencode" ? opencodeEffectiveModel : undefined) || MODEL || undefined,
     network_id: NETWORK_ID || undefined,
     host: getHostTelemetry(),
     process_telemetry: getProcessTelemetry(),
@@ -1830,6 +1834,14 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
       : SESSION_ID || undefined;
   return callCommHub("report_status", {
     resume_id: RESUME_ID, alias, status: resolveReportedStatus(status), task,
+    // #1510 —— 每次上报都重新报一次 transport(Hub 侧「每份 report 重新测一次」的要求)。
+    // 我是怎么连到 Hub 的(loopback / https / plain)：Hub 的传输闸门靠这一格判
+    // 「能不能把密钥转发给这个节点」；没它，闸门没有判据(现网 369 个会话全为空)。
+    //
+    // 🔴 这一格此前在同一个对象里出现了**两次**（#2871 与更早的一次各加了一行，
+    // 值相同）。TypeScript 的 TS1117 会把这件事指出来，但它长得像无害的重复 ——
+    // 而 typecheck 棘轮门（只许错误数减少）的基线就卡在这多出来的 1 个错误上。
+    env_transport: envTransportFor(COMMHUB_URL),
     // #1809 —— 每次状态上报都带 version(此前只有 3 分钟心跳带)。hub 在同 alias 换
     // resume_id 时会整行 DELETE+INSERT,没带的列被清成 NULL;.49 之前的 hub 没有接手逻辑,
     // 这里带上至少让 agent-node 自己的每次上报都把 version 写回去。
@@ -1877,7 +1889,11 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
     // timeout (NOT false ✓).
     // #1958 — grok: the model the session actually ran with. Hub's report_status
     // schema already accepts `model`; on a hub that ignores it nothing breaks.
-    ...(RUNTIME === "grok" && grokEffectiveModel ? { model: grokEffectiveModel } : {}),
+    // OpenCode V2 reports the TUI session model the same way. config_snapshot.model
+    // stays the configured value, so a dashboard model edit is not false-finalized.
+    ...((RUNTIME === "grok" && grokEffectiveModel) || (RUNTIME === "opencode" && OPENCODE_GENERATION === "v2" && opencodeEffectiveModel)
+      ? { model: RUNTIME === "grok" ? grokEffectiveModel : opencodeEffectiveModel }
+      : {}),
     // #448 —— 分层健康(codex-app-server);旧 Hub 静默丢弃该键,不会拒整份上报。
     // #594 —— 上报用 reportedNodeHealth()(多带 codex_login);上面的 model_auth 闸门仍只看监视器那份。
     ...(reportedNodeHealth() ? { health: reportedNodeHealth() } : {}),
@@ -2484,6 +2500,8 @@ let grokSessionId: string | undefined = RUNTIME === "grok" ? (SESSION_ID || unde
 // dashboard shows the running model rather than the configured one.
 let grokEffectiveModel: string | undefined;
 let grokModelSource: "readback" | "argv" | "default" | undefined;
+// OpenCode V2 TUI selection. Display only: never written back into config.json.
+let opencodeEffectiveModel: string | undefined;
 // RFC-029 PR② — opencode-cli session state.
 // `opencodeSessionId` is persisted across turns; on a supervisor-driven
 // restart runtime.ts will try `session/load` with it before falling
@@ -2551,6 +2569,27 @@ if (RUNTIME === "opencode") {
 }
 let opencodeCopresenceSession:
   import("./runtime/opencode-copresence/runtime").OpenCodeCopresenceSession | null = null;
+const OPENCODE_MODEL_POLL_MS = 30_000;
+let opencodeModelPollInFlight = false;
+async function pollOpencodeSessionModel(): Promise<void> {
+  if (RUNTIME !== "opencode" || OPENCODE_GENERATION !== "v2" || opencodeMode !== "copresence") return;
+  if (opencodeModelPollInFlight) return;
+  const session = opencodeCopresenceSession;
+  if (!session?.isRunning || !session.selectedModel) return;
+  opencodeModelPollInFlight = true;
+  try {
+    const next = await session.selectedModel();
+    if (!next || next === opencodeEffectiveModel) return;
+    const previous = opencodeEffectiveModel;
+    opencodeEffectiveModel = next;
+    log(`[opencode] session model=${next}${MODEL && next !== MODEL ? ` configured=${MODEL}` : ""}${previous ? ` was=${previous}` : ""}`);
+    void reportStatus(lastReportedStatus.status, lastReportedStatus.task).catch(() => {});
+  } catch (error: any) {
+    debug(`[opencode] session model poll failed: ${error?.message || error}`);
+  } finally {
+    opencodeModelPollInFlight = false;
+  }
+}
 const opencodeCopresenceOpening = createSingleFlight<
   import("./runtime/opencode-copresence/runtime").OpenCodeCopresenceSession
 >();
@@ -4112,23 +4151,56 @@ function reportCapacityRetry(attempt: number): Promise<void> {
   return reportStatus("working", capacityRetryProgress(attempt)).catch(() => {});
 }
 
+/** #1879 —— 本轮等待共享会话的起点（0 = 没在等）。见 busy-note.ts。 */
+let busySince = 0;
+let busyTimer: ReturnType<typeof setInterval> | null = null;
+function clearBusyNote(): void {
+  busySince = 0;
+  if (busyTimer) { clearInterval(busyTimer); busyTimer = null; }
+}
+
 async function processWithOpencode(
   task: string,
   _from: string,
   _images?: string[],
   evidence?: TaskRuntimeEvidenceReporter,
+  /** #1879 ③ —— 排队项的归属：这条任务是谁的。 */
+  taskId?: string | null,
 ): Promise<string> {
   debug(`[${OPENCODE_PROCESS_BUNDLE_MARKER}] dispatch`);
   if (opencodeMode === "copresence") {
     const runtime = await ensureOpencodeCopresenceRuntime();
+    // #1879 ③ —— 归属：这条排队项是谁的（task id + 提交者）。
+    const queueOwner = { taskId: taskId ?? null, sender: _from || null };
     const outcome = await runtime.submit(task, currentOpencodeTimeout().valueMs, _from, {
       onSubmitted: evidence?.submitted,
       onConsumed: evidence?.consumed,
       onCapacityRetry: reportCapacityRetry,
-    }).catch(error => {
+      // #1879 —— 选「排队」的第一半：等待期间把「在等、等了多久」持续报出去。
+      // 节点会话行本来就带 task 文本，Hub/客户端的节点卡片直接显示它 ⇒ 不用翻日志，
+      // 也不会被误读成「节点卡死」。30 分钟硬预算不变（那是在兜住合法的长构建）。
+      onAdmissionBusy: () => {
+        if (busySince === 0) {
+          busySince = Date.now();
+          // 每 30 秒刷新一次「已等多久」，直到这一轮结束（提交成功/失败都会清掉）。
+          busyTimer = setInterval(() => {
+            if (busySince === 0) return;
+            reportStatus("working", busyNote(busySince, Date.now(), queueOwner)).catch(() => {});
+          }, 30_000);
+          (busyTimer as unknown as { unref?: () => void })?.unref?.();
+        }
+        return reportStatus("working", busyNote(busySince, Date.now(), queueOwner)).catch(() => {});
+      },
+    },
+    // #1879 ③ —— 归属：排队项绑定 task 与提交者。负责人离开时，终止理由
+    // 要能点名是谁的那条任务被终止，而不是一句泛泛的「会话忙」。
+    { taskId: taskId ?? null },
+    ).catch(error => {
+      clearBusyNote();
       if (opencodeBorrowedCli && !runtime.isRunning) clearBorrowedLaunchHealth?.();
       throw error;
     });
+    clearBusyNote();
     log(`[opencode-copresence] turn done | reply=${outcome.replyText.length}ch session=${runtime.sessionId.slice(0, 12)}`);
     return outcome.replyText || "（无回复）";
   }
@@ -4376,6 +4448,7 @@ async function ensureOpencodeCopresenceRuntime(): Promise<
       throw new Error("OpenCode copresence server exited while opening");
     }
     opencodeCopresenceSession = opened;
+    if (OPENCODE_GENERATION === "v2") void pollOpencodeSessionModel();
     if (borrowed && process.env.ANET_BORROWED_V1_LAUNCH_ID) {
       const { publishBorrowedLaunchHealth } = await import("./shared/opencode-borrowed-launch-health");
       clearBorrowedLaunchHealth = publishBorrowedLaunchHealth(configFilePath, process.env.ANET_BORROWED_V1_LAUNCH_ID);
@@ -5884,7 +5957,8 @@ function think(
           : await processWithGrok(task, from, images, evidence);
       }
       if (RUNTIME === "opencode") {
-        return await processWithOpencode(task, from, images, evidence);
+        // #1879 ③ —— 把 taskId 带进去，排队项才有归属。
+        return await processWithOpencode(task, from, images, evidence, taskId);
       }
       if (RUNTIME === "pi") {
         return await processWithPi(task, from, images, evidence);
@@ -7272,7 +7346,10 @@ async function processConfigUpdate(): Promise<void> {
       return;
     }
 
-    const localMode = computeConfigApplyMode(update.patch);
+    const localMode = computeConfigApplyMode(update.patch, {
+      runtime: fileConfig?.runtime,
+      opencodeGeneration: fileConfig?.opencodeGeneration,
+    });
     if (localMode !== update.apply_mode) {
       warn(`[config-apply] mode mismatch hub=${update.apply_mode} local=${localMode}; trusting local for safety`);
     }
@@ -7285,6 +7362,54 @@ async function processConfigUpdate(): Promise<void> {
         status: "rejected",
         error: "no config file path on this node — start with --config to enable remote apply",
       });
+      return;
+    }
+    if (mode === "hot" && update.patch.model && RUNTIME === "opencode" && OPENCODE_GENERATION === "v2") {
+      const session = opencodeCopresenceSession;
+      if (!session?.isRunning || !session.setSelectedModel) {
+        await callCommHub("ack_config_update", {
+          update_id: updateId,
+          status: "rejected",
+          error: "OpenCode V2 session is not running; model was not changed",
+        });
+        return;
+      }
+      // #1976 —— 切换 + 写配置 + ack 一起有上限。超时的多半是「这台机器没有这个模型」。
+      try {
+        await withDeadlineMs(
+          session.setSelectedModel(update.patch.model),
+          MODEL_SWITCH_DEADLINE_MS,
+          `OpenCode session model switch timed out after ${MODEL_SWITCH_DEADLINE_MS}ms`,
+        );
+      } catch (switchErr: any) {
+        const reason = String(switchErr?.message || switchErr).slice(0, 400);
+        warn(`[config-apply] OpenCode V2 model switch failed: ${reason}`);
+        // 失败路径的 ack 也要有上限:一次就够,别在「拒绝」这件事上再等 4×30s。
+        try {
+          await callCommHub("ack_config_update", {
+            update_id: updateId,
+            status: "rejected",
+            error: `OpenCode session model switch failed: ${reason}`,
+          }, 0);
+        } catch (ackErr: any) {
+          warn(`[config-apply] ack rejected failed: ${ackErr?.message || ackErr}`);
+        }
+        return;
+      }
+      const backup = backupOpencodeConfig(configFilePath);
+      const merged = mergePatch(fileConfig, { model: update.patch.model });
+      writeOpencodeConfig(configFilePath, merged);
+      writebackOpencodeConfiguredModel(configFilePath, update.patch.model);
+      opencodeEffectiveModel = update.patch.model;
+      fileConfig = merged;
+      currentConfigRevision += 1;
+      await callCommHub("ack_config_update", {
+        update_id: updateId,
+        status: "applied",
+        new_revision: currentConfigRevision,
+      });
+      log(`[config-apply] OpenCode V2 session model=${update.patch.model} (no restart, .prev backedUp=${backup.backedUp})`);
+      void reportStatus(lastReportedStatus.status, lastReportedStatus.task).catch(() => {});
       return;
     }
     const backup = RUNTIME === "opencode"
@@ -8197,6 +8322,9 @@ setInterval(() => {
   }
   reportStatus("idle").catch(() => {});
 }, STATUS_HEARTBEAT_MS);
+if (RUNTIME === "opencode" && OPENCODE_GENERATION === "v2" && opencodeMode === "copresence") {
+  setInterval(() => { void pollOpencodeSessionModel(); }, OPENCODE_MODEL_POLL_MS).unref();
+}
 
 // RFC-027 §2.5 / §4.4 D7 — 30d backup sweeper, host_supervisor only.
 // Runs once at boot (catches accumulated junk from long down-periods),

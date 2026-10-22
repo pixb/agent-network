@@ -53,6 +53,7 @@ Commands:
   loop <name> ...               Schedule a recurring goal on a node
   ls                            List nodes in this directory
   codex <verb> <ref>            Codex TUI co-presence lifecycle
+  secret <verb> <ref>          Manage <node>/secrets.env (list | set | unset)
   migrate-token-to-envref <n>   Move a node's token out of config.json into .env
 
 Run 'anet node <command> --help' for details.`,
@@ -128,6 +129,27 @@ Restart the node for the change to take effect.
 On another machine (#562): add --remote — the Hub asks that machine's daemon to do it.
   anet node <start|stop|restart> <alias> --remote [--network <id|name>] [--yes] [--wait <s>]
   anet node edit <alias> --model <id> --remote [--network <id|name>] [--yes] [--wait <s>]`,
+  "node secret": `Usage: anet node secret list  <node> [--json]
+       anet node secret set   <node> <KEY> [--from-env VAR]
+       anet node secret unset <node> <KEY>
+
+Manage <node>/secrets.env — the file the node loads at startup (0600, one
+KEY=VALUE per line; reserved keys like PATH/LD_* are ignored). Values are never
+printed by any verb: list shows names, set/unset confirm only the key name.
+
+  anet node secret list 指挥室
+  anet node secret set 指挥室 OPENAI_API_KEY --from-env MY_KEY   # 从环境变量取
+  printf '%s' "$KEY" | anet node secret set 指挥室 OPENAI_API_KEY
+  anet node secret unset 指挥室 OPENAI_API_KEY
+
+The value is never taken from argv: it comes from stdin (one line, no echo) or
+from an existing environment variable via --from-env, so it cannot land in your
+shell history or in ps. The node must be restarted to load a change.
+
+No secrets.env is a normal state (exit 0). A symlink, a non-regular file or an
+unreadable file is an error (exit 1) rather than an empty list; set/unset
+refuse to write through a symlink.
+`,
   "node ls": `Usage: anet node ls [--verbose]
        anet node list
 
@@ -442,6 +464,20 @@ List locally configured daemon nodes (configuration only, not liveness).`,
 list reads the daemon-scoped Provider configuration (no secrets).
 scan, put, and apply read private JSON from stdin. No key is accepted in argv.
 put saves that JSON; it does not apply it to a runtime.`,
+  "daemon secret": `Usage: anet daemon secret list  <daemon> [--node <alias>] [--json]
+       anet daemon secret set   <daemon> <KEY> --from-env <VAR> (--node <alias> | --all)
+       anet daemon secret unset <daemon> <KEY> (--node <alias> | --all)
+
+Manage the env secrets this daemon hands to its child nodes on their next start
+(scoped-secrets.json, 0600). Values only come from --from-env or stdin; they
+never appear in argv, in the receipt, or in list.
+
+  anet daemon secret set daemon-dev DEEPSEEK_API_KEY --from-env MY_KEY --all
+  anet daemon secret set daemon-dev DEEPSEEK_API_KEY --from-env MY_KEY --node 指挥室
+  anet daemon secret unset daemon-dev DEEPSEEK_API_KEY --node 指挥室
+
+--all writes the daemon-wide default; --node writes that child only. A write
+without either is refused on purpose: a default reaches every child.`,
 
   // ── network ──
   "network ls": `Usage: anet network ls

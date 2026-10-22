@@ -11,7 +11,7 @@ import { statusAliasResolverRead } from "./status-alias-resolver.js";
 import { readNodeHealth } from "./node-health-store.js";
 import { wantsAllTools } from "./tool-audience.js";
 import { assertNodeHealthy, degradedLayers } from "./node-health-guard.js";
-import { auditDepartment, createDepartment, deleteDepartment, listDepartments, setMemberDepartment, updateDepartment } from "./departments.js";
+import { auditDepartment, createDepartment, deleteDepartment, listDepartments, setAgentDepartment, setMemberDepartment, updateDepartment } from "./departments.js";
 import { addManualMember, canManageGroup, createDepartmentGroup, getDepartmentGroup, groupById, groupTx, groupViewerCan, isGroupMember, listGroupMembers, listVisibleGroups, readGroup, removeManualMember, renameGroup, syncDepartmentGroups } from "./department-groups.js";
 import { DEPARTMENT_SCOPE_DENIED, departmentLeaders, departmentSubtree, headScope, listDepartmentProjectGrants, managedDepartmentIds, membersIn, replaceDepartmentProjectGrants } from "./department-heads.js";
 import { redactMessageRow } from "./redact-tokens.js";
@@ -32,6 +32,7 @@ import { notifyExpiredTasks, type ExpiredTaskRow } from "./task-expiry-notice.js
 import { expireStaleOpenTasks } from "./task-stale-open.js";
 import { flagOrphanTasks } from "./task-orphan.js";
 import { addAgentNetworkScope, addHumanNetworkScope, addNetworkScope, addOwnTrafficScope, addAgentTimelineScope, canRestWriteNetwork, canRestWriteNetworkAsHuman, getUserNetworkIds, resolveRestNetworkScope, resolveRestWriteNetworkId, singleNetworkId, type RestNetworkScope } from "./network-scope.js";
+import { pickAliasNetwork } from "./rest-alias-network-fallback.js";
 import { lifecycleProjections, lifecycleRequestResponse } from "./node-lifecycle-read.js";
 import { listAdoptionCandidates, snapshotReportsAdoptionDiscovery } from "./adoption-candidates.js";
 import { restrictedMemberSeesFile, restrictedMemberAttachmentsDenied } from "./restricted-files.js";
@@ -86,6 +87,9 @@ import { listTaskLateReplies } from "./task-late-replies.js";
 import { assertScheduledTaskBackendSupported, handleScheduledTaskRequest, startScheduledTaskScheduler } from "./scheduled-tasks.js";
 import { startDueReminderTimer } from "./requirement-due-reminders.js";
 import { handleRequirementsRequest } from "./requirements.js";
+import { readHubProviders } from "./hub-provider-config.js";
+import { requestNodeSecrets, getScopedSecrets } from "./scoped-secrets.js";
+import { readEnvTransportLog } from "./env-transport-gate.js";
 import { labelRoute, mcpRouteLabel, recordRouteTiming, routeStats, setRouteCallerMasterToken, setRouteCallerTokenReader } from "./route-timing.js";
 import { handleExternalScheduleEditRequest } from "./external-schedule-edits.js";
 import { recordDeliveredStaleEvents } from "./task-lifecycle-watcher.js";
@@ -1970,12 +1974,13 @@ return Bun.serve({
     // 在这棵子树里也能写;越出子树 → 403 department_scope_denied(固定一个错误)。不是负责人的成员与以前逐字节相同。 ──
     const deptMatch = url.pathname.match(/^\/api\/networks\/([^/]+)\/departments(?:\/([^/]+))?$/);
     const memberDeptMatch = url.pathname.match(/^\/api\/networks\/([^/]+)\/members\/([^/]+)\/department$/);
+    const nodeDeptMatch = url.pathname.match(/^\/api\/networks\/([^/]+)\/nodes\/([^/]+)\/department$/);
     const deptSubMatch = url.pathname.match(/^\/api\/networks\/([^/]+)\/departments\/([^/]+)\/(project-grants|nodes|group)$/);
-    if (deptMatch || memberDeptMatch || deptSubMatch) {
+    if (deptMatch || memberDeptMatch || deptSubMatch || nodeDeptMatch) {
       const token = requestToken(req, { allowQueryToken: false });
       const resolved = token ? resolveToken(token) : null;
       if (!resolved) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
-      const netId = decodeURIComponent((deptMatch ?? memberDeptMatch ?? deptSubMatch)![1]);
+      const netId = decodeURIComponent((deptMatch ?? memberDeptMatch ?? deptSubMatch ?? nodeDeptMatch)![1]);
       if (resolved.networkId && resolved.networkId !== netId) return withCors(req, Response.json({ ok: false, error: "not a member of this network" }, { status: 403 }));
       const hubAdmin = isHubAdminCredential(resolved);
       const role = resolved.networkId ? null : getUserNetworkRole(resolved.user.user_id, netId);
@@ -2081,6 +2086,19 @@ return Bun.serve({
       // 组织架构变了,负责人们的「本部门」跟着变:断开他们(和被调动的人)的实时流,按新权限重连。
       const leadersBefore = departmentLeaders(netId);
       const kick = (extra: string[] = []) => { for (const uid of new Set([...leadersBefore, ...departmentLeaders(netId), ...extra])) closeUserStreamsInNetwork(netId, uid); };
+      // Agent(节点)显式归属部门:只有 owner / admin(以及 Hub 管理员)。
+      // 负责人对自己部门的 Agent 也可调动 —— 和「人」的调动同一条 scope 规则。
+      if (nodeDeptMatch) {
+        if (req.method !== "PUT") return withCors(req, Response.json({ ok: false, error: "method_not_allowed" }, { status: 405 }));
+        const targetNode = decodeURIComponent(nodeDeptMatch[2]);
+        if (!canManage) {
+          const current = db.get<{ department_id: string | null }>("SELECT department_id FROM nodes WHERE network_id = ?1 AND node_id = ?2", netId, targetNode);
+          if (current && (!inManaged(current.department_id) || (!inManaged(body.department_id) && (blank(body.department_id) || exists(body.department_id))))) return scopeDenied();
+        }
+        const r = setAgentDepartment(netId, targetNode, body.department_id);
+        if (r.ok) auditDepartment(resolved.user, "agent_department_set", netId, `${targetNode} → ${r.department_id ?? "(unassigned)"}${via === "leader" ? " via=leader" : ""}`);
+        return reply(r);
+      }
       if (memberDeptMatch) {
         if (req.method !== "PUT") return withCors(req, Response.json({ ok: false, error: "method_not_allowed" }, { status: 405 }));
         const targetUid = decodeURIComponent(memberDeptMatch[2]);
@@ -2715,6 +2733,148 @@ return Bun.serve({
       }
       const nodes = [...byNode.values()].sort((a, b) => b.total - a.total || a.node_id.localeCompare(b.node_id));
       return withCors(req, Response.json({ ok: true, network_id: networkId, since: new Date(sinceMs).toISOString(), mode: nodePermissionsFlag(), total: nodes.reduce((n, e) => n + e.total, 0), nodes }));
+    }
+
+    // ── #1473 (#909): read-only Hub catalogs for the desktop client ──
+    //
+    // Skills / network secrets / Providers have existed on this Hub only as
+    // MCP tools (list_skills, list_network_secrets, list_providers). With no
+    // HTTP surface, the client shipped a fixture page instead
+    // (agent-network-app/src/hub-scope-demo.ts: "Hub 这些写接口还没接通 ... 不发请求").
+    // These three endpoints expose the SAME rows to a USER token and never a
+    // secret value: names and timestamps only, plus the review flag, so the
+    // client can stop inventing data.
+    const hubCatalog = url.pathname === "/api/skills" ? "skills"
+      : url.pathname === "/api/secrets" ? "secrets"
+      : url.pathname === "/api/providers" ? "providers" : null;
+    if (hubCatalog && req.method === "GET") {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      // A node token is not a person: it may not enumerate the network's
+      // catalogs (same rule as the node-permission report above).
+      if (restAuth.networkId) return userTokenRequired(req);
+      const networkId = singleNetworkId(restScope);
+      if (!networkId) return withCors(req, Response.json({ ok: false, error: "network_id_required" }, { status: 400 }));
+      const role = restAuth.userId ? getUserNetworkRole(restAuth.userId, networkId) : null;
+      if (!isAdmin && !role) {
+        return withCors(req, Response.json({ ok: false, error: "permission_denied", message: "network member only" }, { status: 403 }));
+      }
+      const reviewer = isAdmin || role === "owner" || role === "admin";
+      if (hubCatalog === "skills") {
+        // Pending submissions stay invisible to plain members even when they
+        // ask: `include_pending` is a reviewer switch, not a client wish.
+        const includePending = url.searchParams.get("include_pending") === "1" && reviewer;
+        const rawLimit = Number(url.searchParams.get("limit") ?? 100);
+        const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200) : 100;
+        let sql = `SELECT skill_id, slug, name, description, version, status, source_type, source_alias,
+                          created_at, updated_at, reviewed_at, review_note
+                     FROM skillhub_skills WHERE network_id = ?1`;
+        if (!includePending) sql += ` AND status = 'published'`;
+        sql += ` ORDER BY updated_at DESC LIMIT ${limit}`;
+        return withCors(req, Response.json({ ok: true, network_id: networkId, reviewer, skills: db.all(sql, networkId) }));
+      }
+      if (hubCatalog === "secrets") {
+        // Keys and timestamps only. The ciphertext columns are not selected at
+        // all, so a future "just add the value for convenience" edit has to
+        // change this query on purpose instead of leaking by accident.
+        const rows = db.all<{ key: string; updated_at: number | string | null }>(
+          "SELECT key, updated_at FROM network_secrets WHERE network_id = ?1 ORDER BY key", networkId);
+        return withCors(req, Response.json({
+          ok: true, network_id: networkId,
+          keys: rows.map(r => ({ key: r.key, updated_at: r.updated_at ?? null })),
+        }));
+      }
+      const providers = readHubProviders({ userId: restAuth.userId ?? null, isNode: false, networkId });
+      if (!providers.ok) {
+        return withCors(req, Response.json(providers, { status: 403 }));
+      }
+      return withCors(req, Response.json({ ...providers, network_id: networkId }));
+    }
+
+    // ── #1510: the log-only view of the secret transport gate ──
+    //
+    // Answers "how many secret writes WOULD a plain-HTTP refusal have blocked,
+    // and on which node" before anyone turns the gate on. Same audience and
+    // shape as the node-permission report: network owner/admin, aggregated.
+    const envTransportLog = url.pathname.match(/^\/api\/networks\/([^/]+)\/env-transport-log$/);
+    if (envTransportLog && req.method === "GET") {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      if (restAuth.networkId) return userTokenRequired(req);
+      const networkId = decodeURIComponent(envTransportLog[1]);
+      const role = restAuth.userId ? getUserNetworkRole(restAuth.userId, networkId) : null;
+      if (!isAdmin && role !== "owner" && role !== "admin") {
+        return withCors(req, Response.json({ ok: false, error: "permission_denied", message: "network owner/admin only" }, { status: 403 }));
+      }
+      const sinceRaw = url.searchParams.get("since");
+      const sinceMs = sinceRaw ? Date.parse(sinceRaw) : Date.now() - 7 * 86_400_000;
+      if (!Number.isFinite(sinceMs)) return withCors(req, Response.json({ ok: false, error: "invalid_since" }, { status: 400 }));
+      const rows = readEnvTransportLog(networkId, new Date(sinceMs).toISOString().slice(0, 13));
+      return withCors(req, Response.json({
+        ok: true, network_id: networkId, since: new Date(sinceMs).toISOString(),
+        total: rows.reduce((n, r) => n + r.hits, 0), rows,
+      }));
+    }
+
+    // ── #1491 E1: the node-secret write lane over REST ──
+    //
+    // The lane already exists end to end (tools.ts `node_secret_*` →
+    // scoped-secrets.ts → node doorbell → agent-node reconcileNodeSecrets), but
+    // it is MCP-only and request/ack shaped: a caller enqueues a request, the
+    // node applies it at its next start and acks with a snapshot. The client has
+    // no way to drive that, which is the only reason it still "cannot manage a
+    // node's env".
+    //
+    // Two endpoints, deliberately thin: enqueue, then poll. Authorization stays
+    // where it already is — requestNodeSecrets allows owner/admin only, so a
+    // plain member (or any node token) is refused by the lane itself.
+    const nodeSecretReq = url.pathname.match(/^\/api\/nodes\/([^/]+)\/secrets$/);
+    const nodeSecretGet = url.pathname.match(/^\/api\/nodes\/([^/]+)\/secrets\/([^/]+)$/);
+    if ((nodeSecretReq || nodeSecretGet) && !restAuth) {
+      return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+    }
+    if (nodeSecretReq && req.method === "POST") {
+      if (restAuth!.networkId) return userTokenRequired(req);
+      const networkId = singleNetworkId(restScope);
+      if (!networkId) return withCors(req, Response.json({ ok: false, error: "network_id_required" }, { status: 400 }));
+      const nodeId = decodeURIComponent(nodeSecretReq[1]);
+      if (!nodeId) return withCors(req, Response.json({ ok: false, error: "node_id_required" }, { status: 400 }));
+      let body: any;
+      try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid JSON" }, { status: 400 })); }
+      const action = body?.action;
+      if (action !== "list" && action !== "put" && action !== "delete") {
+        return withCors(req, Response.json({ ok: false, error: "invalid_action", message: "action must be list | put | delete" }, { status: 400 }));
+      }
+      // A `put` without a revision is a client bug, not a server decision: the
+      // node rejects it anyway, and silently inventing 0 would overwrite a file
+      // the operator edited in the meantime.
+      if (action !== "list" && !Number.isSafeInteger(body?.revision)) {
+        return withCors(req, Response.json({ ok: false, error: "revision_required", message: "put/delete need the revision from the last list" }, { status: 400 }));
+      }
+      const result = requestNodeSecrets(
+        { userId: restAuth!.userId ?? null, isNode: false, networkId },
+        nodeId, action, body?.key, body?.value, body?.revision,
+      );
+      if (!result.ok) {
+        const status = result.error === "secret_admin_required" ? 403
+          : result.error === "node_secrets_upgrade_required" ? 409
+          : result.error === "secret_store_busy" || result.error === "secret_queue_busy" ? 409
+          : 400;
+        return withCors(req, Response.json(result, { status }));
+      }
+      return withCors(req, Response.json(result));
+    }
+    if (nodeSecretGet && req.method === "GET") {
+      if (restAuth!.networkId) return userTokenRequired(req);
+      const networkId = singleNetworkId(restScope);
+      if (!networkId) return withCors(req, Response.json({ ok: false, error: "network_id_required" }, { status: 400 }));
+      const result = getScopedSecrets(
+        { userId: restAuth!.userId ?? null, isNode: false, networkId },
+        decodeURIComponent(nodeSecretGet[2]),
+      );
+      if (!result.ok) {
+        const status = result.error === "secret_admin_required" ? 403 : 404;
+        return withCors(req, Response.json(result, { status }));
+      }
+      return withCors(req, Response.json(result));
     }
 
     if (url.pathname === "/api/dm" || url.pathname === "/api/dm/threads") {
@@ -3619,6 +3779,37 @@ return Bun.serve({
           error: "network_id_required",
           message: "network_id is required when the user token has zero or multiple network memberships",
         }, { status: 400 })));
+      }
+      // #1974 —— alias 不在请求的网络里、但在调用者**另一个**网络里(且唯一)⇒ 发到那儿去。
+      // 客户端的 Agent 列表是跨网络的(/api/status?light=1 不带 network_id),发送却带着
+      // 「登录时选的那一个网络」;多网络账号因此给别的网络里的 Agent 发消息一律 404
+      // (tang → tang02,2026-10-21)。旧客户端不改也能立刻受益。
+      // 找不到 / 多个网络同名 / 没权限 ⇒ 不动,保持原来的 404。
+      if (restAuth && taskNetId) {
+        const canonicalAlias = resolveCanonicalAlias(taskNetId, body.alias).alias;
+        const memberNets = getUserNetworkIds(restAuth.userId);
+        const netsWithAlias = memberNets.filter(n => !!db.get(
+          "SELECT 1 AS ok FROM sessions WHERE alias = ?1 AND network_id = ?2",
+          [canonicalAlias, n],
+        ));
+        const alt = pickAliasNetwork({
+          alias: canonicalAlias,
+          requestedNetworkId: taskNetId,
+          memberNetworkIds: memberNets,
+          networksWithAlias: netsWithAlias,
+          canWrite: (net) => canRestWriteNetwork(restAuth, net, isAdmin),
+          canMessage: (net) => {
+            if (isAgentRestricted(restAuth.userId, net)) {
+              const row = db.get<{ node_id: string | null }>(
+                "SELECT node_id FROM sessions WHERE alias = ?1 AND network_id = ?2",
+                [canonicalAlias, net],
+              );
+              return canMessageAgent(restAuth.userId, net, { alias: canonicalAlias, nodeId: row?.node_id ?? null });
+            }
+            return true;
+          },
+        });
+        if (alt) taskNetId = alt;
       }
       // 多用户 Agent 权限:受限成员只能给授权且 can_message 的 Agent 发;
       // 目标不存在 / 没授权 / 只读授权 → 同一个 403,不留 alias 探测差异。发件人固定为自己的用户名。

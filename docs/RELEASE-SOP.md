@@ -378,6 +378,61 @@ gh workflow run release.yml \
 > 本文档早先在这一步写的是 `cd agent-node && npm publish --tag preview`。
 > **那条指令现在是违规的**，已删除 —— 它正是上面那起事故的动作形状。
 
+#### 6.1 发布凭据的两种形态：`NPM_TOKEN`（旧）与 trusted publishing（OIDC，推荐）
+
+发布这一步有两种认证形态，`release.yml` 与 `promote-latest.yml` 都按同一个仓库变量切换：
+
+| 形态 | 开关 | 行为 |
+|---|---|---|
+| `secrets.NPM_TOKEN`（长期 token） | 默认 | `setup-node` 写 `.npmrc` 的 `_authToken`；token 泄露即等于发布权泄露 |
+| **trusted publishing（OIDC）** | 仓库变量 `NPM_TRUSTED_PUBLISHING=true` | **不写 `_authToken`**；npm 用本次运行的 OIDC 短时凭据发布，作用域只限这个仓库 + 这个 workflow |
+
+切换步骤（一次性）：
+
+1. npmjs.com → 该包 → **Settings → Trusted Publisher** → GitHub Actions，填
+   `org=sleep2agi`、`repo=agent-network`、`workflow=release.yml`（`environment` 留空）；
+2. 仓库 Settings → Variables → 新建 **`NPM_TRUSTED_PUBLISHING = true`**；
+3. 观察一次 `release.yml` 的 publish job 成功后再删 `secrets.NPM_TOKEN`。
+
+### 6.2 🔴 「publish 成功但 registry 里没有」先等 45 分钟，别重发
+
+2026-10-19/20 我按「发布失败」处理了三个版本，结论错了。事实是**处理慢**：
+
+| 包 | `npm publish` 之后到 registry 可见 |
+|---|---|
+| `agent-network@2.3.0-preview.186` | 未见（那一版被后续 `.187` 取代） |
+| `agent-network@2.3.0-preview.187` | **约 40 分钟** |
+| `agent-network-dashboard@0.6.3-preview.60` | **约 40 分钟**（`.59` 当时 7 分钟，快慢没有稳定值） |
+
+- `npm publish` 打印 `Your package is being processed and may take a few minutes` 时，
+  **退出码 0 不等于已经可见**；`npm view` 404 也不等于失败。
+- 🔴 **不要重发**：同一个版本重发会被拒
+  `E409 Cannot publish over previously staged version` —— 这条错误会把「慢」误读成「staged 卡住」。
+- 判据（按顺序、每次间隔几分钟）：
+
+```bash
+npm view <pkg>@<version> version      # 404 = 还没转出
+npm view <pkg> dist-tags              # 标签是否已指过去
+npm stage list                        # 有 staged 条目才谈得上「去批准」
+```
+
+- `release.yml` 的发后核实上限已按实测调到 **45 分钟**（`VERIFY_TIMEOUT_MIN`）：
+  超时只代表「尚未核实」，不代表「没生效」。发版人此时应该**等**，不是重发。
+
+### 6.3 npm 正在收紧「免 2FA 的发布 token」（与本条事故无关，但迟早要切）
+
+npm CLI 会打这类提示：
+
+```
+npm notice npm tokens that bypass 2FA are being restricted for account changes and direct publishing.
+```
+
+它**不是** 2026-10-19 那三个版本「看不见」的原因（那是 §6.2 的处理延迟，我一开始判断错了），
+但方向明确：长期 token 的发布通道会越来越受限。
+
+发布工作流已支持切到 **trusted publishing（OIDC）**，开关与步骤见 **§6.1**。
+切换是「迟早要做」的加固项，不是当前故障的解药 —— 不要把它当成发布失败的通用解释。
+
 ### Step 7：等待窗口 ≥ 30 分钟 + owner explicit ACK
 
 #### npm registry 尚不可下载时：复用正式 gated CLI tarball

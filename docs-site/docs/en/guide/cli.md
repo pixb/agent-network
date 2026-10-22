@@ -453,6 +453,37 @@ it is still there, **send it a task** — `anet status` answers "what it last sa
 about itself", not "whether it is still running".
 
 
+## Node and daemon environment secrets (preview)
+
+### Node env: `anet node secret`
+
+```bash
+anet node secret list  <node> [--json]
+anet node secret set   <node> <KEY> [--from-env VAR]
+anet node secret unset <node> <KEY>
+```
+
+Writes `nodes/<node>/secrets.env` (0600, atomic replace, symlinks refused) and lists key
+names only. Values come from `--from-env` or stdin; a value in argv is a usage error.
+
+### Daemon-scoped: `anet daemon secret`
+
+```bash
+anet daemon secret list  <daemon> [--node <alias>] [--json]
+anet daemon secret set   <daemon> <KEY> --from-env VAR (--node <alias> | --all)
+anet daemon secret unset <daemon> <KEY> (--node <alias> | --all)
+```
+
+Manages `scoped-secrets.json` in the daemon directory (0600, revision CAS, the target must
+already be bound). `set`/`unset` **require** `--node` or `--all`: an unscoped write becomes
+the default for every child, which is a permission decision, never an accident. Receipts and
+`list` show key names and their source (`daemon`/`node`) only.
+
+Both commands are entries into the existing `daemon_provider_snapshot` `secret_*` actions —
+no second read/write path. Values load on the node's next **full** start; restarting the
+bridge alone does not update the native TUI/server. A name on the Hub token page is not
+injected into this process. Precedence: [Environment precedence at startup](/en/guide/agent-node#environment-precedence-at-startup).
+
 ## Adopt manually started nodes (preview source, board #626)
 
 On Linux, configure the daemon's `adopt_roots` with absolute allowed workdirs;

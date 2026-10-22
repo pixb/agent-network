@@ -24,7 +24,7 @@ import {
   handleCreateNodeDoorbell,
   serializeEnvLocalDaemon,
 } from "./create-node-daemon.js";
-import { resolveOnPathReal } from "./runtime-readiness.js";
+import { cliCandidatesOnPath, resolveOnPathReal } from "./runtime-readiness.js";
 import { verifyStoppedChildConfig } from "./start-daemon.js";
 import { _resetChildrenMapForTest, handleStopDoorbell } from "./stop-daemon.js";
 import { resolveChildDirName } from "./child-dir-name.js";
@@ -89,15 +89,27 @@ beforeEach(() => {
   _resetAnetBinAbsForTest();
 });
 
-/** Fixture placed ahead of a vendor `opencode` already on the fixed child PATH. */
-let shadowedOpencode: { target: string; backup: string | null } | null = null;
+/**
+ * Fixture placed ahead of every vendor `opencode` on the fixed child PATH.
+ *
+ * #1611 makes the generation gate scan **all** candidates and take the first one the
+ * requested generation accepts. Shadowing only the first hit is therefore not enough:
+ * test829's image installs `@opencode/cli@2.0.22` into /usr/local/bin, so a scenario
+ * that means "this machine only has v1" still finds a real v2 further along PATH and
+ * legitimately passes the generation gate (then fails on the V2 model config, which
+ * is what made `#829 explicit generation must match an accepted install` red).
+ *
+ * So the fixture hides **every** candidate and restores them all afterwards.
+ */
+let shadowedOpencode: Array<{ target: string; backup: string | null }> = [];
 
 function restoreShadowedOpencode() {
   const shadowed = shadowedOpencode;
-  shadowedOpencode = null;
-  if (!shadowed) return;
-  rmSync(shadowed.target, { force: true });
-  if (shadowed.backup) renameSync(shadowed.backup, shadowed.target);
+  shadowedOpencode = [];
+  for (const one of shadowed) {
+    rmSync(one.target, { force: true });
+    if (one.backup) renameSync(one.backup, one.target);
+  }
 }
 
 afterEach(() => {
@@ -143,7 +155,16 @@ function plantOpencode(stdout: string) {
     const detail = e instanceof Error ? e.message : String(e);
     throw new Error(`plantOpencode: fixed PATH already has ${fixedHit}; cannot place the fixture at ${target}: ${detail}`);
   }
-  shadowedOpencode = { target, backup };
+  // Hide the remaining vendor candidates too: "only v1" has to mean only v1.
+  for (const other of (cliCandidatesOnPath("opencode", fixed) ?? [])) {
+    if (other === target) continue;
+    const otherBackup = `${other}.t652-bak`;
+    if (existsSync(otherBackup)) throw new Error(`plantOpencode: refusing to clobber ${otherBackup}`);
+    const hadFile = existsSync(other);
+    if (hadFile) renameSync(other, otherBackup);
+    shadowedOpencode.push({ target: other, backup: hadFile ? otherBackup : null });
+  }
+  shadowedOpencode.push({ target, backup });
   const hit = resolveOnPathReal("opencode", fixed);
   if (hit !== target) {
     restoreShadowedOpencode();
@@ -162,7 +183,7 @@ function writeFakeAnet(root: string): string {
   return realpathSync(abs);
 }
 
-interface Spawned { bin: string; args: string[]; cwd: string; path?: string }
+interface Spawned { bin: string; args: string[]; cwd: string; path?: string; pid?: number }
 
 async function runCreate(spec: Record<string, unknown>, requestId: string, envBlob?: Record<string, string>, providerScope?: CreateNodeDeps['providerScope']) {
   const acks: Record<string, any>[] = [];
@@ -186,6 +207,7 @@ async function runCreate(spec: Record<string, unknown>, requestId: string, envBl
       spawned.push({ bin, args, cwd: opts.cwd, path: opts.env.PATH });
       const child = spawn("sleep", ["30"], { stdio: "ignore", detached: true });
       if (child.pid) killPids.push(child.pid);
+      spawned.at(-1)!.pid = child.pid ?? undefined;
       return child;
     },
   });
@@ -631,5 +653,33 @@ describe("#652 start / stop / delete find the ASCII directory from the alias", (
     const entries = readdirSync(trash);
     expect(entries.some(n => n.endsWith(`-${CN_DIR}`))).toBe(true);
     expect(entries.filter(n => !isAscii(n))).toEqual([]);
+  });
+});
+
+// ── #1625 — a failed post-spawn validation owns the generation it spawned ──
+describe("#1625 failed V2 create reaps what it spawned", () => {
+  const pidAlive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+
+  test("runtime_capability_check_failed leaves no live launcher and says so in the ack", async () => {
+    plantOpencode("opencode v2.0.22");
+    const cfgDir = join(home, ".config", "opencode");
+    mkdirSync(cfgDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(cfgDir, "opencode.json"), `${JSON.stringify({ model: "stub/model" })}\n`, { mode: 0o600 });
+
+    const { acks, spawned } = await runCreate({
+      name: "v2-orphan", runtime: "opencode-cli", model: "stub/model",
+      flags: { opencodeGeneration: "v2", opencodeUnsafeTools: true, timeout: 600000 },
+    }, "cr_v2orphan1625");
+
+    expect(acks.map(a => a.status)).toEqual(["runtime_capability_check_failed"]);
+    expect(String(acks[0].error)).toContain("cleanup=");
+    expect(String(acks[0].error)).not.toContain("cleanup=residue");
+
+    const pid = spawned[0]?.pid;
+    expect(pid).toBeGreaterThan(0);
+    for (let i = 0; i < 60 && pidAlive(pid!); i++) await new Promise(r => setTimeout(r, 50));
+    expect(pidAlive(pid!)).toBe(false);
   });
 });
