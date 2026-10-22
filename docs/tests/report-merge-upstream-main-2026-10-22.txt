@@ -1,0 +1,117 @@
+# 合并上游 main 到 pixb —— 门禁报告
+
+Date: 2026-10-22 Asia/Shanghai
+MERGE: pixb <- upstream/main (9ce4ce79) / origin/main；109 个上游提交
+MERGE_COMMIT: 0e384c7a89e82f035bea0c6336dcea460d4f00bd
+范围：上游 2.3.0-preview.190 / agent-node 2.5.0-preview.153（+ 本方 pi-cli / OpenCode V1 pin 1.19.3 / compose 部署套件）
+
+---
+
+## 1. 拉取与合并
+
+```
+git fetch origin --prune && git fetch upstream --prune
+git pull --ff-only origin pixb      # ef946fad -> f552ca5d -> b73d97dc
+git merge origin/main --no-edit     # 0e384c7a
+```
+
+上游 109 个提交（`git log --oneline $(git merge-base HEAD origin/main)..origin/main`）。
+
+### 冲突与处置（10 个冲突文件）
+
+| 文件 | 处置 |
+|---|---|
+| `agent-network/package.json` / `package-lock.json` | 取上游 `.190`（版本位，package.json 与 lock 三处一致） |
+| `agent-node/package.json` / `package-lock.json` | 取上游 `2.5.0-preview.153` |
+| `agent-network/src/opencode-agent-node-pair.ts` | 取上游 `PAIRED_* = .190 / .153` |
+| `agent-node/src/runtime/opencode-acp/binary.ts` | 取上游 #1611 的 PATH 逐候选 attestation 重构，保留本方版本注释 |
+| `agent-node/src/runtime/opencode-acp/binary.test.ts` | **保留本方 1.19.3 pin 断言** + **补入上游两条 #1611 用例**（用例里的 `PIN = OPENCODE_DEFAULT_PIN`，自适应本方 pin） |
+| `docs-site/docs/guide/getting-started.md`（中） | 取上游 `.190` 戳与正文（沿用 2026-10-18 那次合并上游的同一做法） |
+| `docs-site/docs/en/guide/getting-started.md` | 同上 |
+| `docs/tests/release-v2.5.0-preview.147.md` | 上游同名文件（OpenCode V2 session model sync）保留；**本方那份改名** `release-v2.5.0-preview.147-opencode-v1-pin.md` |
+
+合并后版本位一致：
+
+```
+agent-network/package.json       2.3.0-preview.190
+agent-network/package-lock.json  2.3.0-preview.190   (顶层 + packages."")
+agent-node/package.json          2.5.0-preview.153
+agent-node/package-lock.json     2.5.0-preview.153   (顶层 + packages."")
+PAIRED_AGENT_NETWORK_VERSION     2.3.0-preview.190
+PAIRED_AGENT_NODE_VERSION        2.5.0-preview.153
+```
+
+本方资产合并后仍在：`agent-node/src/runtime/pi-rpc/`（4 文件）、`OPENCODE_V1_PIN = "1.19.3"`、goals 的 pi bucket、clone 的 pi 分支、compose 部署套件。
+
+---
+
+## 2. 合并暴露的两处本方枚举遗漏（已修）
+
+合并上游后跑门才暴露 —— 都是 RFC-043 的收尾盘点漏掉的（当时只补了 hub 侧，没补 daemon 侧副本与门断言）：
+
+1. `agent-node/src/runtime/create-node-daemon.ts` 的 `VALID_RUNTIMES`（daemon 侧副本）漏 `pi-cli`
+   → daemon 建不出 pi 节点；`runtime-set-parity.test.ts` 的 #1298 跨包等价门变红。
+2. `server/src/create-node-validate.test.ts` 的「🔴 恰好七个」断言没跟着 RUNTIMES 改成 8
+   → `create-node-validate.test.ts` 46 pass / 1 fail。
+
+修完：`3c16303c`（daemon）+ `fe74da08`（server 门断言），RFC-043 §10 已补记。
+
+---
+
+## 3. 门禁结果
+
+### 3.1 test725 — agent-node 全量单测（Docker）
+
+镜像 `anet-test725:merge`（等价 `tests/test725-agent-node-unit-ci/Dockerfile`，本地加速版只换源，不改判据）
+
+```
+ 3107 pass
+ 3 skip
+ 0 fail
+ 11519 expect() calls
+Ran 3110 tests across 250 files. [262.42s]
+executed_files=250 discovered_files=250
+[L1] witnessed-red: ... MUTATION_RED ... RESULT: PASS
+```
+
+**PASS**
+
+### 3.2 server 聚合门（Docker，`server/scripts/test-aggregate.ts`，237 文件 / 独立进程）
+
+```
+SERVER_AGGREGATE_RESULT {"files":237,"order":"normal","pass":2758,"fail":9,"skip":0,"expects":17075,"bad":true,"root":null}
+```
+
+9 条失败全部是**上游既有失败**，与本合并无关 —— 在 `origin/main`（9ce4ce79）的独立 worktree 上同树复现，完全一致：
+
+| 文件 | origin/main 基线 | 合并后 |
+|---|---|---|
+| `server/src/daemon-provider-snapshots.test.ts` | pass=11 fail=6 | pass=11 fail=6 |
+| `server/src/hub-provider-config.test.ts` | pass=4 fail=3 | pass=4 fail=3 |
+
+（`daemon_provider_snapshot` 回执返回 `failed` 而非 `succeeded`；上游同树同样红。）
+
+### 3.3 pi 相关套件（Docker）
+
+| 套件 | 结果 |
+|---|---|
+| `tests/test-pi-compile-check/` | PASS — agent-node bun build PASS；agent-network tsc 0 错；server runtime-label.ts 无新增错 |
+| `tests/test-pi-e2e/`（L2 全链路） | **12 passed / 0 failed** — hub + `anet node create --runtime pi-cli` + agent-node + MCP send_task → `PI_E2E_OK`；负控制 preflight 拦截 |
+
+### 3.4 文档版本戳门
+
+```
+python3 scripts/check-doc-version-claims.py
+→ checked 4 version-claim stamp(s) across 2 doc(s)
+→ 每一条被标记的版本断言都指着正在发的那个版本。   rc=0
+```
+
+---
+
+## 4. 环境备注（不属代码问题）
+
+- 宿主 `/` 100% 满（0 可用）曾让 test725 首跑 1148 fail（全是 `ENOSPC: no space left on device`）。
+  清了 `docker builder prune`（5.886G）+ 本方旧镜像 `test725-release182:latest`（3.6G）后复跑全绿。
+- 加速：GitHub release 下 bun 直连超时（60s 拿不到）→ 走代理 `http://192.168.1.200:1087`（18.7s / 36MB，sha256 校验不变）；
+  npm 走 `registry.npmmirror.com`（0.15s vs 官方 0.92s）；apt 走 `mirrors.aliyun.com`（**须用 http，镜像内没有 ca-certificates，用 https 会因证书不可信而拉不到索引**）。
+  加速版 Dockerfile 只放在 `/tmp/opencode/test725-mirror.Dockerfile`，**不入库**。
