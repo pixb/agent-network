@@ -671,6 +671,7 @@ const VALID_RUNTIMES = new Set([
   "grok-build-acp",
   "grok-build-cli",
   "opencode-cli",
+  "pi-cli", // RFC-043 — daemon create_node 集合,与 normalize-runtime SUPPORTED_RUNTIME_NAMES 对齐
 ]);
 /** 测试钩子 —— 让 runtime-set-parity.test.ts 能拿到这份副本做跨包等价断言。
  *  只读用途，不要在产品代码里用它绕过 VALID_RUNTIMES 本身的检查。 */
