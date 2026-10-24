@@ -8,7 +8,7 @@
 // Explicit `claude-code-cli` choice still works.
 
 import { describe, expect, test } from "bun:test";
-import { normalizeRuntime, normalizeRuntimeStrict, skipsCreateRuntimePicker, SUPPORTED_RUNTIME_NAMES } from "./normalize-runtime";
+import { AGENT_NODE_RUNTIMES, launchesAgentNode, normalizeRuntime, normalizeRuntimeStrict, skipsCreateRuntimePicker, SUPPORTED_RUNTIME_NAMES } from "./normalize-runtime";
 
 describe("normalizeRuntime — fallback default is claude-agent-sdk (Vincent no-Max)", () => {
   test("legacy normalization: unknown string → claude-agent-sdk", () => {
@@ -187,5 +187,23 @@ describe("skipsCreateRuntimePicker — every supported runtime is honored", () =
 
   test("no runtime → picker still runs", () => {
     expect(skipsCreateRuntimePicker(undefined)).toBe(false);
+  });
+});
+
+// `anet node start` must hand every runtime except the launcher-owned
+// claude-code-cli lane to agent-node. A hand-written list missed pi-cli twice
+// (create picker, start spawn) — the table is the guard.
+describe("launchesAgentNode — start dispatch is table-driven", () => {
+  test("pi-cli goes to agent-node", () => {
+    expect(launchesAgentNode("pi-cli")).toBe(true);
+  });
+
+  test("claude-code-cli is the only launcher-owned runtime", () => {
+    expect(launchesAgentNode("claude-code-cli")).toBe(false);
+    expect([...SUPPORTED_RUNTIME_NAMES].filter((r) => !launchesAgentNode(r))).toEqual(["claude-code-cli"]);
+  });
+
+  test("every agent-node runtime is a supported runtime", () => {
+    for (const r of AGENT_NODE_RUNTIMES) expect(SUPPORTED_RUNTIME_NAMES).toContain(r);
   });
 });
