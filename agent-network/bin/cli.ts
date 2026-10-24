@@ -2926,6 +2926,7 @@ import {
   normalizeRuntimeStrict,
   reusedLoginFor,
   RUNTIME_REUSED_LOGIN,
+  launchesAgentNode,
   skipsCreateRuntimePicker,
   SUPPORTED_RUNTIME_NAMES,
   type ReusedLogin,
@@ -4014,6 +4015,8 @@ function describeAgentNodeOnPath(env?: NodeJS.ProcessEnv): string {
   }
 }
 let codexAgentNodeLaunchPlan: AgentNodeLaunchPlan | null = null;
+/** RFC-043 — pi-cli candidate (explicit bin / standalone / sibling). */
+let piAgentNodeLaunchPlan: AgentNodeLaunchPlan | null = null;
 
 function agentNodeHelp(plan: AgentNodeLaunchPlan): string {
   return execFileSync(plan.command, [...plan.argsPrefix, "--help"], {
@@ -4433,7 +4436,57 @@ function checkOpencodeGenerationBinary(generation: "v2"):
   }
 }
 
+/** RFC-043 — resolve the pi-cli agent-node candidate, but only the ones we can
+ * probe: an explicit ANET_AGENT_NODE_BIN, the standalone-embedded copy, or the
+ * one installed beside anet. Returns null when the spawn path would fall back
+ * to PATH / npx (nothing to probe there — spawn keeps its generic fallback).
+ *
+ * Why this exists: the spawn chain used to be a hand-written runtime list, and
+ * pi-cli was missing from it, so `anet node start` fell through to the Claude
+ * Code lane (`claude: command not found` → NODE_CHILD_PID_MISSING). Same class
+ * of miss as the create-time picker bug. */
+function resolvePiAgentNodeLaunchPlan(): AgentNodeLaunchPlan | null {
+  if (piAgentNodeLaunchPlan) return piAgentNodeLaunchPlan;
+  const explicit = process.env.ANET_AGENT_NODE_BIN;
+  let plan: AgentNodeLaunchPlan | null = null;
+  if (explicit) {
+    if (!isAbsolute(explicit) || !existsSync(explicit)) {
+      throw new Error("ANET_AGENT_NODE_BIN must name an existing absolute agent-node CLI path");
+    }
+    plan = { command: process.execPath, argsPrefix: [explicit], source: "explicit", probeEnv: process.env };
+  } else if (standaloneNow()) {
+    plan = bundledAgentNodeLaunchPlan(process.env);
+  } else {
+    const sibling = findSiblingAgentNode();
+    if (sibling) {
+      plan = { command: process.execPath, argsPrefix: [sibling.entrypoint], source: "sibling", probeEnv: process.env };
+    }
+  }
+  if (!plan) return null;
+  if (!planSupportsRuntime(plan, "pi-cli")) {
+    throw new Error(`the candidate agent-node does not advertise pi-cli; required exact runtime: ${PAIRED_AGENT_NODE_SPEC}`);
+  }
+  piAgentNodeLaunchPlan = plan;
+  return plan;
+}
+
 function assertStartCompatibility(runtime: RuntimeName, profile?: Profile, nodeId?: string) {
+  if (runtime === "pi-cli") {
+    // RFC-043 — pi-cli only exists in agent-node >= the paired release. If we
+    // can identify the candidate (explicit bin / standalone / sibling), verify
+    // it advertises pi-cli instead of letting an old global silently launch a
+    // different runtime. PATH/npx fallback is validated at spawn by the same
+    // helper when a candidate is discoverable.
+    try {
+      resolvePiAgentNodeLaunchPlan();
+    } catch (error: any) {
+      console.error(`[anet] Incompatible agent-node for pi-cli.`);
+      console.error(`[anet] ${error?.message || error}`);
+      console.error(`[anet] Refusing to start: an unsupported agent-node could silently select another runtime.`);
+      process.exit(1);
+    }
+    return;
+  }
   if (runtime === "codex-app-server") {
     try {
       resolveCodexAgentNodeLaunchPlan();
@@ -7615,14 +7668,9 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
     });
   }
 
-  if (
-    runtime === "codex-sdk" ||
-    runtime === "codex-app-server" ||
-    runtime === "claude-agent-sdk" ||
-    runtime === "grok-build-acp" ||
-    runtime === "grok-build-cli" ||
-    runtime === "opencode-cli"
-  ) {
+  // 🔴 表驱动：claude-code-cli 是唯一由启动器自己 spawn `claude` 的车道，
+  //    其余 runtime 全部交给 agent-node。手写列表漏过 pi-cli 两次。
+  if (launchesAgentNode(runtime)) {
     // spawn agent-node
     const agentArgs = [
       "--config", join(nodesDir(), nodeId, "config.json"),
@@ -7766,6 +7814,10 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
       commandArgs = [...plan.argsPrefix, ...agentArgs];
     } else if (runtime === "codex-app-server") {
       const plan = resolveCodexAgentNodeLaunchPlan();
+      cmd = plan.command;
+      commandArgs = [...plan.argsPrefix, ...agentArgs];
+    } else if (runtime === "pi-cli" && resolvePiAgentNodeLaunchPlan()) {
+      const plan = resolvePiAgentNodeLaunchPlan()!;
       cmd = plan.command;
       commandArgs = [...plan.argsPrefix, ...agentArgs];
     } else if (findSiblingAgentNode()) {

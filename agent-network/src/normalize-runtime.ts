@@ -62,6 +62,21 @@ export const SUPPORTED_RUNTIME_NAMES: readonly RuntimeName[] = [
 ] as const;
 
 /**
+ * `anet node start` 会把哪些 runtime 交给 agent-node 子进程。
+ *
+ * 唯一例外是 `claude-code-cli`：它的执行车道在启动器里（直接 spawn 真正的
+ * `claude` CLI），从不过 agent-node。这张表以前在两个地方手写，pi-cli 两次都
+ * 漏了（create 的选择器、start 的 spawn 门），症状分别是「建成错 runtime」和
+ * `claude: command not found`。表驱动之后新增 runtime 不会再漏。
+ */
+export const AGENT_NODE_RUNTIMES: readonly RuntimeName[] =
+  SUPPORTED_RUNTIME_NAMES.filter((rt) => rt !== "claude-code-cli");
+
+export function launchesAgentNode(runtime: RuntimeName): boolean {
+  return AGENT_NODE_RUNTIMES.includes(runtime);
+}
+
+/**
  * 「显式 `--runtime` 应该跳过建节点时的 runtime 选择器吗？」
  *
  * 唯一依据是上面那张表 —— 以前这里是手写的 `=== "…" || === "…"` 列表，
