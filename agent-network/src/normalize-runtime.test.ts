@@ -8,7 +8,7 @@
 // Explicit `claude-code-cli` choice still works.
 
 import { describe, expect, test } from "bun:test";
-import { normalizeRuntime, normalizeRuntimeStrict } from "./normalize-runtime";
+import { normalizeRuntime, normalizeRuntimeStrict, skipsCreateRuntimePicker, SUPPORTED_RUNTIME_NAMES } from "./normalize-runtime";
 
 describe("normalizeRuntime — fallback default is claude-agent-sdk (Vincent no-Max)", () => {
   test("legacy normalization: unknown string → claude-agent-sdk", () => {
@@ -168,5 +168,24 @@ describe("normalizeRuntime — profile object paths", () => {
 
   test("legacy profile normalization keeps unknown → default for display/migration", () => {
     expect(normalizeRuntime({ runtime: "bogus-runtime-name" } as any)).toBe("claude-agent-sdk");
+  });
+});
+
+// Regression: `anet node create x --runtime pi-cli` in a TTY used to pop the
+// runtime picker anyway, default to claude-agent-sdk, and create the wrong
+// node (OpenRouter model then failed upstream as `unrecognized_model`).
+// The explicit-runtime check is table-driven so a newly added runtime cannot
+// be forgotten again.
+describe("skipsCreateRuntimePicker — every supported runtime is honored", () => {
+  test("pi-cli is in SUPPORTED_RUNTIME_NAMES", () => {
+    expect(SUPPORTED_RUNTIME_NAMES as readonly string[]).toContain("pi-cli");
+  });
+
+  test.each([...SUPPORTED_RUNTIME_NAMES])("explicit %s suppresses the create picker", (runtime) => {
+    expect(skipsCreateRuntimePicker(runtime)).toBe(true);
+  });
+
+  test("no runtime → picker still runs", () => {
+    expect(skipsCreateRuntimePicker(undefined)).toBe(false);
   });
 });

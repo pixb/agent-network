@@ -61,6 +61,18 @@ export const SUPPORTED_RUNTIME_NAMES: readonly RuntimeName[] = [
   "opencode-cli",
 ] as const;
 
+/**
+ * 「显式 `--runtime` 应该跳过建节点时的 runtime 选择器吗？」
+ *
+ * 唯一依据是上面那张表 —— 以前这里是手写的 `=== "…" || === "…"` 列表，
+ * 新增 runtime（pi-cli）时漏了一行，于是 `anet node create x --runtime pi-cli`
+ * 在 TTY 下仍弹出选择器，默认选中 claude-agent-sdk，节点建成了错 runtime。
+ * 表驱动能从结构上消灭这一类遗漏。
+ */
+export function skipsCreateRuntimePicker(runtime: RuntimeName | undefined): boolean {
+  return !!runtime && (SUPPORTED_RUNTIME_NAMES as readonly string[]).includes(runtime);
+}
+
 // Subset of Profile fields this helper inspects. Keeping it narrow so
 // the test fixture doesn't need the full Profile shape and so callers
 // (bin/cli.ts uses the full Profile) can pass anything structurally

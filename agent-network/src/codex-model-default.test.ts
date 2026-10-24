@@ -20,6 +20,7 @@ describe("Codex model defaults", () => {
       "grok-build-acp",
       "grok-build-cli",
       "opencode-cli",
+      "pi-cli",
     ]);
     for (const runtime of NON_CODEX_RUNTIMES) {
       expect(defaultCodexModelForRuntime(runtime)).toBeUndefined();
