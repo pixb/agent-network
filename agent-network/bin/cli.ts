@@ -2926,6 +2926,7 @@ import {
   normalizeRuntimeStrict,
   reusedLoginFor,
   RUNTIME_REUSED_LOGIN,
+  skipsCreateRuntimePicker,
   SUPPORTED_RUNTIME_NAMES,
   type ReusedLogin,
   type RuntimeName,
@@ -6392,6 +6393,13 @@ This wizard creates one agent node for this project:
     if (pickedRuntime === "grok-build-cli") printGrokCopresenceWarning(id, undefined, "configured");
   } else if (pickedRuntime === "opencode-cli") {
     await configureOpencodeRuntime(opts, true);
+  } else if (pickedRuntime === "pi-cli") {
+    // RFC-043 — no vendor picker: pi reads its own provider registry.
+    opts.runtime = "pi-cli";
+    if (!commandExists("pi")) {
+      console.log("[anet] 请确保已安装 pi CLI (exact/global): npm install -g @earendil-works/pi-coding-agent");
+    }
+    console.log("[anet] pi-cli 使用 pi 自己的 provider 配置；--model 必须与 pi 的 models.json 里注册的 id 一致。");
   } else {
     // claude-agent-sdk — flow continues into vendor + model picker.
     const sel = await selectVendorAndModel();
@@ -6663,13 +6671,7 @@ async function createCommand(idOverride?: string) {
   const explicitRuntime = opts.runtime
     ? runtimeForExecution(opts.runtime, "create node")
     : undefined;
-  const runtimeAlreadyExplicit = explicitRuntime === "claude-agent-sdk"
-    || explicitRuntime === "claude-code-cli"
-    || explicitRuntime === "codex-sdk"
-    || explicitRuntime === "codex-app-server"
-    || explicitRuntime === "grok-build-acp"
-    || explicitRuntime === "grok-build-cli"
-    || explicitRuntime === "opencode-cli";
+  const runtimeAlreadyExplicit = skipsCreateRuntimePicker(explicitRuntime);
 
   // #133 selectRuntime — runtime-first, exported as a helper so create paths
   // (interactive single / batch wizard / sci-team demo) can share the picker.
@@ -6714,6 +6716,14 @@ async function createCommand(idOverride?: string) {
     }
   } else if (opts.runtime === "opencode-cli") {
     await configureOpencodeRuntime(opts, Boolean(process.stdin.isTTY));
+  } else if (opts.runtime === "pi-cli") {
+    // RFC-043 — pi is BYOK: the model id must already exist in pi's own
+    // provider registry (models.json / auth.json). No vendor picker here, and
+    // no Anthropic-compat fallback: a wrong id is refused by pi, not rewritten.
+    if (!commandExists("pi")) {
+      console.log("[anet] 请确保已安装 pi CLI (exact/global): npm install -g @earendil-works/pi-coding-agent");
+    }
+    console.log("[anet] pi-cli 使用 pi 自己的 provider 配置；--model 必须与 pi 的 models.json 里注册的 id 一致。");
   } else {
     // Either claude-agent-sdk (explicit / picker-default) or undefined runtime
     // — fall through to vendor selection. credAlreadyProvided also skips since

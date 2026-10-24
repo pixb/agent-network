@@ -1,0 +1,70 @@
+fix: `anet node create --runtime pi-cli` 在 TTY 下仍弹 runtime 选择器
+版本: 2.3.0-preview.192 / 2.5.0-preview.155（成对 tgz，不发 npm）
+分支: pixb
+
+一、现象
+  anet node create 8-pix-auto-video-pi --runtime pi-cli \
+    --model openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+
+  仍然弹出 "? 选择 runtime:"，默认/回车选中 claude-agent-sdk，
+  随后走 Anthropic-compat vendor 向导；节点建成 claude 节点，
+  日志 runtime: claude (input: claude-agent-sdk)。
+  任务侧表现：claude-code:unrecognized_model + Not logged in · Please run /login，
+  3 次重试后失败。
+
+二、根因（两处，同一类）
+  1) bin/cli.ts 里 runtimeAlreadyExplicit 是**手写枚举**，漏了 pi-cli：
+       explicitRuntime === "claude-agent-sdk" || ... || === "opencode-cli"
+     于是 --runtime pi-cli 不被认作「已显式指定」，TTY 下照样进选择器。
+     （createRuntimeChoices() 里有 pi-cli —— 列表有、判据没有，所以只对
+      显式传参失效，只影响脚本/命令行用户。）
+  2) 只补枚举还不够：分支链里没有 pi-cli 分支，会落进最后的
+     「claude-agent-sdk + vendor 选择器」else，把 runtime 又改回 claude。
+
+三、修法
+  · src/normalize-runtime.ts 新增 skipsCreateRuntimePicker()，
+    直接查 SUPPORTED_RUNTIME_NAMES —— 以后新增 runtime 不会再漏。
+  · bin/cli.ts 用它替掉手写枚举（命名创建路径）。
+  · 交互创建路径（无名 create 的 pickedRuntime 分支）补 pi-cli 分支：
+    只打印 pi 的安装/provider 提示，不弹 vendor 选择器，不改 runtime。
+  · 回归测试：
+      src/normalize-runtime.test.ts      —— 表驱动，每个受支持 runtime 都必须
+                                            跳过选择器；pi-cli 必须在表里。
+      顺带修两条 pi-cli 加入后即红的旧断言（与本 bug 同源，之前没人跑 745）：
+      src/runtime-reused-login.test.ts   7 → 8 个 runtime，pi-cli = api-key
+      src/codex-model-default.test.ts    NON_CODEX_RUNTIMES 补 pi-cli
+
+四、验证（全部 Docker 内）
+  tests/test725-agent-node-unit-ci  3111 pass / 3 skip / 0 fail  RESULT: PASS
+  tests/test745-agent-network-unit-ci 2194 pass / 13 skip / 0 fail RESULT: PASS
+    （2207 tests / 220 files；修前 45 fail，其中 43 条是测试镜像里
+      http_proxy 把 localhost 假 hub 也代理走造成的，属测试环境；
+      真红的两条就是上面 runtime-reused-login / codex-model-default）
+  agent-network: tsc --noEmit rc=0；bun test src/normalize-runtime.test.ts 42 pass
+
+  打包后行为验证（装进临时 prefix，用 script 造真 TTY）：
+    --runtime pi-cli  → 无 "选择 runtime:"，直接打印 pi 提示
+    不带 --runtime     → 仍弹 "选择 runtime:"（对照，选择器没被禁用）
+
+五、产物
+  /vol2/1000/Download/agent-network-tgz/
+    sleep2agi-agent-node-2.5.0-preview.155.tgz
+      sha256 a071a0af6704cbb4b4fe0d40f7f290ab8f074931005bab27f429ac08de6d20c8
+    sleep2agi-agent-network-2.3.0-preview.192.tgz
+      sha256 9e78bb0572270c8ecd8d6d60f6d31e58d7d4de42a8d1e8a097ac6edcb737cce2
+  注意：旧 .191/.154 的 tgz 仍在同目录，仅作回滚；两包必须同一次成对安装。
+
+六、装/升级（每台机器）
+  npm i -g <两个 tgz 路径>
+  用 `anet --version` 确认 2.3.0-preview.192。
+  🔴 出事时先看 PATH：`command -v anet` 必须指向刚装的那份。
+     本机全局 /vol1/1000/pix/.npm-global/bin/anet 是旧版，会盖掉新装的。
+  🔴 不要用 `anet upgrade`（跟 npm dist-tag 走，会把机器换成上游客服版，pi-cli 没了）。
+
+七、建 pi / opencode 节点（区分）
+  pi-cli：model 必须与 pi 自己的 models.json 注册的 id 一致；
+          pi 鉴权在 pi 的配置里，不走 anet 的 --env，也不走 opencode auth.json。
+  opencode-cli：model 走 opencode 的 provider 解析（第一个 / 之前是 providerId），
+          key 写在 <节点目录>/.local/share/opencode/auth.json。
+  两者都不要用 claude-agent-sdk 去接 openrouter/... —— 那条路必然
+  unrecognized_model。
