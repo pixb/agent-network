@@ -27,8 +27,8 @@ beforeEach(() => {
 });
 
 describe("opencode-pin — built-in fallback", () => {
-  test("release builtin pin is the revalidated opencode-ai@1.19.3", () => {
-    expect(OPENCODE_BUILTIN_PIN).toBe("1.19.3");
+  test("release builtin pin is the revalidated opencode-ai@1.19.4", () => {
+    expect(OPENCODE_BUILTIN_PIN).toBe("1.19.4");
   });
 
   test("returns the built-in constant when no override file exists", () => {
@@ -42,9 +42,9 @@ describe("opencode-pin — built-in fallback", () => {
     const detail = "opencode package identity/version check failed: no trusted package on PATH";
     const hint = formatOpencodePackageIdentityFailure(OPENCODE_BUILTIN_PIN, detail);
     expect(hint).toContain(detail);
-    expect(hint).toContain("Expected trusted opencode-ai@1.19.3");
-    expect(hint).toContain("npm install -g opencode-ai@1.19.3");
-    expect(opencodeExactInstallCommand()).toBe("npm install -g opencode-ai@1.19.3");
+    expect(hint).toContain("Expected trusted opencode-ai@1.19.4");
+    expect(hint).toContain("npm install -g opencode-ai@1.19.4");
+    expect(opencodeExactInstallCommand()).toBe("npm install -g opencode-ai@1.19.4");
   });
 });
 
@@ -60,7 +60,7 @@ describe("opencode-pin — override file write + read round-trip", () => {
   test("an override left by `upgrade-pin 1.19.0` (previous pin) yields to the new built-in pin", () => {
     writePinOverride("1.19.0", "2026-07-16T00:00:00.000Z", "smoke: initialize + session/new", fakeHome);
     const pin = readEffectivePin(fakeHome);
-    expect(pin.version).toBe("1.19.3");
+    expect(pin.version).toBe("1.19.4");
     expect(pin.source).toBe("builtin");
   });
 
@@ -107,24 +107,24 @@ describe("opencode-pin — validation refuses malformed / unvalidated overrides"
   });
 });
 
-describe("opencode-pin — 1.19.0 → 1.19.3 transition", () => {
+describe("opencode-pin — 1.19.3 → 1.19.4 transition", () => {
   test("accepted versions: release pin first, then the previous pins; nothing else", () => {
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
-    expect(acceptedOpencodeVersions()).toEqual(["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
-    expect(acceptedOpencodeVersions("1.19.0")).toEqual(["1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect(acceptedOpencodeVersions()).toEqual(["1.19.4", "1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect(acceptedOpencodeVersions("1.19.3")).toEqual(["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
   });
 
   test("legacy note is one line naming the found version and the upgrade command", () => {
-    expect(opencodeLegacyPinNote("1.19.3")).toBeNull();
+    expect(opencodeLegacyPinNote("1.19.4")).toBeNull();
     expect(opencodeLegacyPinNote("1.18.2")).toBeNull();
     expect(opencodeLegacyPinNote("1.18.1")).toContain("opencode-ai@1.18.1");
     const note = opencodeLegacyPinNote("1.19.0")!;
     expect(note).toContain("opencode-ai@1.19.0");
-    expect(note).toContain("anet opencode upgrade-pin 1.19.3");
+    expect(note).toContain("anet opencode upgrade-pin 1.19.4");
     expect(note).not.toContain("\n");
     const older = opencodeLegacyPinNote("1.18.35")!;
     expect(older).toContain("opencode-ai@1.18.35");
-    expect(older).toContain("anet opencode upgrade-pin 1.19.3");
+    expect(older).toContain("anet opencode upgrade-pin 1.19.4");
     expect(older).not.toContain("\n");
   });
 
@@ -141,6 +141,6 @@ describe("opencode-pin — 1.19.0 → 1.19.3 transition", () => {
     const { acceptedOpencodeVersionsFor, OPENCODE_V1_PIN } = await import("./opencode-versions");
     expect(OPENCODE_BUILTIN_PIN).toBe(OPENCODE_V1_PIN);
     expect([...acceptedOpencodeVersionsFor("v1")]).toEqual(acceptedOpencodeVersions());
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(acceptedOpencodeVersionsFor("v1").slice(1));
+    expect(["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]).toEqual(acceptedOpencodeVersionsFor("v1").slice(1));
   });
 });

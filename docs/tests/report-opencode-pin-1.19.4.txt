@@ -1,0 +1,40 @@
+opencode V1 pin bump: 1.19.3 → 1.19.4
+版本: 2.3.0-preview.194 / 2.5.0-preview.157（成对 tgz，不发 npm）
+分支: pixb
+
+一、变更
+  将 opencode V1（npm `opencode-ai`）的精确锁定版本从 1.19.3 升到 1.19.4。
+  受影响的三个源文件（双份镜像）：
+    agent-node/src/runtime/opencode-versions.ts
+    agent-network/src/opencode-versions.ts
+    agent-network/src/opencode-pin.ts （OPENCODE_DEFAULT_PIN 派生）
+
+二、迁移窗口（RFC-029 Board #541）
+  acceptedVersions 顺序：新 pin 在前，旧 pin 退为 transition window 第二位：
+    ["1.19.4", "1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]
+  仍保留的 transition 版本：1.19.3、1.19.0、1.18.35、1.18.34、1.18.1
+  —— 仍持有这些 exact 版本的机器能正常起动，并在启动时收到升级提示；
+    其他版本（如 1.19.1/1.19.2/1.18.2/2.0.22 等）直接拒绝。
+
+三、测试同步
+  · agent-network: opencode-pin.test.ts、opencode-package-binary.test.ts 同步期望值
+    （transition window 从旧 pin 1.19.0 变为新旧 pin 1.19.3、1.19.0…）；
+  · agent-node: opencode-acp/binary.test.ts 同理更新 transition window 期望值；
+  · 双份 opencode-versions.ts 字节级一致性由 opencode-versions-parity.test.ts 守门。
+
+四、验证（Docker 门禁）
+  tests/test725-agent-node-unit-ci  3111 pass / 3 skip / 0 fail  RESULT: PASS
+  tests/test745-agent-network-unit-ci 2197 pass / 13 skip / 0 fail RESULT: PASS
+  agent-network tsc --noEmit rc=0；全部 opencode 相关单测 43 pass / 0 fail。
+
+五、产物
+  /vol2/1000/Download/agent-network-tgz/
+    sleep2agi-agent-node-2.5.0-preview.157.tgz
+      sha256 ffa5eb7804ef0f42c68adfba23460e150564b2049abdb3558eae96456abb83cb
+    sleep2agi-agent-network-2.3.0-preview.194.tgz
+      sha256 ad987c8d08f0f912c63a2eb2dba8d9e707aace7512c237afd044b306109e13c2
+
+六、升级（每台机器）
+  npm i -g <两个 tgz 路径>
+  command -v anet          # 必须指向刚装的那份（本机全局 /vol1/1000/pix/.npm-global 是旧版）
+  anet node start <name>   # 旧 opencode 节点会打印升级提示并建议运行 `anet opencode upgrade-pin 1.19.4`
