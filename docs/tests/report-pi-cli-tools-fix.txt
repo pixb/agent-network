@@ -1,0 +1,54 @@
+fix: pi-cli 工具集默认只有 4 个安全工具，bash/edit/write 需要 --pi-unsafe-tools
+版本: 2.3.0-preview.195 / 2.5.0-preview.158（成对 tgz，不发 npm）
+分支: pixb
+
+一、根因
+  pi 节点的实际工具集是 agent-node 运行时决定的：
+    - PI_SAFE_TOOLS = [read, grep, find, ls]（默认，无 shell/编辑）
+    - PI_UNSAFE_TOOLS = [read, bash, edit, write, grep, find, ls]（需 flags.piUnsafeTools=true）
+  但 `anet node create` 的摘要**照抄 Claude 预设**，声称 "Built-in: all … Bash …"，导致用户误以为有 Bash。
+  同时没有任何 CLI 标志能在创建时开启 piUnsafeTools。
+
+二、修法
+  1. 新增 `--pi-unsafe-tools`（仅 pi-cli 有效，其他 runtime 报错退出）。
+  2. create 摘要按 runtime 分支：
+     - pi-cli + 无 flag：显示 "read / grep / find / ls (pi safe set — no shell)"，并提示用 `--pi-unsafe-tools` 或手动改配置。
+     - pi-cli + flag：显示完整 7 个工具，Flags 栏显示 piUnsafeTools=true。
+  3. `--tools` 传给 pi-cli 时打印警告（pi 忽略 Claude 的 tools 允许列表）。
+  4. 错配 runtime 直接报错退出（如 `--runtime claude-agent-sdk --pi-unsafe-tools`）。
+  5. help 文档同步新增 `--pi-unsafe-tools`。
+
+三、验证（本机 + Docker）
+  - 创建 pi 节点：
+      --pi-unsafe-tools → flags.piUnsafeTools=true，摘要列出 7 个工具
+      无 flag         → flags 无 piUnsafeTools，摘要明确 "🔴 No shell"
+      --tools 组合   → 警告忽略
+      错 runtime       → exit 1，提示仅 pi-cli 有效
+  - 启动带 flag 的节点并派发任务 `echo COMMHUB_SHELL_OK && uname -srm` → **两条命令均执行并原样回报**，日志打印 `[pi] EXPERIMENTAL/DANGEROUS piUnsafeTools enabled`。
+  - 无 flag 节点同任务 → 报错 `Tool bash not found`（预期行为）。
+  - Docker 门禁：
+      test725 `3111 pass / 0 fail`
+      test745 `2197 pass / 0 fail`
+      tsc 干净
+
+四、现有节点的补救（8-pix-auto-video-pi）
+  该节点在 Mac 上（192.168.1.200），当前 config.json 里 flags 只有 dangerouslySkipPermissions。
+  任选其一：
+  A) 手动改配置并重启：
+     jq '.flags.piUnsafeTools = true' .anet/nodes/8-pix-auto-video-pi/config.json > tmp && mv tmp .anet/nodes/8-pix-auto-video-pi/config.json
+     anet node restart 8-pix-auto-video-pi
+  B) 删了重建（推荐，因为摘要也会对）：
+     anet node delete 8-pix-auto-video-pi --yes
+     anet node create 8-pix-auto-video-pi --runtime pi-cli \
+       --model nvidia/nemotron-3-ultra-550b-a55b:free \
+       --pi-unsafe-tools
+
+五、产物
+  /vol2/1000/Download/agent-network-tgz/
+    sleep2agi-agent-node-2.5.0-preview.158.tgz  (sha256 192841ef...)
+    sleep2agi-agent-network-2.3.0-preview.195.tgz (sha256 f79bbf60...)
+
+六、升级
+  npm i -g <两个 tgz 路径>
+  command -v anet          # 确认指向新装路径
+  anet node create <name> --runtime pi-cli --model ... --pi-unsafe-tools
