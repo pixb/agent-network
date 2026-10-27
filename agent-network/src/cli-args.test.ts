@@ -47,6 +47,7 @@ describe("CLI argument parsing", () => {
       "--no-yolo",
       "--opencode-new-server",
       "--opencode-unsafe-tools",
+      "--pi-unsafe-tools",
       "--pick",
       "--resume-latest",
       "--revoke-cli-tokens",

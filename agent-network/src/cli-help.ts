@@ -68,6 +68,9 @@ Options:
   --model <id>           Model for the runtime
   --tools <list>         Extra tools to enable (e.g. WebSearch)
   --copresence           Shared human + agent TUI (codex-app-server / opencode-cli / grok)
+  --pi-unsafe-tools      pi-cli only: enable bash/edit/write. Default is the pi safe
+                         set (read/grep/find/ls) — without this flag the agent has
+                         no shell.
   --env KEY=VALUE        Environment for the node (stored as an env ref, repeatable)
   --provider <id>        Codex or OpenCode V2 provider: deepseek | minimax |
                          custom-openai-compat. Codex writes config.toml

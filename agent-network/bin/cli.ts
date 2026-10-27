@@ -5325,6 +5325,13 @@ function createProfileFromOpts(id: string, opts: ReturnType<typeof parseOpts>): 
   // explicitly warned against over-restricting). See src/tool-allowlist.ts
   // for the rationale + tests.
   if (opts.model) opts.model = validateModel(opts.model);
+  if (opts["pi-unsafe-tools"] !== undefined && runtime !== "pi-cli") {
+    console.error(`[anet] --pi-unsafe-tools is valid only with --runtime pi-cli (got ${runtime})`);
+    process.exit(1);
+  }
+  if (runtime === "pi-cli" && opts.tools) {
+    console.warn(`[anet] ⚠ --tools has no effect for pi-cli: pi's tool set is safe (read/grep/find/ls) or full (--pi-unsafe-tools). Ignoring ${JSON.stringify(opts.tools)}.`);
+  }
   const nodeId = generateNodeId();
   const grokHeadless = opts["grok-headless"] === "true";
   if (grokHeadless && runtime !== "grok-build-cli") {
@@ -5380,6 +5387,12 @@ function createProfileFromOpts(id: string, opts: ReturnType<typeof parseOpts>): 
       ...(runtime === "codex-app-server" && copresenceCreateOptTruthy(opts.copresence)
         ? codexSdkYoloFlags(opts["no-yolo"] === "true")
         : {}),
+      // RFC-043 — pi's tool set is NOT the Claude preset: agent-node runs the
+      // 4-tool safe set (read/grep/find/ls) unless this flag is on. Creating
+      // without it used to print "Built-in: all … Bash …" while the runtime
+      // could only read — exactly the mismatch that made the first pi node
+      // report "Tool bash not found".
+      ...(runtime === "pi-cli" && opts["pi-unsafe-tools"] === "true" ? { piUnsafeTools: true } : {}),
     },
     ...(runtime === "codex-app-server" && opts["codex-app-server-url"]
       ? { codexAppServerUrl: opts["codex-app-server-url"] }
@@ -6998,6 +7011,32 @@ async function createCommand(idOverride?: string) {
   // they hand it real work. The earlier behavior printed only the flags warning
   // and left tools opaque.
   const toolsArr = Array.isArray(profile.tools) ? profile.tools : [];
+  if (profile.runtime === "pi-cli") {
+    // RFC-043 — pi does not use the Claude preset. Print what pi will actually
+    // enable, or the operator posts "cannot call Bash" on a node whose create
+    // summary just claimed Bash was available.
+    const piUnsafe = profile.flags?.piUnsafeTools === true;
+    console.log(`\n[anet] ⚠ Node created with pi tool set:`);
+    console.log(`[anet]    Built-in: ${piUnsafe
+      ? "read / bash / edit / write / grep / find / ls (piUnsafeTools)"
+      : "read / grep / find / ls (pi safe set — no shell, no edit)"}`);
+    console.log(`[anet]    MCP:      commhub_send_task / send_message / send_reply / get_all_status / ...`);
+    console.log(`[anet]    Flags:    piUnsafeTools=${piUnsafe}`);
+    console.log(`[anet]`);
+    if (piUnsafe) {
+      console.log(`[anet]    The agent can read/write files and run shell commands. Trusted tasks only.`);
+    } else {
+      console.log(`[anet]    🔴 No shell: bash/edit/write are NOT enabled for this node.`);
+      console.log(`[anet]    Enable them:  recreate with --pi-unsafe-tools, or edit`);
+      console.log(`[anet]                  .anet/nodes/${id}/config.json → "flags": { "piUnsafeTools": true }`);
+      console.log(`[anet]                  then: anet node restart ${id}`);
+    }
+    console.log(`[anet]    Inspect current set:   anet info ${id}`);
+    if (!printCodexLoginNextStep(join(nodesDir(), id), nodeDisplayName(id, profile), `anet node start ${id}`)) console.log(`\nStart: anet node start ${id}`);
+    closeRL();
+    if (process.env.ANET_INTERNAL_KEEP_PROCESS !== "1") process.exit(0);
+    return;
+  }
   const toolsLabel = toolsArr.length
     ? `[${toolsArr.join(", ")}] (explicit allowlist)`
     : `all (Claude Code preset — WebFetch / WebSearch / Bash / Read / Write / Edit / Glob / Grep / Task / ...)`;
