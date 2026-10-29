@@ -356,14 +356,14 @@ describe("resolvePinnedOpencodeBinary", () => {
   });
 });
 
-// Board #541 — the release pin moved 1.18.35 → 1.19.0 → 1.19.3 → 1.19.4. A host still
+// Board #541 — the release pin moved 1.18.35 → 1.19.0 → 1.19.3 → 1.19.4 → 1.19.5. A host still
 // holding a previous exact install must keep starting (with an upgrade note) for
 // one transition window; anything else stays rejected.
 describe("opencode pin transition", () => {
-  test("release pin is opencode-ai@1.19.4 with the retained transition window", () => {
-    expect(OPENCODE_DEFAULT_PIN).toBe("1.19.4");
-    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
-    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.4", "1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+  test("release pin is opencode-ai@1.19.5 with the retained transition window", () => {
+    expect(OPENCODE_DEFAULT_PIN).toBe("1.19.5");
+    expect([...OPENCODE_TRANSITION_VERSIONS]).toEqual(["1.19.4", "1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
+    expect([...OPENCODE_ACCEPTED_VERSIONS]).toEqual(["1.19.5", "1.19.4", "1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]);
     expect(isAcceptedOpencodeVersion("1.19.4")).toBe(true);
     for (const v of ["1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]) {
       expect(isAcceptedOpencodeVersion(v)).toBe(true);
@@ -374,29 +374,29 @@ describe("opencode pin transition", () => {
   });
 
   test("transition note names the found version and the exact upgrade command", () => {
-    expect(opencodeTransitionNote("1.19.4")).toBeNull();
+    expect(opencodeTransitionNote("1.19.5")).toBeNull();
     expect(opencodeTransitionNote("1.18.2")).toBeNull();
-    const note = opencodeTransitionNote("1.19.3")!;
-    expect(note).toContain("opencode-ai@1.19.3");
-    expect(note).toContain("anet opencode upgrade-pin 1.19.4");
+    const note = opencodeTransitionNote("1.19.4")!;
+    expect(note).toContain("opencode-ai@1.19.4");
+    expect(note).toContain("anet opencode upgrade-pin 1.19.5");
     expect(note).not.toContain("\n");
     const older = opencodeTransitionNote("1.18.35")!;
-    expect(older).toContain("opencode-ai@1.18.35");
-    expect(older).toContain("anet opencode upgrade-pin 1.19.4");
+    expect(older).toContain("opencode-ai@1.19.4");
+    expect(older).toContain("anet opencode upgrade-pin 1.19.5");
     expect(older).not.toContain("\n");
   });
 
   test("launcher-selected transition version is admitted and revalidates without an explicit version", () => {
     const root = makeTrustedRoot("opencode-bin-transition");
     try {
-      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.18.35" });
+      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.19.4" });
       const attestation = resolvePinnedOpencodeBinaryAttestation({
         requestedBinary: fixture.binary,
-        expectedVersion: "1.18.35",
+        expectedVersion: "1.19.4",
         probeEnv: process.env,
       });
-      expect(attestation.expectedVersion).toBe("1.18.35");
-      expect(revalidatePinnedOpencodeBinary(attestation, { expectedVersion: "1.18.35" })).toBe(fixture.binary);
+      expect(attestation.expectedVersion).toBe("1.19.4");
+      expect(revalidatePinnedOpencodeBinary(attestation, { expectedVersion: "1.19.4" })).toBe(fixture.binary);
       expect(revalidatePinnedOpencodeBinary(attestation)).toBe(fixture.binary);
       expect(() => revalidatePinnedOpencodeBinary(attestation, { expectedVersion: PIN }))
         .toThrow("attestation version changed");
@@ -486,12 +486,12 @@ describe("opencode pin transition", () => {
   test("a package whose manifest says 1.18.35 but reports another version is rejected", () => {
     const root = makeTrustedRoot("opencode-bin-transition-lie");
     try {
-      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.18.35", reportedVersion: "1.18.2" });
+      const fixture = packageStub(root, "opencode-ai", { manifestVersion: "1.19.4", reportedVersion: "1.18.2" });
       expect(() => resolvePinnedOpencodeBinary({
         requestedBinary: fixture.binary,
-        expectedVersion: "1.18.35",
+        expectedVersion: "1.19.4",
         probeEnv: process.env,
-      })).toThrow("expected opencode-ai@1.18.35; resolved binary reports 1.18.2");
+      })).toThrow("expected opencode-ai@1.19.4; resolved binary reports 1.18.2");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

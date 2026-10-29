@@ -48,8 +48,9 @@ export function isAcceptedOpencodeVersion(version: string): boolean {
 /** One-line upgrade note when a transition version was admitted, else null. */
 export function opencodeTransitionNote(version: string): string | null {
   if (version === OPENCODE_DEFAULT_PIN || !OPENCODE_TRANSITION_VERSIONS.includes(version)) return null;
+  const previousPin = OPENCODE_TRANSITION_VERSIONS[0];
   return (
-    `opencode-ai@${version} is the previous release pin and is still accepted for now; ` +
+    `opencode-ai@${previousPin} is the previous release pin and is still accepted for now; ` +
     `upgrade to the vetted opencode-ai@${OPENCODE_DEFAULT_PIN} with: anet opencode upgrade-pin ${OPENCODE_DEFAULT_PIN}`
   );
 }

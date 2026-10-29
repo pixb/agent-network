@@ -292,17 +292,17 @@ describe("resolveAcceptedOpencodePackageBinaryFromPath (transition window)", () 
     return { ...pkg, bin };
   }
 
-  test("a host still on the previous pin 1.18.35 resolves and reports 1.18.35", () => {
+  test("a host still on the previous pin 1.19.4 resolves and reports 1.19.4", () => {
     const base = safeTestBase();
-    const legacy = globalInstall(base, "legacy", "1.18.35");
+    const legacy = globalInstall(base, "legacy", "1.19.4");
     expect(resolveAcceptedOpencodePackageBinaryFromPath(legacy.bin, {
       acceptedVersions: acceptedOpencodeVersions(),
-    })).toEqual({ binary: legacy.binary, version: "1.18.35" });
+    })).toEqual({ binary: legacy.binary, version: "1.19.4" });
   });
 
   test("the release pin wins even when the transition version is earlier on PATH", () => {
     const base = safeTestBase();
-    const legacy = globalInstall(base, "legacy", "1.18.35");
+    const legacy = globalInstall(base, "legacy", "1.19.4");
     const current = globalInstall(base, "current", PIN);
     expect(resolveAcceptedOpencodePackageBinaryFromPath(`${legacy.bin}:${current.bin}`, {
       acceptedVersions: acceptedOpencodeVersions(),
@@ -321,7 +321,7 @@ describe("resolveAcceptedOpencodePackageBinaryFromPath (transition window)", () 
     const base = safeTestBase();
     const project = join(base, "project");
     mkdirSync(project, { mode: 0o700 });
-    const local = globalInstall(project, "payload", "1.18.35");
+    const local = globalInstall(project, "payload", "1.19.4");
     expect(() => resolveAcceptedOpencodePackageBinaryFromPath(local.bin, {
       acceptedVersions: acceptedOpencodeVersions(),
       forbiddenRoots: [project],
