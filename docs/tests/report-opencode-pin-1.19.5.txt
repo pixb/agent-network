@@ -1,0 +1,45 @@
+opencode V1 pin bump: 1.19.4 → 1.19.5
+版本: 2.3.0-preview.196 / 2.5.0-preview.159（成对 tgz，不发 npm）
+分支: pixb
+
+一、变更
+  将 opencode V1（npm `opencode-ai`）的精确锁定版本从 1.19.4 升到 1.19.5。
+  受影响的三个源文件（双份镜像）：
+    agent-node/src/runtime/opencode-versions.ts
+    agent-network/src/opencode-versions.ts
+    agent-network/src/opencode-pin.ts （OPENCODE_DEFAULT_PIN 派生）
+
+二、迁移窗口（RFC-029 Board #541）
+  acceptedVersions 顺序：新 pin 在前，旧 pin 退为 transition 第二位：
+    ["1.19.5", "1.19.4", "1.19.3", "1.19.0", "1.18.35", "1.18.34", "1.18.1"]
+  仍保留的 transition 版本：1.19.4、1.19.3、1.19.0、1.18.35、1.18.34、1.18.1
+  —— 仍持有这些 exact 版本的机器能正常起动，并在启动时收到升级提示；
+    其他版本（如 1.19.1/1.19.2/1.18.2/2.0.22 等）直接拒绝。
+
+三、同步修复：`opencodeTransitionNote` 函数
+  发现原函数将所有 transition 版本都称为 "the previous release pin"，不准确。
+  修正：统一引用 OPENCODE_TRANSITION_VERSIONS[0]（即紧邻的前一 pin）作为 "previous release pin"，
+  升级命令始终指向 OPENCODE_DEFAULT_PIN（当前 pin 1.19.5）。
+
+四、测试同步
+  · agent-network: opencode-pin.test.ts、opencode-package-binary.test.ts 同步期望值
+    （transition window 从旧 pin 1.19.3 变为新旧 pin 1.19.4、1.19.3…）；
+  · agent-node: opencode-acp/binary.test.ts 同理更新 transition window 期望值；
+  · 双份 opencode-versions.ts 字节级一致性由 opencode-versions-parity.test.ts 守门。
+
+五、验证（Docker 门禁）
+  tests/test745-agent-network-unit-ci 2197 pass / 13 skip / 0 fail  RESULT: PASS
+  tests/test725-agent-node-unit-ci  在网络抖动导致 apt 镜像源异常的情况下出现 1 个既有 flaky 测试失败（CODEX_HOME 环境隔离），与本次 pin 升级无关；本地全量跑 479 pass / 1 skip / 2 fail（同 2 个既有 flaky）。
+  agent-network tsc --noEmit rc=0；全部 opencode 相关单测 43 pass / 0 fail。
+
+六、产物
+  /vol2/1000/Download/agent-network-tgz/
+    sleep2agi-agent-node-2.5.0-preview.159.tgz
+      sha256 558041e71d239e5697e3775dadf45e0743ed878902dd8594258ef46e51935efa
+    sleep2agi-agent-network-2.3.0-preview.196.tgz
+      sha256 1158284de588537a1575d2c335c76f97eb98db4e3fee46b4285528962a2e2626
+
+七、升级（每台机器）
+  npm i -g <两个 tgz 路径>
+  command -v anet          # 确认指向新装路径
+  anet node start <name>   # 旧 opencode 节点会打印升级提示并建议运行 `anet opencode upgrade-pin 1.19.5`
