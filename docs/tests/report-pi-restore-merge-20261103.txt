@@ -47,3 +47,21 @@ B. npm 上所有 agent-node 版本（实测 .147/.148/.154/.159/.165/.175）都�
    要跑起来必须从 pixb 构建并发布/安装带 pi 的 agent-node，再 bump pair。
 C. 旧 pixb-backup 上的 docs 测试报告、.191/.154 发布准备、skill 子模块指针
    未恢复（判定为历史产物，非日常代码）。
+
+== 追加（缺口 B 已闭环，2026-11-03 同日）==
+成对包: agent-network 2.3.0-preview.208 / agent-node 2.5.0-preview.176
+        pair 常量同树（scripts/sync-pinned-versions.sh dry-run → --apply）
+        产物: /vol2/1000/Download/agent-network-tgz/sleep2agi-agent-{network-2.3.0-preview.208,node-2.5.0-preview.176}.tgz
+        不发 npm（AGENTS: 对外 npm 只从 main 发布）
+门禁: check-doc-version-claims.py 通过
+端到端（私有 prefix 装 .208；ANET_AGENT_NODE_BIN 指向本地构建的 .176；不动全局包）:
+  node create pi-verify --runtime pi-cli --model local/swift-1.5-iq3_xxs --pi-unsafe-tools   建成
+  node start pi-verify   → 已注册到 CommHub / SSE connected / goals scheduler: enabled (runtime=pi)
+  MCP send_task "只回复一句话：PI_E2E_OK"
+             → task status = replied, result = "[pi-verify] PI_E2E_OK"
+             → delivered/started 09:37:36, runtime_submitted 09:37:38, consumed 09:37:44
+  验证节点已 stop + delete（Hub 上 n_c0d0fea1 已移除）
+pi 模型来源: ~/.pi/agent/models.json provider `local` = swift-1.5-iq3_xxs @ http://192.168.1.21:8080/v1
+说明: 纯 npm 安装下 node start --runtime pi-cli 仍会被 candidate 守卫拒
+      （npm 无带 pi 运行时的 agent-node），需 ANET_AGENT_NODE_BIN 或本地安装 .176。
+发布说明: docs/tests/release-v2.3.0-preview.208-v2.5.0-preview.176.md
