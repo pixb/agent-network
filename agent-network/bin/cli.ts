@@ -11,6 +11,7 @@
  */
 
 import { constants, openSync, closeSync, fstatSync, chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, statSync, lstatSync, renameSync, rmSync, cpSync, copyFileSync, unlinkSync, realpathSync, symlinkSync } from "fs";
+import { formatBuildLine, readPackageBuildInfo } from "../src/build-info";
 import { hasBorrowedV1Intent, readBorrowedLaunchConfig, waitForBorrowedLaunchHealth } from "../src/shared/opencode-borrowed-launch-health";
 import { checkDaemonAnetBin, daemonAnetBinEnv, shouldPinDaemonOnNodeStart } from "../src/daemon-anet-bin.js";
 import { runDaemonAdopt } from "../src/daemon-adopt.js";
@@ -85,6 +86,7 @@ import { OPENCODE_KEYLESS_FREE_MODEL_NOTE, opencodeFreeTierSafePresetWarning } f
 import { resolveRuntimeForResume } from "../src/resume-runtime-infer";
 import { isSameIncarnation, processVanished, resolveOwnedRoots, type OwnedRootCandidate } from "../src/owned-roots";
 import { serializeProfileForConfigJson } from "../src/profile-serialize";
+import { mergeProfilePatch } from "../src/profile-merge";
 import { backfillOpencodeGeneration, stampOpencodeGeneration } from "../src/opencode-generation-record";
 import {
   applyOpencodeGenerationCreateOption,
@@ -729,6 +731,12 @@ function forkRecoveryOptions(nodeId: string, displayName: string, opts: Copresen
 }
 
 async function askTypedConfirmation(prompt: string, expected: string): Promise<boolean> {
+  // 同 #2293：打字确认在非 TTY 里等价于「永远等一个不会来的回答」⇒ 直接判否。
+  // 判否是安全的那一侧：确认类问题唯一的危险答案是被当成「是」。
+  if (!process.stdin.isTTY) {
+    process.stderr.write(`[anet] 非交互环境：跳过打字确认（视为「否」）—— ${prompt.replace(/\n/g, " ").slice(0, 120)}\n`);
+    return false;
+  }
   const rl = getRL();
   const answer = await new Promise<string>((resolve) => rl.question(prompt, (s) => resolve(s)));
   closeRL();
@@ -817,13 +825,28 @@ interface CopresenceOptions {
 }
 
 /** True once `${hub}/health` answers. Unauthenticated on purpose: we only need
- *  to know something is listening, not to read anything from it. */
+ *  to know something is listening, not to read anything from it.
+ *
+ *  2026-10-31 —— 但「答了」不等于「健康」，而这正是 /health 新增 status 字段的理由。
+ *  加了字段却没人读，它就是一个被记录下来的判定（今晚反复出现的那一格）。
+ *  ⇒ 这里做它的第一个读者：**只告警、不阻断**（阻断会让一个降级 hub 变成起不来的节点）。
+ */
 async function hubAnswersHealth(hub: string, timeoutMs = hubHealthTimeoutMs(hub)): Promise<boolean> {
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), timeoutMs);
     const res = await fetch(`${hub}/health`, { signal: ctl.signal });
     clearTimeout(t);
+    if (res.ok) {
+      // 读 body 只为看 status；解析失败不影响「答了」这个结论。
+      try {
+        const body = await res.json() as { status?: string; status_reasons?: unknown };
+        if (body?.status === "degraded") {
+          const why = Array.isArray(body.status_reasons) ? body.status_reasons.join(", ") : "unknown";
+          console.error(`[anet] ⚠ ${hub} answers /health but reports status=degraded (${why}) — continuing`);
+        }
+      } catch { /* body 不可解析 ⇒ 仍然算「答了」 */ }
+    }
     return res.ok || res.status === 401;   // 401 = up, just gated
   } catch { return false; }
 }
@@ -2391,8 +2414,10 @@ async function startOpencodeCopresenceOrchestration(nodeId: string, hubOverride?
     process.exit(1);
   }
 
+  // #3418 —— 这里只想记一格 opencodeMode。原来用内存里的 resolved.profile 整份回写，
+  // 会把启动之后 Hub 改过的 model 一起覆盖掉（生产实测丢过一次）。
   const profile: Profile = { ...resolved.profile, opencodeMode: "copresence" };
-  saveProfile(resolved.id, profile);
+  patchProfileFields(resolved.id, { opencodeMode: "copresence" } as Partial<Profile>);
   const bridgeSession = `${displayName}-桥`;
   const tuiSession = displayName;
   const attachScript = join(nodesDir(), resolved.id, "opencode-attach.sh");
@@ -3203,6 +3228,26 @@ function resolveStartProfile(
   return { profile, runtime };
 }
 
+/**
+ * #3418 —— 只往 config.json 里写声明的那几格：以**磁盘当前内容**打底，patch 覆盖它。
+ *
+ * 为什么不是 `saveProfile(id, { ...profile, x: 1 })`：`profile` 是进程启动时读到的快照，
+ * 长命进程（共存桥）握着它很久；期间 Hub 可能已经把 model 改掉（并 applied 了）。
+ * 用旧快照整份回写，就把那次改动悄悄抹掉了 —— 生产上就是这样丢的（见 profile-merge.ts）。
+ *
+ * 读不到磁盘就不写：宁可少记一格，也不要用读不懂的旧值覆盖整份文件。
+ * 返回是否真的写了（便于调用方打日志，不用于控制流）。
+ */
+function patchProfileFields(id: string, patch: Partial<Profile>): boolean {
+  let onDisk: Profile;
+  try {
+    onDisk = JSON.parse(readFileSync(join(nodesDir(), id, "config.json"), "utf-8")) as Profile;
+  } catch {
+    return false;
+  }
+  saveProfile(id, mergeProfilePatch(onDisk as unknown as Record<string, unknown>, patch as unknown as Record<string, unknown>) as unknown as Profile);
+  return true;
+}
 function saveProfile(id: string, profile: Profile) {
   const dir = join(nodesDir(), id);
   const isOpencode = normalizeRuntime(profile) === "opencode-cli";
@@ -3695,6 +3740,13 @@ function detectAgentNodeSubDeps(): { claudeAgentSdk: string | null; codexSdk: st
 function printVersionReport() {
   const versions = detectInstalledPackages();
   process.stdout.write(formatAnetVersionBanner(versions.anet.version, standaloneBundleVersion(STANDALONE_BUILD_STAMP)));
+  // 2026-10-31 —— #3294：版本标签之外还要有**字节标识**。
+  // 「同一版本号、不同字节」在只有标签时不可分辨；而 absent 与 invalid 也必须分开说
+  // （前者是源码检出的正常状态，后者是注入写坏了）。
+  {
+    const r = readPackageBuildInfo();
+    console.log(`  ${formatBuildLine(r)}`);
+  }
 
   console.log("Components (auto-fetched on first use, you don't need to install them manually):");
   console.log(`  ${formatLazyComponent(versions.agentNode)}`);
@@ -5112,6 +5164,11 @@ async function initGlobal() {
   let hub = opts.hub;
 
   if (!hub) {
+    // #2293：具体到「该传什么」，而不是让通用错误去兜。
+    if (!process.stdin.isTTY) {
+      console.error("Error: 没有给 --hub，且 stdin 不是终端 ⇒ 不会提问。用法: anet init --hub http://YOUR_IP:9200");
+      process.exit(1);
+    }
     hub = await ask("CommHub URL (e.g. http://YOUR_IP:9200)");
   }
 
@@ -7079,7 +7136,27 @@ function getRL() {
 }
 function closeRL() { if (_rl) { _rl.close(); _rl = null; } }
 
+// 2026-10-31 —— #2293：**非 TTY 下绝不等待输入**。
+//
+// 缺陷形状（实测，不是推理）：客户端把 CLI 当子进程拉起时，stdin 是一条**一直被握着的管道**
+// （不是 /dev/null）。`rl.question` 于是永远等不到 EOF：
+//   spawn("anet init", stdio:["pipe",...]) → 6 秒后仍未退出，stdout 只有一行提示串
+//   ⇒ 客户端那边看到的是「卡住」，而且**没有任何可读的原因**（提示串看起来像还在正常工作）。
+// 修复不是「更快地等待」，而是**这类环境里根本不发起提问**：
+//   有默认值 ⇒ 用默认值并说明（stderr，不改 stdout 的机器可读面）
+//   没有默认值 ⇒ 抛出 `non_interactive_prompt`，带上「该传什么」的下一步
 function ask(question: string, defaultVal?: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    if (defaultVal !== undefined) {
+      process.stderr.write(`[anet] 非交互环境（stdin 不是终端）：${question} → 采用默认值 ${JSON.stringify(defaultVal)}\n`);
+      return Promise.resolve(defaultVal);
+    }
+    // 单行：顶层 catch 只印第一行（实测多行提示会被吞掉，只有第一行到得了用户眼里）。
+    return Promise.reject(new Error(
+      `non_interactive_prompt: ${question} —— stdin 不是终端（客户端/管道/CI），这一问不会有人回答；`
+      + `用命令行参数或环境变量给出该值后重跑。`,
+    ));
+  }
   const suffix = defaultVal ? ` [${defaultVal}]` : "";
   return new Promise(resolve => {
     getRL().question(`${question}${suffix}: `, (answer) => {
@@ -8908,10 +8985,8 @@ async function startCommand() {
       // Record the opt-in BEFORE orchestrating, so a node that comes up shared
       // is never left with a profile claiming the operator never asked.
       if (shouldPersistGrokCopresence(copresenceFlagPassed, resolvedForCopresence.profile as any)) {
-        saveProfile(resolvedForCopresence.id, {
-          ...(resolvedForCopresence.profile as any),
-          grokCopresenceAuto: true,
-        });
+        // #3418 —— 只记这一格，不整份回写。
+        patchProfileFields(resolvedForCopresence.id, { grokCopresenceAuto: true } as any);
         console.log(`[anet] remembered co-presence for this node — next time \`anet node start ${shellQuote(nodeDisplayName(resolvedForCopresence.id, resolvedForCopresence.profile))}\` is enough.`);
       }
       await startGrokCopresenceOrchestration(id, { hub: opts.hub });
@@ -8930,7 +9005,8 @@ async function startCommand() {
     if (shouldPersistCodexCopresence(copresenceFlagPassed, prof)) remember.codexCopresence = true;
     if (shouldPersistCodexFullAccess(danger, prof)) remember.codexCopresenceFullAccess = true;
     if (Object.keys(remember).length > 0) {
-      saveProfile(resolvedForCopresence.id, { ...prof, ...remember });
+      // #3418 —— 只记要记的那几格。
+      patchProfileFields(resolvedForCopresence.id, remember as any);
       if (remember.codexCopresence) {
         console.log(`[anet] remembered co-presence for this node — next time \`anet node start ${shellQuote(displayNameForCopresence)}\` is enough.`);
       }
@@ -17123,9 +17199,17 @@ async function demoDebateCommand() {
   }
   if (!topic) { console.error("  ❌ 议题不能为空."); markFailed(); return; }
 
-  const minimaxKey = opts.key || process.env.MINIMAX_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
+  // 2026-10-31 —— **跨厂商凭据不许回退**（外部复核：「一个初始化里两个不同 process.env.X 即错借」）。
+  // 原来这里是 `opts.key || MINIMAX_KEY || ANTHROPIC_AUTH_TOKEN`：
+  // 后者是**另一家厂商**的凭据；把它发给 MiniMax 只会得到一个难查的 401，
+  // 而失败现场看起来像「MiniMax key 错了」。
+  const minimaxKey = opts.key || process.env.MINIMAX_KEY || "";
   if (!minimaxKey) {
     console.error("  ❌ 需要 MiniMax key. 用 --key 或 export MINIMAX_KEY=sk-cp-...");
+    if (process.env.ANTHROPIC_AUTH_TOKEN) {
+      // 提示而不借用：说清「你设的那个是另一家的」
+      console.error("     （检测到 ANTHROPIC_AUTH_TOKEN —— 那是另一家厂商的凭据，本命令不会用它）");
+    }
     markFailed(); return;
   }
 
@@ -17528,7 +17612,8 @@ async function demoSocialMediaCommand() {
     markUsageError(); return;
   }
 
-  const minimaxKey = opts.key || process.env.MINIMAX_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
+  // 同 17032 处：跨厂商凭据不回退（ANTHROPIC_AUTH_TOKEN 是另一家的，借来只会得到难查的 401）
+  const minimaxKey = opts.key || process.env.MINIMAX_KEY || "";
   if (!minimaxKey) {
     console.error("  ❌ 需要 MiniMax key. 用 --key 或 export MINIMAX_KEY=...");
     markFailed(); return;
@@ -18039,7 +18124,8 @@ async function demoPrReviewCommand() {
     console.log(`  ⚠️  diff 大小 ${diffKb} KB > 30 KB，可能超 model context。建议用 'gh api -X GET repos/.../files' 先筛关键文件。继续...`);
   }
 
-  const minimaxKey = opts.key || process.env.MINIMAX_KEY || process.env.ANTHROPIC_AUTH_TOKEN || "";
+  // 同 17032 处：跨厂商凭据不回退（ANTHROPIC_AUTH_TOKEN 是另一家的，借来只会得到难查的 401）
+  const minimaxKey = opts.key || process.env.MINIMAX_KEY || "";
   if (!mockMode && !minimaxKey) {
     console.error("  ❌ 需要 MiniMax key. 用 --key 或 export MINIMAX_KEY=sk-cp-...");
     markFailed(); return;

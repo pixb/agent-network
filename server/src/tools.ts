@@ -35,11 +35,11 @@ import { addAgentNetworkScope, addAgentTimelineScope, addNetworkScope, canRestWr
 import { canMessageAgent, restrictedNetworkIds, RESTRICTED_MEMBER_TOOLS, type AgentRef } from "./agent-access.js";
 import { listedToolFilter, scopeToolsList, type ToolCaller } from "./tool-audience.js";
 import { agentBatchScheduleInterval, agentCancelSchedule, agentCreateSchedule, agentGetSchedule, agentListSchedules, agentRunScheduleNow, agentScheduleRuns, agentUpdateSchedule } from "./schedule-agent.js";
-import { broadcastVerdict, dispatchVerdict, humanOnlyVerdict, NODE_TOOL_CLASS, nodeDecide, nodeIdentity, nodePermissionDeniedBody, writeVerdict, type NodeIdentity, type Verdict } from "./node-permissions.js";
+import { broadcastVerdict, dispatchVerdict, humanOnlyVerdict, NODE_TOOL_CLASS, nodeDecide, nodeIdentity, nodePermissionDeniedBody, recordNodeToolCall, writeVerdict, type NodeIdentity, type Verdict, toolAllowlistVerdict } from "./node-permissions.js";
 import { countInFlightTasks } from "./node-in-flight-tasks.js";
 import { restrictedMemberAttachmentsDenied } from "./restricted-files.js";
 import { errorBody } from "./requirements-errors.js";
-import { handleRequirementsRequest } from "./requirements.js";
+import { handleRequirementsRequest, clearNodeFromRequirements } from "./requirements.js";
 import {
   buildAnetArgs as _unused_buildAnetArgs,           // ensure module is loaded
   validateName as validateChildName,
@@ -98,10 +98,12 @@ import {
   SECURITY_SENSITIVE_FLAGS,
   EDITABLE_CHANNELS,
   computeApplyMode,
+  readOpencodeSnapshotFlags,
+  readConfigUpdateCapable,
+  configUpdateCapabilityDivergence,
   validatePatch,
   narrowChannelsPatch,
-  isAllowedToChangeFlag,
-} from "./config-apply-validate.js";
+  isAllowedToChangeFlag, readSystemdSupervision } from "./config-apply-validate.js";
 import { sharedSendDedup, buildDuplicateSendPayload } from "./send_dedup.js";
 import { clientRequestIdFromMeta, idempotentTaskId, idempotentTaskMatches, type StoredIdempotentTask } from "./task-idempotency.js";
 import { stampTaskAuthOrigin, type TaskAuthOrigin } from "./task-auth-origin.js";
@@ -109,7 +111,10 @@ import { dispatchQueueInfo, queueDepthByNode, queueDepthKey } from "./task-queue
 import { parseHubTimestamp } from "./hub-timestamp";
 import { noteTerminalResultRead, purgeLogsResultNow, sweepNodeRequestContent } from "./node-request-retention.js";
 import { listTaskLateReplies } from "./task-late-replies.js";
+import { pollPacer } from "./poll-pacing.js";
+import { neverConsumedExpiryCounters, neverConsumeGate, persistentNeverConsumedExpiries } from "./expiry-counters.js";
 import { auditDepartment, createDepartment, deleteDepartment, listDepartments, setAgentDepartment, updateDepartment } from "./departments.js";
+import { decideParentInference, noteInferAccepted, noteInferRejected } from "./parent-infer.js";
 
 function ts(): string {
   return new Date().toTimeString().slice(0, 8);
@@ -136,6 +141,21 @@ function lateReplyContextMatches(
   threadId: string,
   turnId: string,
 ): boolean {
+  // #3061 —— 任务**从未记下 turn 上下文**时，不能用「上下文不符」把它挡回去。
+  //
+  // 现场（2026-10-30 生产实测）：
+  //   「仍在 TUI 会话里运行，等待回复已达 30 分钟上限」的失败任务 289 条，
+  //   其中 thread_id/turn_id **非空的 0 条**；「任务未提交」781 条里只有 1 条有。
+  //   ⇒ 这类任务的迟到结果永远匹配不上，等于**工作做完了但结果必定丢弃**。
+  //   全库 task_late_replies 只有 4 行，正是这条路走不通的证据。
+  //
+  // 放宽的边界（三条同时满足才放行）：
+  //   · 存的两个 id 都是 null（不是「存了 A 却来了 B」——那种仍然拒）
+  //   · 任务已经是终态（调用点在别处已判）
+  //   · 令牌就是该任务的负责人（late_reply_task_not_owned 的检查在调用点，未改动）
+  // 在这种情况下，迟到结果只会写进 append-only 的 task_late_replies，并投递给原发送方；
+  // 不改写任务行、不跑父任务回链，所以不会把已完成的任务「再改一遍」。
+  if (storedThreadId === null && storedTurnId === null) return true;
   return storedThreadId === threadId && storedTurnId === turnId;
 }
 
@@ -285,11 +305,35 @@ function guardNodePermissionTools(server: McpServer, tokenId: string, networkId:
   };
   const wrap = (name: string, handler: (...callArgs: any[]) => any) => async (...callArgs: any[]) => {
     const cls = NODE_TOOL_CLASS[name];
-    if (cls && cls !== "always" && cls !== "read" && cls !== "requirements" && cls !== "schedule") {
+    if (cls) {
       const id = nodeIdentity(tokenId, networkId);
-      const args = callArgs[0] && typeof callArgs[0] === "object" ? callArgs[0] as Record<string, unknown> : {};
-      const verdict = id ? verdictFor(id, name, args) : null;
-      if (id && nodeDecide(id, `mcp:${name}`, verdict)) return denied(verdict!.reason, `mcp:${name}`);
+      if (id) {
+        // #2969 后半 —— 接口白名单先判（always 类豁免在函数内部处理）。
+        // 放在模式判定之前：主人明确列了「只能用这几个」，优先于模式带来的放宽/收紧。
+        const allowVerdict = toolAllowlistVerdict(id, name, cls === "always");
+        // 只在真的要被拒时才进闸：`null` 时不写账、不改任何既有行为
+        // （读类工具原来完全不碰闸，这里也不该因为"顺手记一笔"而改变它们的路径）。
+        if (allowVerdict && nodeDecide(id, `mcp:${name}`, allowVerdict)) {
+          return denied(allowVerdict.reason, `mcp:${name}`);
+        }
+        // #2971 —— 账本要覆盖「到达工具的每一次调用」，不只是会被拦的那几类。
+        // 读类 / 需求类 / 排程类原来根本不到这里 ⇒ node_tool_calls 漏掉它们，
+        // 而 read 类里就有 list_network_secrets / list_providers / tail_node_logs 这些敏感读。
+        // 🔴 只计数、不判定：拦截语义零变化（这几类本来也不在这个闸里判）。
+        // always 类仍然不记：那是心跳（get_inbox / report_status），记进来只会把账本淹掉。
+        const gated = cls !== "always" && cls !== "read" && cls !== "requirements" && cls !== "schedule";
+        if (!gated) {
+          if (cls !== "always") recordNodeToolCall(id, `mcp:${name}`);
+        } else {
+          const args = callArgs[0] && typeof callArgs[0] === "object" ? callArgs[0] as Record<string, unknown> : {};
+          // #2969 续 —— 令牌解析不到节点行时（nodeId 为 null），两张白名单都管不到它。
+          // 先按「记录」模式跑：`unbound_token` **不在 MODE_REASONS 里**，
+          // 所以 log（默认）只记账、不改变行为；只有显式 enforce 才会拒。
+          // 这样「要不要强制要求绑定令牌」这个决定，将来自有数据可依据。
+          const verdict = id.nodeId ? verdictFor(id, name, args) : { reason: "unbound_token" as const, sample: name };
+          if (nodeDecide(id, `mcp:${name}`, verdict)) return denied(verdict!.reason, `mcp:${name}`);
+        }
+      }
     }
     return handler(...callArgs);
   };
@@ -841,6 +885,9 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       // it knows the last hop. Reporting only; no write path reads it yet.
       env_transport: z.enum(["loopback", "https", "plain"]).optional().describe("Hub link kind"),
       version: z.string().max(100).optional().describe("Agent version"),
+      // 2026-10-31 —— #3294：**字节标识**。40 位 hex；也接受 12 位前缀（CI 里截过的那种）。
+      // 与 version 分开：version 是标签，build_commit 是「哪一份字节」。
+      build_commit: z.string().regex(/^[0-9a-f]{7,40}$/).optional().describe("Build commit (hex)"),
       tmux_name: z.string().max(200).optional().describe("tmux session name"),
       // V2 fields
       node_id: z.string().max(200).optional().describe("Stable node identifier"),
@@ -939,6 +986,12 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         // （约定见 tool-audience-http.test.ts：加字段先砍描述或合并，别改那三个数）。
         // `.catch(undefined)`：形状不对只丢这一格，绝不拒掉整份心跳。
         opencode_catalog: z.array(z.string()).max(400).optional().catch(undefined),
+        // #3144 —— 目录是**快照**：没有采集时刻，51 个模型是刚才的还是三周前的分不出。
+        // 🔴 这一格必须写进 schema：zod 的 object 默认**丢掉未知键** ⇒ 不写在这里，
+        //    daemon 报上来也会被静默剥掉，而 /api/nodes 的投影读到的永远是 null
+        //    （#3294 的 build_commit 就是同一个坑）。`.catch(undefined)` 与邻居一致：
+        //    形状不对只丢这一格，绝不拒掉整份心跳。
+        opencode_catalog_seen_at: z.string().max(40).optional().catch(undefined),
         // #2293 —— 这台机器上 OpenCode serve 的 loopback 端点（`http://127.0.0.1:PORT`）。
         // 客户端「OpenCode Server」行此前只能写「端口未上报」。只收 loopback URL，不收密码。
         opencode_server: z.string().max(200).optional().catch(undefined),
@@ -1082,7 +1135,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       // instead of rejecting the whole report (see node-health-store.ts).
       health: nodeHealthSchema,
     },
-    async ({ resume_id, alias, status, task, output, score, progress, server: srv, hostname: hn, agent: ag, project_dir: pd, os_user: osUser, version: ver, tmux_name: tmux, node_id, session_id, config_path, channels, model: mdl, node_name: nn, network_id: netId, host, process_telemetry: proc, external_schedules: externalSchedules, config_snapshot: cfgSnap, rules_file_capable: rulesFileCapable, skills_capable: skillsCapable, files_capable: filesCapable, logs_capable: logsCapable, team_rules: teamRules, health: nodeHealth, secret_keys: secretKeys, env_transport: envTransport }) => {
+    async ({ resume_id, alias, status, task, output, score, progress, server: srv, hostname: hn, agent: ag, project_dir: pd, os_user: osUser, version: ver, tmux_name: tmux, node_id, session_id, config_path, channels, model: mdl, node_name: nn, network_id: netId, host, process_telemetry: proc, external_schedules: externalSchedules, config_snapshot: cfgSnap, rules_file_capable: rulesFileCapable, skills_capable: skillsCapable, files_capable: filesCapable, logs_capable: logsCapable, team_rules: teamRules, health: nodeHealth, secret_keys: secretKeys, env_transport: envTransport, build_commit: buildCommit }) => {
       const effectiveNetId = getNetworkId(netId);
       const sessionNetId = effectiveNetId ?? "default";
       if (!callerTokenIsNetwork || !enforceNetworkId) {
@@ -1293,6 +1346,13 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           db.run(
             `UPDATE sessions SET env_transport = ?2, updated_at = datetime('now') WHERE resume_id = ?1`,
             [resume_id, envTransport],
+          );
+        }
+        // 2026-10-31 —— #3294：同一手法（自己的 UPDATE，INSERT 字节形状不动）。
+        if (buildCommit) {
+          db.run(
+            `UPDATE sessions SET build_commit = ?2, updated_at = datetime('now') WHERE resume_id = ?1`,
+            [resume_id, buildCommit],
           );
         }
         if (Array.isArray(secretKeys)) {
@@ -2066,12 +2126,25 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       let parentSource: "explicit" | "inferred" | null = parentIn ? "explicit" : null;
       if (!humanSender && !parentTaskId && from_session && from_session !== "hub" && from_session !== "api") {
         try {
+          // #669 —— 取**全部**候选而非最近一条：裁定需要知道「是不是唯一」。
           const recentParams: any[] = [from_session];
-          let recentSql = "SELECT task_id FROM tasks WHERE to_name = ?1 AND status IN ('delivered')"; // board668-parent-delivered-only
+          let recentSql = "SELECT task_id, created_at FROM tasks WHERE to_name = ?1 AND status IN ('delivered')"; // board668-parent-delivered-only
           recentSql = addScope(recentSql, recentParams, effectiveNetId);
-          recentSql += " ORDER BY created_at DESC LIMIT 1";
-          const recent = db.get<{ task_id: string }>(recentSql, ...recentParams);
-          if (recent?.task_id) { parentTaskId = recent.task_id; parentSource = "inferred"; }
+          recentSql += " ORDER BY created_at DESC LIMIT 5";
+          const cands = db.all<{ task_id: string; created_at: string | null }>(recentSql, ...recentParams);
+          const verdict = decideParentInference(
+            cands.map((c) => ({ task_id: c.task_id, created_at_ms: c.created_at ? Date.parse(c.created_at) : null })),
+            Date.now(),
+          );
+          if (verdict.ok) {
+            parentTaskId = verdict.task_id;
+            parentSource = "inferred";
+            noteInferAccepted();
+          } else if (verdict.rejection.candidates > 0) {
+            // 只有「本来有候选但被拒」才计数：没有候选是常态（没有要接的任务），
+            // 把它记成拒绝会让分母虚高。
+            noteInferRejected(verdict.rejection);
+          }
         } catch {}
       }
 
@@ -2101,6 +2174,15 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           // still proceed; the LLM may have meant to dispatch fresh.
           console.log(`[${ts()}] ⚠ send_task: parent_task_id=${parentIn.slice(0, 8)} not found, dropping parent link`);
           parentTaskId = null;
+          // #3348 —— **来源必须与父一起丢弃**。
+          // 上面那段 meta 是在父校验**之前**拼的（`if (parentSource && parentTaskId)` 当时为真），
+          // 而这里才把 parentTaskId 置空 ⇒ 落库会留下
+          //     parent_task_id = NULL，meta.parent_source = "explicit"
+          // 这一格。#669 那条不变式正是「父有值 ⇒ 来源有值」，它只挡住了反方向
+          // （父为空时来源也不必在），于是这一格两边都放过。
+          // 生产实测：131684 行里有 2 条落在这里（10-30、10-31 各一条）。
+          parentSource = null;
+          metaJsonWithParent = metaJson;
         } else if ((parentRow.network_id ?? null) !== (effectiveNetId ?? null)) {
           console.log(`[${ts()}] 🚫 send_task: cross-network parent rejected, parent=${parentIn.slice(0, 8)} parent-net=${parentRow.network_id ?? "null"} caller-net=${effectiveNetId ?? "null"}`);
           return { content: [{ type: "text" as const, text: JSON.stringify({
@@ -2216,6 +2298,19 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       {
         const hg = assertNodeHealthy(targetAlias, effectiveNetId ?? null, { force, forceAllowed: !callerTokenIsNetwork });
         if (!hg.ok) return { content: [{ type: "text" as const, text: JSON.stringify(hg) }] };
+      }
+      // #3271 —— 同一形状的第二道闸：**这台节点从未取走过任务**（本进程窗口内 ≥3 次过期且 consumed_at 全空）。
+      // 原来这里什么都没有：每次只是「又过期了一条」的通知，派单方只能靠人记住。
+      {
+        const gate = neverConsumeGate({
+          alias: targetAlias,
+          counters: neverConsumedExpiryCounters(),
+          force: force === true,
+          forceAllowed: !callerTokenIsNetwork,
+          // #3271 —— 进程内计数器随部署归零，所以必须并上 tasks 表里的历史（跨重启）。
+          persistent: persistentNeverConsumedExpiries(db, targetAlias, effectiveNetId ?? null),
+        });
+        if (!gate.ok) return { content: [{ type: "text" as const, text: JSON.stringify(gate) }] };
       }
 
       console.log(`[${ts()}] ${from_session} → send_task → ${targetAlias}: ${task.slice(0, 60)}${priority === "high" ? " [HIGH]" : ""}${canonical.renamed ? ` [renamed from ${alias}]` : ""}`);
@@ -2496,10 +2591,25 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         let lateSql = "SELECT status,from_name,to_node_id,thread_id,turn_id FROM tasks WHERE task_id=?1";
         lateSql = addScope(lateSql, lateParams, effectiveNetId);
         const lateCandidate = db.get<LateTask>(lateSql, ...lateParams) ?? null;
-        if (lateCandidate && !["created", "delivered", "acked", "running"].includes(lateCandidate.status)) {
+        // #3259 收口 —— 迟到通道只对「终态但**没有成功交付回复**」的任务开放。
+        // `replied` 的任务发送方已经拿到了结果，再补一次就是重复投递
+        // （#698 的 idempotency 测试就是这条：replay 不能变成第二条 inbox 回复）。
+        if (lateCandidate && lateCandidate.status !== "replied"
+          && !["created", "delivered", "acked", "running"].includes(lateCandidate.status)) {
           if (workSignal.outcome) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "scheduled_work_outcome_terminal", reply_queued: false }) }] };
           // Old runtimes do not send turn identity and retain the old result.
-          if (!threadId || !turnId) {
+          // #3061 续 —— 任务**从未记下 turn 上下文**时，不该再要求调用方凭空给出 id。
+          //
+          // 现场（2026-10-30，通信Dash欧）：它对一条 failed 任务调 send_reply 想补结果，
+          // 拿到 `reply_task_terminal`，只好先 retry_task 把任务重置成 delivered 再回复 ——
+          // 代价是账本里那条从 failed 变成 retried→replied，**「当初失败过」这个事实被抹掉了**。
+          // 而 #3244 只放宽了「id 对不上」，没放宽「必须提供 id」。
+          //
+          // 新语义：
+          //   · 任务存了 thread/turn ⇒ 仍然要求调用方给出**匹配**的 id（防串号）
+          //   · 任务两个都是 null     ⇒ 不要求 id；归属/终态/目标三条判据照样生效
+          const storedCtx = !!(lateCandidate.thread_id || lateCandidate.turn_id);
+          if (storedCtx && (!threadId || !turnId)) {
             return { content: [{ type: "text" as const, text: JSON.stringify({
               ok: false, error: "reply_task_terminal",
               message: `cannot apply reply: task is already terminal (${lateCandidate.status})`,
@@ -2516,7 +2626,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           if (!token?.bound_node_id || !lateCandidate.to_node_id || token.bound_node_id !== lateCandidate.to_node_id) {
             return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "late_reply_task_not_owned", reply_queued: false }) }] };
           }
-          if (!lateReplyContextMatches(lateCandidate.thread_id, lateCandidate.turn_id, threadId, turnId)) {
+          if (storedCtx && !lateReplyContextMatches(lateCandidate.thread_id, lateCandidate.turn_id, threadId!, turnId!)) {
             return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "late_reply_context_mismatch", reply_queued: false }) }] };
           }
           const canonicalOrigin = resolveCanonicalAlias(enforceNetworkId, lateCandidate.from_name).alias;
@@ -2524,6 +2634,10 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
             return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "reply_target_mismatch", reply_queued: false }) }] };
           }
 
+          // 表列是 NOT NULL：任务没有上下文时用稳定占位值。
+          // 幂等键是 (task_id, thread_id, turn_id)，占位值仍能让「同一任务的重复补发」收敛成一条。
+          const lateThreadId = threadId ?? "unrecorded";
+          const lateTurnId = turnId ?? "unrecorded";
           const lateOutcome = db.transaction(() => {
             const currentParams: any[] = [in_reply_to];
             let currentSql = "SELECT status,to_node_id,thread_id,turn_id FROM tasks WHERE task_id=?1";
@@ -2532,12 +2646,16 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
             if (!current || ["created", "delivered", "acked", "running"].includes(current.status)) {
               return { ok: false as const, error: "late_reply_task_not_terminal" as const };
             }
-            if (current.to_node_id !== token.bound_node_id || !lateReplyContextMatches(current.thread_id, current.turn_id, threadId, turnId)) {
+            // 与上面同一判据：只有任务真的记过 thread/turn 时才要求调用方 id 匹配；
+            // 两个都 null 的任务（#3061 的 289 条）不因为「没 id」被挡回去。
+            const currentHasCtx = !!(current.thread_id || current.turn_id);
+            if (current.to_node_id !== token.bound_node_id
+              || (currentHasCtx && !lateReplyContextMatches(current.thread_id, current.turn_id, threadId!, turnId!))) {
               return { ok: false as const, error: "late_reply_context_mismatch" as const };
             }
             const existing = db.get<{ late_reply_id: string; inbox_id: string; from_node_id: string; status: string; result: string }>(
               "SELECT late_reply_id,inbox_id,from_node_id,status,result FROM task_late_replies WHERE task_id=?1 AND thread_id=?2 AND turn_id=?3",
-              in_reply_to, threadId, turnId,
+              in_reply_to, lateThreadId, lateTurnId,
             );
             if (existing) {
               if (existing.from_node_id !== token.bound_node_id || existing.status !== replyStatus || existing.result !== text) {
@@ -2548,7 +2666,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
             const lateReplyId = uuidv4();
             const lateMeta = normalizeMetaJson({
               ...(mergedMeta && typeof mergedMeta === "object" && !Array.isArray(mergedMeta) ? mergedMeta : {}),
-              late: true, late_reply_id: lateReplyId, thread_id: threadId, turn_id: turnId,
+              late: true, late_reply_id: lateReplyId, thread_id: lateThreadId, turn_id: lateTurnId,
             });
             db.run(
               `INSERT INTO inbox (id,session_name,node_id,type,priority,content,from_session,in_reply_to,requires_response,network_id,meta_json)
@@ -2561,7 +2679,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
                (late_reply_id,inbox_id,task_id,network_id,from_node_id,thread_id,turn_id,status,result,meta_json)
                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`,
               [lateReplyId, id, in_reply_to, effectiveNetId ?? null, token.bound_node_id,
-              threadId, turnId, replyStatus, text, lateMeta],
+              lateThreadId, lateTurnId, replyStatus, text, lateMeta],
             );
             return { ok: true as const, duplicate: false as const, lateReplyId, inboxId: id };
           });
@@ -2972,10 +3090,17 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       if (task) {
         task.late_replies = listTaskLateReplies(db, task_id, typeof task.network_id === "string" ? task.network_id : null);
       }
+      // #3001 —— 轮询节奏提示。只多一个字段，不改状态、不返回错误：
+      // 调用方忽略它照常工作；连着打的才会看到这句话。
+      // 放在 Hub 侧而不是只改 agent-node，是因为 get_task 由 Hub 提供 ——
+      // 发版即对所有节点生效，不必等客户端升级。
+      const pacing = pollPacer.record(`${callerTokenId ?? callerAlias ?? "anon"}:${task_id}`);
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(task ? { ok: true, task } : { ok: false, error: "task not found" }),
+          text: JSON.stringify(task
+            ? { ok: true, task, ...(pacing ? { pacing } : {}) }
+            : { ok: false, error: "task not found", ...(pacing ? { pacing } : {}) }),
         }],
       };
     }
@@ -3011,7 +3136,18 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
             )?.bound_node_id ?? null
           : null;
         if (!boundNodeId || from_node_id !== boundNodeId) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "from_node_id_identity_mismatch" }) }] };
+          // #2768 —— 这个码其实合并了两种原因：token **没有绑定**（注册漏绑）
+          // 与 token **绑到了别的节点**（注入/串号）。客户端把两者都当「未绑定」处理
+          // （agent-node 的 UNBOUND_TOKEN_REJECTIONS 就是这个集合），行为上没问题；
+          // 但运维排障必须能分开 —— 否则只能凭日志猜是漏绑还是串号。
+          //
+          // 加 detail 是向后兼容的：错误码不变，客户端不必改；多出来的一段只给人和日志看。
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            ok: false,
+            error: "from_node_id_identity_mismatch",
+            detail: boundNodeId ? "bound_to_other_node" : "no_binding",
+            bound_node_id: boundNodeId ?? null,
+          }) }] };
         }
       }
       if (durable_terminal_cursor) {
@@ -3653,7 +3789,17 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
 
       // Compute apply_mode + persist + push doorbell.
       const updateId = `cu_${uuidv4()}`;
-      const applyMode = computeApplyMode(model, flags, channels);
+      // #3146 —— 把目标节点的 runtime 身份带进分类器。OpenCode V2 共存
+      // 节点可以在 TUI 会话里就地换模型（agent-node 侧早就能，见
+      // agent-node/src/runtime/config-apply.ts）；不带这三个字段时
+      // computeApplyMode 退回旧行为（model ⇒ restart），那正是客户端
+      // 显示「重启中」却永远等不到重启的原因。
+      const opencodeSnap = readOpencodeSnapshotFlags(node.config_snapshot);
+      const applyMode = computeApplyMode(model, flags, channels, {
+        runtime: node.runtime,
+        opencodeGeneration: opencodeSnap.opencodeGeneration,
+        opencodeMode: opencodeSnap.opencodeMode,
+      });
       const patchJson = JSON.stringify({
         ...(model !== undefined ? { model } : {}),
         flags,
@@ -3667,10 +3813,70 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
 
       pushEvent(node.alias, { type: "config_update", update_id: updateId }, networkId);
 
+      // 裸起节点（无 supervisor）收到 restart-tier 变更会 **安静地死掉**：
+      // 它写配置 → ack restarting → exit 75，而没人拉起；
+      // 更新停在 pending/restarting，60s 后被 reaper 判 timeout ——
+      // 调用方看到的只有「超时」，永远学不到「这台节点现在是下线的」。
+      // 不擅自拒绝（会破坏合法流程），但必须把后果说在前面。
+      const configUpdateCapable = readConfigUpdateCapable(node.config_snapshot);
+      // 2026-10-31 —— 两个字段都被允许“遮住对方”的时候，被遮住的那个值就再也读不到了。
+      // 文档说它们永远同值，所以**不同值**本身是信号（半升级 / 旧节点 / 手改快照）。
+      // 判据不变（仍以 restart_supervised 为准），但分歧必须能被看见 ——
+      // 否则「两个一致」与「有一个被遮住了」在调用方看来完全一样。
+      const capabilityDivergence = configUpdateCapabilityDivergence(node.config_snapshot);
+      const warnings: Array<{ code: string; message: string }> = [];
+      if (capabilityDivergence) {
+        warnings.push({
+          code: "restart_supervision_flag_divergence",
+          message: `config snapshot carries two disagreeing capability flags: `
+            + `restart_supervised=${capabilityDivergence.named} but config_update_capable=${capabilityDivergence.legacy}. `
+            + `The named field wins, so this update was classified as supervised=${capabilityDivergence.named}. `
+            + `They are documented to always agree, so a divergence means a half-upgraded node (a wrapper that `
+            + `forwards one flag but not the other), an older node, or a hand-edited snapshot. `
+            + `Verify how this node is launched before relying on a restart-tier change.`,
+        });
+      }
+      // #3168 —— 具名判定优先：节点自己说了算，legacy 布尔只在「不知道」时兜底。
+      const systemdSupervision = readSystemdSupervision(node.config_snapshot);
+      if (applyMode !== "hot" && systemdSupervision === "not_supervised") {
+        warnings.push({
+          code: "restart_requires_manual_respawn",
+          // 2026-10-31 —— 「意图 + 能力」两份要能对上：节点可能**声明**有重启能力，
+          // 而同时**观测**到没人拉它。两者不一致时以观测为准，并且必须把冲突说出来 ——
+          // 否则 restart_supervised=true 会被读成「已验证」。
+          message: (configUpdateCapable === true
+            ? "this node DECLARES restart_supervised=true but REPORTS systemd_supervision=not_supervised. "
+              + "The declaration and the observation disagree; the observation wins. "
+            : "")
+            + "this node reports systemd_supervision=not_supervised, i.e. it says nothing will respawn it. "
+            + "A restart-tier patch makes the process exit 75 and stay down: the update will time out and the "
+            + "node will be offline until someone starts it again. Use Stop -> Start instead of a restart-tier "
+            + "patch, or launch it under a supervisor first (anet start / pm2 / systemd).",
+        });
+      } else if (applyMode !== "hot" && systemdSupervision === null && configUpdateCapable === false) {
+        warnings.push({
+            code: "restart_supervision_unknown",
+            // 不说 "no supervisor" —— 这个字段只说明「没有声明 sentinel-75 重启包装」，
+            // 而 systemd/pm2 托管的节点同样可能报 false（它们不走那套包装）。
+            // 「不能热更新」蕴含「这次需要重启」，但**不蕴含**「重启是安全的」，
+            // 反过来也不蕴含「重启是危险的」。这里只能如实说“没有声明”，
+            // 把判断交给调用方，并给出可执行的两种处置。
+            message: "this node does not advertise config_update_capable=true, i.e. it does not declare "
+              + "a supervisor that honours the sentinel-75 restart path. If nothing respawns it, a "
+              + "restart-tier patch makes the process exit 75 and stay down: the update will time out "
+              + "and the node will be offline until it is started again. Verify how this node is "
+              + "launched (anet start / pm2 / systemd) before sending restart-tier changes; "
+              + "model-only changes on an OpenCode V2 co-presence node are hot and unaffected.",
+        });
+      }
+
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ ok: true, update_id: updateId, apply_mode: applyMode }),
+          text: JSON.stringify({
+            ok: true, update_id: updateId, apply_mode: applyMode,
+            ...(warnings.length > 0 ? { warnings } : {}),
+          }),
         }],
       };
     },
@@ -4401,8 +4607,8 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       // No additional tools in model context; ordinary Provider actions unchanged.
       if (action === 'secret_read') return providerReply(getScopedSecrets(human, id));
       if (action === 'node_secret_list' || action === 'node_secret_put' || action === 'node_secret_delete') {
-        const input = provider as { key?: string; value?: string } | undefined;
-        const result = requestNodeSecrets(human, id, action === 'node_secret_list' ? 'list' : action === 'node_secret_put' ? 'put' : 'delete', input?.key, input?.value, revision);
+        const input = provider as { key?: string; value?: string; from_vault?: boolean } | undefined;
+        const result = requestNodeSecrets(human, id, action === 'node_secret_list' ? 'list' : action === 'node_secret_put' ? 'put' : 'delete', input?.key, input?.value, revision, input?.from_vault === true);
         if (result.ok) {
           const target = db.get<{ alias: string }>('SELECT alias FROM nodes WHERE node_id=?1 AND network_id=?2', id, human.networkId!);
           if (target) pushEvent(target.alias, { type: 'node_secrets', request_id: result.request_id }, human.networkId!);
@@ -5850,6 +6056,9 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
             // By node_id, not alias — a same-alias rebuild keeps its session.
             db.run(`DELETE FROM sessions WHERE node_id = ?1`, [row.child_node_id]);
             clearNodeFromAgentTeams(row.child_node_id); // #764
+            // 2026-10-31 —— #3277：卡上的引用也要清（实测 3 个已删节点仍被 27 张卡引用，
+            // 其中 2 个 id 在 api_tokens 里还有绑定行 ⇒ 这是删除路径的缺口，不是录入错误）。
+            clearNodeFromRequirements(row.child_node_id);
             auditCreateNodeStrict({
               action: "delete_node_completed",
               user_id: null, network_id: row.network_id, target_id: request_id,
@@ -6484,9 +6693,52 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           `SELECT model_id, model_name, display_name, context_window, supports_vision, enabled FROM provider_models WHERE provider_id = ?1 AND enabled = 1 ORDER BY model_name`,
           p.provider_id,
         );
-        return { ...p, in_vault: true, models };  // in_vault: true since we required it on upsert
+        // 2026-10-31 —— 每个 provider 自己也要能说「我一个可用模型都没有」。
+        // 否则客户端的模型下拉只会是空的，用户看不出是 provider 没配模型还是全部被停用。
+        const modelsDisabled = db.get<any>(
+          `SELECT COUNT(*) AS cnt FROM provider_models WHERE provider_id = ?1 AND enabled = 0`,
+          p.provider_id,
+        );
+        return {
+          ...p,
+          in_vault: true,  // in_vault: true since we required it on upsert
+          models,
+          models_state: models.length > 0
+            ? "available"
+            : ((modelsDisabled?.cnt ?? 0) > 0 ? "all_disabled" : "none_configured"),
+        };
       });
-      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, providers: out }) }] };
+
+      // 2026-10-31 —— **空的 providers 数组有四种含义**，以前只回一个 `[]`：
+      //   ① 这个网络还没配过任何 provider（管理员还没录第一行）
+      //   ② 配过，但全被 enabled=0 停用
+      //   ③ 配过、也启用，但一条模型都没有（客户端下拉必然空）
+      //   ④ 查询本身失败（这一支会 throw，不会走到这里 —— 但读者需要知道它不在这个 `[]` 里）
+      // 客户端拿到 `[]` 时无法区分 ①②③，于是空状态只能显示「没有」，
+      // 这正是外部复核那句「兜底值必须说出自己是兜底」的现场版。
+      // ⇒ 加 state + counts + hint（只有非 configured 时才给 hint，避免正常载荷变胖）。
+      const disabledProviders = db.get<any>(
+        `SELECT COUNT(*) AS cnt FROM providers WHERE network_id = ?1 AND enabled = 0`,
+        effectiveNetId || "default",
+      );
+      const providerState = out.length > 0
+        ? "configured"
+        : ((disabledProviders?.cnt ?? 0) > 0 ? "all_disabled" : "unconfigured");
+      const stateBlock = {
+        state: providerState,
+        counts: {
+          providers_enabled: out.length,
+          providers_disabled: disabledProviders?.cnt ?? 0,
+          models_enabled: out.reduce((n: number, p: any) => n + p.models.length, 0),
+          providers_without_models: out.filter((p: any) => p.models_state !== "available").length,
+        },
+        ...(providerState === "configured" ? {} : {
+          hint: providerState === "all_disabled"
+            ? "此网络的 provider 全部被停用（enabled=0）；管理员用 update_provider {enabled:true} 重新启用"
+            : "此网络还没有任何 provider；管理员需要先录入一个 provider 及其模型，客户端才有可选模型",
+        }),
+      };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, providers: out, ...stateBlock }) }] };
     },
   );
 
@@ -7053,12 +7305,26 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
 
   // #765: exact authenticated node; team tree is independent of human departments.
   server.tool("org_whoami", "Your Agent team, ancestors, lead, owner and up to 50 teammates. Read-only.", {},
-    async () => scheduleCall(id => agentTeamWhoami(id.networkId, id.nodeId)));
+    async () => {
+      const res = scheduleCall(id => agentTeamWhoami(id.networkId, id.nodeId));
+      // #3001 续 —— 全舰队 6 小时 52522 次工具调用里，org_whoami 占 21900（42%），
+      // 而其中十来个节点在同期收到 0 个任务（实测 1420–2190 次/6h）。
+      // 这些调用与 get_task 那一类一样：每次都跑完一轮 LLM，却没有推进任何工作。
+      // 阈值比 get_task 宽（8 次/60 秒）—— p50 约 2.3 次/分钟是设计频率，不该被提示打扰。
+      const pacing = pollPacer.record(`whoami:${callerTokenId ?? callerAlias ?? "anon"}`, "identity_poll");
+      if (!pacing) return res;
+      try {
+        const body = JSON.parse(res.content[0].text);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ...body, pacing }) }] };
+      } catch {
+        return res; // 解析失败就原样返回：提示绝不该让一个只读工具失败
+      }
+    });
 
   // #478:tools/list 只列这个调用者真能用的工具(tool-audience.ts)。只滤列表,tools/call 不变。
   const caller: ToolCaller = callerTokenIsNetwork
     ? { kind: "node", tokenId: callerTokenId ?? null, networkId: enforceNetworkId ?? null, includeProtocol: listing.includeProtocol === true }
-    : enforceUserId ? { kind: "user", includeProtocol: listing.includeProtocol === true } : { kind: "unknown" };
+    : enforceUserId ? { kind: "user", includeProtocol: listing.includeProtocol === true } : { kind: "anonymous", why: "no_identity" };
   scopeToolsList(server, listedToolFilter(caller));
 }
 

@@ -77,6 +77,38 @@ while IFS= read -r _marker; do
   L1_TESTS+=("$(basename "$(dirname "$_marker")")")
 done < <(find "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tests" -mindepth 2 -maxdepth 2 -name qa.l1 | sort)
 
+# #2800 —— 按**实测构建耗时降序**排序，让取模分片自然地做出「最重优先」的均衡分配。
+#
+# 为什么：取模分片（下面 `_idx % _n`）只保证「不重不漏」，不保证均衡。
+# 2026-10-30 实测（三个 shard 的套件数都是 29，很均）：
+#
+#     分片        构建总时长     墙钟
+#     shard 1/3    1792s         12.8 min
+#     shard 2/3     901s          7.3 min
+#     shard 3/3    1108s          7.1 min
+#
+# 差 891s 全部来自「哪几个重套件恰好落在哪一片」。按耗时降序排列后，
+# 取模分片等价于 LPT（最重优先）分配，预测三片 1397/1240/1164s（差 233s）。
+#
+# 耗时数据来自 CI 日志的 `[l1-build] <秒>s <套件名>`（#3231 加的），放在
+# tests/qa-l1-weights.tsv。**缺项的套件按 0 处理（排最后）** —— 所以这份表过期
+# 也只会让分配回到「接近字母序」，不会漏跑任何一个套件。
+_weights="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tests/qa-l1-weights.tsv"
+if [[ -f "$_weights" && ${#L1_TESTS[@]} -gt 0 ]]; then
+  _ordered=()
+  while IFS= read -r _name; do _ordered+=("$_name"); done < <(
+    awk -F'\t' 'BEGIN{OFS="\t"} NR==FNR{ if ($1 !~ /^#/ && NF>=2) w[$1]=$2; next }
+                 { print (($1 in w) ? w[$1] : 0), $1 }' "$_weights" <(printf '%s\n' "${L1_TESTS[@]}") \
+      | sort -k1,1nr -k2,2 | cut -f2
+  )
+  # 只在「数量没变」时才采用，避免 awk/sort 出岔子把套件弄丢（那会变成静默漏跑）
+  if [[ ${#_ordered[@]} -eq ${#L1_TESTS[@]} ]]; then
+    L1_TESTS=("${_ordered[@]}")
+  else
+    note "警告：按耗时重排后条目数从 ${#L1_TESTS[@]} 变成 ${#_ordered[@]}，放弃重排（保持原顺序）"
+  fi
+fi
+
 
 if [[ "${1:-}" == "--list" ]]; then
   echo "L0 unit (bun test, local, ms-budget):"
@@ -173,11 +205,17 @@ if [[ "$_l1_bpar" =~ ^[0-9]+$ ]] && (( _l1_bpar > 1 )); then
     while (( $(jobs -rp | wc -l) >= _l1_bpar )); do wait -n 2>/dev/null || true; done
     (
       _pcmd="$(_qa_l1_build_cmd "$_pt")"
+      # #2800 —— 每套件的构建耗时必须自己报出来。
+      # 现在只知道分片总数是均的（29/29/29），却不知道哪几片重 —— 因为**没有任何一处
+      # 记录单个套件的构建时长**。没有这张表，「按耗时重新分片」就只能靠猜，
+      # 而猜错的代价是「某个套件从此不在任何分片里」（它和「跑过了」在报告里长得一样）。
+      _pb1=$SECONDS
       if eval "$_pcmd" >"/tmp/qa-l1-$_pt-build.log" 2>&1; then
         touch "/tmp/qa-l1-$_pt-prebuilt"
       else
         printf '%s\n' "$_pt" >> /tmp/qa-l1-prebuild.log
       fi
+      printf '[l1-build] %5ss  %s\n' "$(( SECONDS - _pb1 ))" "$_pt"
     ) &
   done
   wait
@@ -379,7 +417,11 @@ note "L1 单套件 wait 超时 = ${L1_WAIT_TIMEOUT}s(用 L1_WAIT_TIMEOUT 覆盖)
       _run_cmd+=" ${_qa_run_flags} anet-$t"
       dockerrun "$_run_cmd" >/tmp/qa-l1-$t-run.log 2>&1 || _rc=$?
       _e=$(( $(date +%s) - START ))
-      printf '%s\t%s\t%s\n' "$t" "$_s" "$_e" >> /tmp/qa-l1-timing.tsv
+      # 2026-10-31 —— 时间线改成**带标签**的一行（外部复核 ⑥：「给 log_format 加列会移动其后的所有下标
+      # ⇒ 会亲手制造第 ⑤ 条；必须先把消费方改成按标签取值」）。
+      # 这个文件是 /tmp 里的临时产物，不是历史 —— 所以改它不会让任何历史 run 对不上，
+      # 而按位置取值的消费方（$2/$3）会在加一列时静默算错时长。
+      printf 'suite=%s\tstart=%s\tend=%s\n' "$t" "$_s" "$_e" >> /tmp/qa-l1-timing.tsv
       # 🔴 **完成即打印**,不要只留给结尾的汇总。
       #    2026-08-27 一次 L0+L1 顶到 30 分天花板被 kill(run 33126449082,1815s):
       #    18 个 build 起来了,而时间线**一行都没有** —— 因为汇总只在所有 wait 结束后才跑,
@@ -401,7 +443,7 @@ note "L1 单套件 wait 超时 = ${L1_WAIT_TIMEOUT}s(用 L1_WAIT_TIMEOUT 覆盖)
     #    bash/coreutils/procps 的容器里重放(见本文件上面那条注释),那里未必有。
     #    退化行为是「安静地取不到时间」而不是报错,但那正是最难发现的一种坏 ——
     #    输出少了一段,谁也不会注意到。awk 是字段比较,不涉及正则方言。
-    _line=$(awk -F'\t' -v t="$_t" '$1==t{last=$0} END{if(last)print last}' /tmp/qa-l1-timing.tsv 2>/dev/null || true)
+    _line=$(awk -F'\t' -v t="suite=$_t" '$1==t{last=$0} END{if(last)print last}' /tmp/qa-l1-timing.tsv 2>/dev/null || true)
     [ -z "$_line" ] && return 0
     local _a _b
     _a=$(printf '%s' "$_line" | cut -f2); _b=$(printf '%s' "$_line" | cut -f3)
@@ -477,8 +519,16 @@ note "L1 单套件 wait 超时 = ${L1_WAIT_TIMEOUT}s(用 L1_WAIT_TIMEOUT 覆盖)
   if [ -s /tmp/qa-l1-timing.tsv ]; then
     echo
     echo "L1 时间线（相对 L1 起点，按开始偏移排序）— #1333"
-    sort -t$'\t' -k2,2n /tmp/qa-l1-timing.tsv \
-      | awk -F'\t' '{printf "  +%4ds .. +%4ds  (%3ds)  %s\n", $2, $3, $3-$2, $1}'
+    # 按标签取值（不按位置）：插一个字段也不会让三列错位。
+    awk -F'\t' '
+      function lab(key,   i) { for (i = 1; i <= NF; i++) if (index($i, key "=") == 1) return substr($i, length(key) + 2); return "" }
+      { n = lab("suite"); st = lab("start"); en = lab("end")
+        if (n == "" || st == "" || en == "") { bad++; next }
+        printf "%d\t%d\t%d\t%s\n", st, en, en - st, n }
+      END { if (bad) printf "✗ 时间线有 %d 行缺少 suite=/start=/end= 标签 ⇒ 拒绝出表（不打印猜出来的数字）\n", bad > "/dev/stderr" }
+    ' /tmp/qa-l1-timing.tsv \
+      | sort -k1,1n \
+      | awk -F'\t' '{printf "  +%4ds .. +%4ds  (%3ds)  %s\n", $1, $2, $3, $4}'
     # 🔴 #1627 —— 一行**格式固定**的摘要,专门为了「跨 run 比快慢」。
     #
     #    今天(2026-08-31)我能判定五次红都是「慢 runner 撞绝对超时」,
@@ -495,7 +545,13 @@ note "L1 单套件 wait 超时 = ${L1_WAIT_TIMEOUT}s(用 L1_WAIT_TIMEOUT 覆盖)
     # ⚠ 时长是**算出来的**($3-$2),不是列 —— 不能直接 `sort -k4`。
     #   第一版我就这么写了,输出是一串带时长的套件名、**看起来完全合理**,
     #   实际是原文件顺序(漏掉真正第 3 慢的那个,混进一个 1s 的)。
-    _slowest=$(awk -F'\t' '{print $3-$2"\t"$1}' /tmp/qa-l1-timing.tsv 2>/dev/null \
+    # ⚠ 时长是**算出来的**（end-start），仍然不是列 —— 但现在两侧都按标签取。
+    _slowest=$(awk -F'\t' '
+        function lab(key,   i) { for (i = 1; i <= NF; i++) if (index($i, key "=") == 1) return substr($i, length(key) + 2); return "" }
+        { n = lab("suite"); st = lab("start"); en = lab("end")
+          if (n == "" || st == "" || en == "") next
+          print (en - st)"\t"n }
+      ' /tmp/qa-l1-timing.tsv 2>/dev/null \
       | sort -k1,1nr \
       | awk -F'\t' 'NR<=5{printf "%s%s=%ds", (NR>1?",":""), $2, $1}')
     echo "L1-TIMING v1 total=$(( $(date +%s) - START ))s suites=$(wc -l < /tmp/qa-l1-timing.tsv | tr -d ' ') slowest=${_slowest}"
@@ -537,8 +593,35 @@ if [[ "$L1_SOFT_BUDGET_S" != "0" && $ELAPSED -gt $L1_SOFT_BUDGET_S ]]; then
 fi
 
 echo
+# 2026-10-31 —— 「ALL PASS」在没有说清**跑了哪几层**时是两个事件的同值：
+#   (L0+L1 全过) 与 (只跑了 L0) —— 而后者在 CI 里出现过（--l0 / 早退）。
+#   外部复核给的同款反例：某 gate 的「全绿」= L0 全过，或 L0 全过 + 27 条没有读数。
+# ⇒ 汇总行必须自带作用域；未跑的层单独印一行，不许让它消失在一个绿里。
+SCOPE=""
+[[ $RUN_L0 -eq 1 ]] && SCOPE="${SCOPE}L0"
+[[ $RUN_L1 -eq 1 ]] && SCOPE="${SCOPE:+$SCOPE+}L1"
+NOT_RUN=""
+[[ $RUN_L0 -eq 0 ]] && NOT_RUN="${NOT_RUN}L0 "
+[[ $RUN_L1 -eq 0 ]] && NOT_RUN="${NOT_RUN}L1 "
+if [[ -n "$NOT_RUN" ]]; then
+  note "本次**未运行**：${NOT_RUN}（--l0 / 环境变量所致）⇒ 上面的绿不覆盖这些层"
+fi
+# 2026-10-31 —— **「没有读数」必须进退出码**（外部复核：
+# 「聚合器在散文里说对，在退出码里说反」——NORUN 印成「没有读数(不是通过)」却不在退出条件里）。
+# 本仓的具体形态：请求了某一层，而那一层**一个套件都没跑**（!= 全过）。
+#   L1 请求了但时间线为空 ⇒ 不是「L1 全绿」，是「L1 没有读数」。
+NO_READING=""
+if [[ $RUN_L1 -eq 1 ]]; then
+  _l1_ran=$(wc -l < /tmp/qa-l1-timing.tsv 2>/dev/null | tr -d ' ' || echo 0)
+  [[ "${_l1_ran:-0}" -eq 0 ]] && NO_READING="${NO_READING}L1(0 套件) "
+fi
+if [[ -n "$NO_READING" && $FAILED -eq 0 ]]; then
+  fail "没有读数（不是通过）：${NO_READING}—— 请求了该层，但它一个套件都没产出结果"
+  echo "  ⇒ 这与「该层全过」是两件事；先查为什么没跑起来（构建失败 / 早退 / 过滤条件）。"
+  exit 1
+fi
 if [[ $FAILED -eq 0 ]]; then
-  ok "ALL PASS in ${ELAPSED}s"
+  ok "ALL PASS in ${ELAPSED}s (scope: ${SCOPE:-none})"
   exit 0
 else
   fail "$FAILED test(s) failed in ${ELAPSED}s"

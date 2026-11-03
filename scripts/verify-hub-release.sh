@@ -23,6 +23,10 @@ CHANNEL="${3:-preview}"
 if [ "${2:-}" = "--tag" ]; then CHANNEL="${3:-preview}"; fi
 
 fail() { echo "FAIL: $*"; exit 1; }
+# 2026-10-31 —— curl 失败要报**层**，不是「连不上」：
+#   rc=56（传输层通了但 HTTP 没人读，首疑代理/WAF）与 rc=28（读了但挂住）与 rc=60（TLS）
+#   的第一动作完全不同，而 `|| fail "cannot read"` 把三者压成一句。
+. "$(dirname "$0")/lib/curl-exit.sh"
 
 command -v curl >/dev/null || fail "curl is required"
 command -v python3 >/dev/null || fail "python3 is required"
@@ -31,7 +35,7 @@ command -v tar >/dev/null || fail "tar is required"
 registry="https://registry.npmjs.org/${PKG}"
 
 echo "== dist-tags"
-tags=$(curl -sS --max-time 25 "$registry") || fail "cannot read the registry"
+if ! tags=$(curl -sS --max-time 25 "$registry"); then rc=$?; curl_fail "读取 registry" "$rc" >&2; exit 1; fi
 if [ -z "$VERSION" ]; then
   VERSION=$(printf '%s' "$tags" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("dist-tags",{}).get("preview",""))')
   [ -n "$VERSION" ] || fail "registry has no preview dist-tag"
@@ -44,10 +48,11 @@ echo "OK   dist-tags.$CHANNEL == $VERSION"
 echo "== tarball"
 work=$(mktemp -d "${TMPDIR:-/tmp}/verify-hub-release-XXXXXX") || fail "mktemp failed"
 trap 'rm -rf "$work"' EXIT
-tarball=$(curl -sS --max-time 25 "$registry/$VERSION" \
+if ! meta=$(curl -sS --max-time 25 "$registry/$VERSION"); then rc=$?; curl_fail "读取版本元数据" "$rc" >&2; exit 1; fi
+tarball=$(printf '%s' "$meta" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin).get("dist",{}).get("tarball",""))')
 [ -n "$tarball" ] || fail "no tarball url for $VERSION"
-curl -sSL --max-time 180 "$tarball" -o "$work/pkg.tgz" || fail "tarball download failed: $tarball"
+if ! curl -sSL --max-time 180 "$tarball" -o "$work/pkg.tgz"; then rc=$?; curl_fail "下载 tarball（$tarball）" "$rc" >&2; exit 1; fi
 echo "OK   downloaded $(wc -c <"$work/pkg.tgz") bytes"
 tar -xzf "$work/pkg.tgz" -C "$work" || fail "tarball is not a readable .tgz"
 [ -d "$work/package" ] || fail "tarball has no package/ directory"
@@ -226,6 +231,24 @@ check_feature "circuit dispatch guard"           "nodeCanAcceptDispatch"        
 
 # 0.9.0-preview.193 —— #2884 共享会话忙的失败分开报排队/会话等待（读时投影）。
 check_feature "busy elapsed split"                "busyElapsedNote"                           "0.9.0-preview.193"
+
+# 0.9.0-preview.201 —— #2969 后半：接口白名单（tool_allowlist / tool_not_allowed）。
+check_feature "tool allowlist"                    "tool_not_allowed"                          "0.9.0-preview.201"
+
+# 0.9.0-preview.210 —— #2721 假信号：启动尖峰不算停顿。
+# 🔴 环境变量在 .210 改名了：COMMHUB_STALL_WARMUP_MS → COMMHUB_STALL_BOOT_GRACE_MS，
+#    语义也跟着变（不再是「前 N 秒全不记」，而是「只在第一个 tick 且进程刚起来时跳过」）。
+#    改名当场把这条探针打红了一次 —— 探针的意义就在这里：改名会让「能力是否仍在」失去锚点。
+check_feature "stall boot grace"                  "COMMHUB_STALL_BOOT_GRACE_MS"               "0.9.0-preview.210"
+
+# 0.9.0-preview.203 —— #1510 严格档：transport 未上报独立成原因码。
+check_feature "secret transport strict"           "secret_transport_unknown"                  "0.9.0-preview.203"
+
+# 0.9.0-preview.204 —— #2969：空数组歧义拒收（清空请传 null）。
+check_feature "allowlist empty array rejected"    "empty_allowlist_ambiguous"                 "0.9.0-preview.204"
+
+# 0.9.0-preview.200 —— #2969 节点级对端白名单（peer_allowlist / peer_not_allowed）。
+check_feature "peer allowlist"                    "peer_not_allowed"                          "0.9.0-preview.200"
 
 # 0.9.0-preview.199 —— 纯开源化：license 端点删除；send_task 不再检查 licenses.expires_at。
 check_feature "no license gate in send_task"      "不再产生 license_expired"                   "0.9.0-preview.199"

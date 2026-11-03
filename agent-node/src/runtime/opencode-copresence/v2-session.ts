@@ -76,6 +76,132 @@ const HISTORY_PAGE_LIMIT = 200;
 const HISTORY_MAX_PAGES = 25;
 const POLL_INTERVAL_MS = 250;
 
+/**
+ * #3071 —— 超时不等于结果丢失。
+ *
+ * 现场（2026-10-30 生产实测）：`仍在节点的 TUI 会话里运行…等待回复已达 30 分钟上限`
+ * 的历史失败任务 289 条，其中 thread/turn 非空的 **0 条**；全库迟到结果只有 4 行。
+ * 也就是说：那一轮最终跑完了，但**没有人在听**，结果直接蒸发。
+ *
+ * 为什么这个改动很小：bridge 判断「这一轮好了没」本来就是**轮询会话历史**
+ * （`readEntriesAfter`），不是事件订阅。所以超时后只需要让这个轮询继续活着，
+ * 等 turn 真的结束再补发一次 —— 不需要新的通道、不需要订阅生命周期。
+ *
+ * 三条边界：
+ * · 硬上限 `capMs`：到点就放弃并记日志（不能让一个跑飞的 turn 永久占一个定时器）
+ * · 定时器 `unref()`：不阻止进程退出
+ * · 只补一次：`settled` 标志 + Hub 侧以 (task_id, thread, turn) 幂等
+ */
+export const LATE_REPLY_CAP_MS = 60 * 60_000;
+
+/**
+ * #3166 —— **共享 server 的「活着」判据**。
+ *
+ * 原来是一个粘滞布尔 `sharedDisconnected`：一次 ECONNRESET 之后置 true，**没有任何地方置回 false**
+ * ⇒ `isRunning` 从此恒为 false ⇒ 热切模型永久降级成重启（生产实测：一次抖动就够了）。
+ *
+ * 判据改成**带时间窗的提示**：连接类错误只说明「刚刚那一下断了」，不说明「现在也断着」。
+ * 窗口之外，下一次切模型会真的去试；真断了就再记一次，代价是一次失败的尝试（不会更坏）。
+ *
+ * 为什么用纯函数：这条语义要能被单测钉住，而单测不该需要一台活着的 v2 server。
+ */
+export const SHARED_DISCONNECT_GRACE_MS = 30_000;
+
+export function openCodeV2SessionAlive(input: {
+  closed: boolean;
+  /** 最近一次连接类错误的发生时刻（毫秒）；null = 没有记录过。 */
+  disconnectedAt: number | null;
+  now: number;
+  /** 私服子进程；共享 server 为 null。 */
+  child: { exitCode: number | null; signalCode: string | null } | null;
+  graceMs?: number;
+}): boolean {
+  if (input.closed) return false;
+  const grace = input.graceMs ?? SHARED_DISCONNECT_GRACE_MS;
+  if (input.disconnectedAt !== null && input.now - input.disconnectedAt < grace) return false;
+  const child = input.child;
+  return !child || (child.exitCode === null && child.signalCode === null);
+}
+
+export type LateReplyPayload = {
+  /** 会话 id，作为 thread_id 补发（Hub 在任务行没有上下文时才用它做幂等）。 */
+  threadId: string;
+  /** 本轮被接受时的 message id，作为 turn_id。 */
+  turnId: string;
+  replyText: string;
+  status: "replied" | "failed";
+};
+
+type LateReplyVerdict =
+  | { state: "pending" }
+  | { state: "done"; replyText: string }
+  | { state: "done_error"; error: unknown };
+
+type LateReplyWatcherDeps = {
+  /** 观察器刚挂上时回调一次（#3095 用它记录「正在等哪一轮」，供重启后识别）。 */
+  onArmed?: () => void;
+  /** 会话 id，补发时作为 thread_id（Hub 只在任务行没有上下文时才用它做幂等）。 */
+  threadId: string;
+  /** 本轮被接受时的 message id，补发时作为 turn_id。 */
+  turnId: string;
+  readEntries: () => Promise<OpenCodeV2Entry[] | null>;
+  isRunning: () => boolean;
+  onLateReply: (payload: LateReplyPayload) => void | Promise<void>;
+  capMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  log?: (message: string) => void;
+  /** 测试缝：把「这一轮好了没」的判据换掉，避免测试去造真实的 history 形状。 */
+  evaluate?: (after: OpenCodeV2Entry[]) => LateReplyVerdict;
+};
+
+function evaluateLateReply(after: OpenCodeV2Entry[], turnId: string): LateReplyVerdict {
+  const verdict = openCodeV2TurnVerdict(after);
+  if (verdict.state !== "done") return { state: "pending" };
+  try {
+    return { state: "done", replyText: openCodeV2Outcome(verdict, turnId).replyText };
+  } catch (error) {
+    return { state: "done_error", error };
+  }
+}
+
+/** 超时之后继续盯着这一轮；结束时把结果交出去。返回一个可 await 的 promise（测试用）。 */
+export function watchLateReply(deps: LateReplyWatcherDeps): Promise<void> {
+  const capMs = deps.capMs ?? LATE_REPLY_CAP_MS;
+  const deadline = Date.now() + capMs;
+  let settled = false;
+  return (async () => {
+    try { deps.onArmed?.(); } catch { /* 记录失败不影响观察 */ }
+    while (!settled && Date.now() < deadline) {
+      if (!deps.isRunning()) return;
+      await (deps.sleep ? deps.sleep(POLL_INTERVAL_MS) : new Promise((r) => setTimeout(r, POLL_INTERVAL_MS)));
+      if (!deps.isRunning() || Date.now() >= deadline) break;
+      let after: OpenCodeV2Entry[] | null = null;
+      try {
+        after = await deps.readEntries();
+      } catch (error: any) {
+        deps.log?.(`[opencode-copresence] late-reply history read failed: ${error?.message ?? error}`);
+        continue;
+      }
+      if (!after) continue;
+      const verdict = (deps.evaluate ?? ((entries) => evaluateLateReply(entries, deps.turnId)))(after);
+      if (verdict.state === "pending") continue;
+      settled = true;
+      const payloadOk = verdict.state === "done"
+        ? { threadId: deps.threadId, turnId: deps.turnId, replyText: verdict.replyText, status: "replied" as const }
+        // provider 报错也算「这一轮结束了」：把失败原因交出去，
+        // 比让它彻底消失有用（发送方至少知道为什么没成）。
+        : { threadId: deps.threadId, turnId: deps.turnId, replyText: `[迟到结果] 这一轮以错误结束：${(verdict.error as any)?.message ?? verdict.error}`, status: "failed" as const };
+      try {
+        await deps.onLateReply(payloadOk);
+      } catch (error: any) {
+        deps.log?.(`[opencode-copresence] late-reply delivery failed: ${error?.message ?? error}`);
+      }
+      return;
+    }
+    if (!settled) deps.log?.(`[opencode-copresence] late-reply window closed (${Math.round(capMs / 60000)} min) without a result`);
+  })();
+}
+
 /** One V2 history entry, read defensively. */
 export interface OpenCodeV2Entry {
   id?: string;
@@ -335,7 +461,8 @@ export async function openVettedOpenCodeV2Copresence(
   }
 
   let closed = false;
-  let sharedDisconnected = false;
+  // #3166 —— 从粘滞布尔改成时间戳（理由见 openCodeV2SessionAlive）
+  let sharedDisconnectedAt: number | null = null;
   let queue = Promise.resolve();
   let notifyWarned = false;
   const attachScriptPath = join(opts.workDir, "opencode-attach.sh");
@@ -433,7 +560,12 @@ export async function openVettedOpenCodeV2Copresence(
       sessionId,
       attachScriptPath,
       get isRunning() {
-        return !closed && !sharedDisconnected && (!child || (child.exitCode === null && child.signalCode === null));
+        return openCodeV2SessionAlive({
+          closed,
+          disconnectedAt: sharedDisconnectedAt,
+          now: Date.now(),
+          child: child ? { exitCode: child.exitCode, signalCode: child.signalCode } : null,
+        });
       },
       backgroundControl: createSessionBackgroundControl({
         sessionId,
@@ -582,12 +714,28 @@ export async function openVettedOpenCodeV2Copresence(
             throw new OpenCodeCopresenceTimeoutError(withdrawn ? "admission" : "reply", budgetMs);
           }
           warn(`[opencode-copresence] task deadline ${budgetMs}ms reached; the turn continues in the TUI session`);
+          // #3071 —— 这一轮还在跑，别把结果丢掉：把「等结果」留在后台。
+          // 不 await：调用方要立刻拿到超时结论（Hub 侧任务要终结），
+          // 补发走旁路，失败只写日志，绝不阻塞收件循环。
+          if (evidence?.onLateReply) {
+            void watchLateReply({
+              threadId: sessionId,
+              turnId: messageId,
+              onArmed: evidence?.onLateReplyArmed
+                ? () => evidence.onLateReplyArmed!({ threadId: sessionId, turnId: messageId })
+                : undefined,
+              readEntries: () => readEntriesAfter(url, password, sessionId, messageId).catch(() => null),
+              isRunning: () => session.isRunning,
+              onLateReply: evidence.onLateReply,
+              log: warn,
+            });
+          }
           throw new OpenCodeCopresenceTimeoutError("reply", budgetMs);
           }
         });
         const observed = operation.catch((error: any) => {
           if (shared && /ECONNREFUSED|ECONNRESET|UND_ERR_SOCKET|EPIPE/.test(error?.message ?? "")) {
-            sharedDisconnected = true;
+            sharedDisconnectedAt = Date.now();
           }
           throw error;
         });

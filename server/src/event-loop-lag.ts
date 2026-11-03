@@ -80,6 +80,19 @@ export function recordGap(
   return stallMs;
 }
 
+/**
+ * 2026-10-31 —— 窗口两端必须跟着读数一起走（#3174）。
+ *
+ * 原来 event_loop 给了 stall_count / last_stall_at，却没有窗口起点：
+ * 计数器随进程重启归零，而「归零」与「从未发生」在读数上同值 ⇒
+ * 单独引用 stall_count 的读者会把它读成「从上线以来没卡过」。
+ *
+ * ⇒ 现在两个时刻戳都在这对象里：`since`（起点，模块初始化时冻结）与 `observed_at`（读的时刻）。
+ *    引用者不必再去 /health 顶层猜窗口，窗口与读数同域。
+ *    判据：分子分母各要自己的时刻戳；**被声明的那个永远不算**。
+ */
+let sinceIso = new Date().toISOString();
+
 export function eventLoopStats(): {
   max_gap_ms: number;
   last_gap_ms: number;
@@ -87,6 +100,10 @@ export function eventLoopStats(): {
   last_stall_ms: number;
   last_stall_at: string | null;
   recent_stalls: EventLoopStall[];
+  /** 窗口起点（本进程 event-loop 观察开始时刻）。 */
+  since: string;
+  /** 这次读的时刻。与 `since` 一起才构成窗口；单独任一个都不构成。 */
+  observed_at: string;
 } {
   return {
     max_gap_ms: Math.round(maxGapMs),
@@ -95,6 +112,8 @@ export function eventLoopStats(): {
     last_stall_ms: Math.round(lastStallMs),
     last_stall_at: lastStallAt,
     recent_stalls: [...stalls].reverse(),
+    since: sinceIso,
+    observed_at: new Date().toISOString(),
   };
 }
 
@@ -106,6 +125,7 @@ export function resetEventLoopLagForTests(): void {
   lastStallAt = null;
   lastStallMs = 0;
   stalls.length = 0;
+  sinceIso = new Date().toISOString(); // 重置窗口起点 —— 否则测试里「归零」与「没归零」同形
 }
 
 function envMs(name: string, fallback: number): number {
@@ -123,12 +143,37 @@ export function startEventLoopLagMonitor(opts: {
   thresholdMs?: number;
   log?: (msg: string) => void;
   rssMb?: () => number;
+  /**
+   * #2721 —— 启动期的 tick gap 不算停顿。判据是**进程启动多久了**，不是第几个 tick。
+   *
+   * 事故形状：进程 22:21:06 启动，14:21:09.835Z 记到 gap 2972ms —— 启动后 3 秒。
+   * 那段 gap 度量的是「监控开始 → 第一次 tick」被模块加载/开库/迁移占满的时间。
+   *
+   * 两版错误实现（都试过，都被既有测试抓住）：
+   *   ① 10 秒**时间窗** → 监控在前 10 秒什么都不记，「阈值 40ms + spin 120ms 应打日志」直接吞掉
+   *   ② 只跳**第一个 tick** → 测试里的 spin 恰好落在第一个 tick，同样吞掉
+   *
+   * 真正的区别不是「第几个 tick」，而是**这段时间里进程有没有可能还在启动**。
+   * 所以：只有当 tick 到来时进程 uptime 仍小于 bootGraceMs，才把 gap 当作启动尖峰。
+   * 启动 20 秒之后的第一条 gap 依旧照常记录 —— 那时候它不可能是启动耗时。
+   */
+  bootGraceMs?: number;
+  /** 测试注入：返回进程已运行的毫秒数（默认 process.uptime()）。 */
+  uptimeMs?: () => number;
 } = {}): ReturnType<typeof setInterval> {
   const intervalMs = opts.intervalMs ?? Math.max(50, envMs("COMMHUB_STALL_TICK_MS", 250));
   const thresholdMs = opts.thresholdMs ?? envMs("COMMHUB_STALL_LOG_MS", 2000);
   const log = opts.log ?? ((m: string) => console.log(m));
   const rssMb = opts.rssMb ?? (() => Math.round(process.memoryUsage().rss / 1048576));
   let last = performance.now();
+  const startedAt = last;
+  // #2721 —— 启动预热不算停顿。
+  // 实测：2026-10-29 这次进程 22:21:06 起来，14:21:09.835Z 记到一次 gap 2972ms，
+  // 也就是**启动后 3 秒**。那段时间在做模块加载 / 打开 DB / 迁移，第一个 tick 必然偏大。
+  // 不排除它的后果是：每次部署都会在 `/health` 里留一条「停顿」，而它和线上真实卡顿长得一模一样。
+  const bootGraceMs = opts.bootGraceMs ?? envMs("COMMHUB_STALL_BOOT_GRACE_MS", 15_000);
+  const uptimeMs = opts.uptimeMs ?? (() => process.uptime() * 1000);
+  let firstTick = true;
   const timer = setInterval(() => {
     const now = performance.now();
     const gap = now - last;
@@ -136,6 +181,12 @@ export function startEventLoopLagMonitor(opts: {
     const rss = rssMb();
     const served = servedSinceTick;
     servedSinceTick = 0;
+    // 启动尖峰：只可能是**第一个** tick，且到来时进程才刚起来。
+    // 两个条件缺一不可 —— 只看「第一个 tick」会吞掉运行中立刻发生的真实停顿。
+    if (firstTick) {
+      firstTick = false;
+      if (uptimeMs() < bootGraceMs) return;
+    }
     const stall = recordGap(gap, { intervalMs, thresholdMs, rssMb: rss, served });
     if (thresholdMs > 0 && stall >= thresholdMs) {
       // 和 retention/slow-sql 的日志同一前缀，方便 grep。

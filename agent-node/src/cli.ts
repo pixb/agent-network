@@ -11,6 +11,9 @@
  * 配置加载: --config > CLI args > env > .anet/nodes/<name>/config.json > ~/.anet/config.json > defaults
  */
 
+import { extractTurnResult, readSessionEntries } from "./runtime/opencode-copresence/late-reply-recover.js";
+import { clearLateReplyRecord, listLateReplyRecords, saveLateReplyRecord } from "./runtime/opencode-copresence/late-reply-store.js";
+import { GET_TASK_TOOL_LINE, IDENTITY_POLL_DISCIPLINE_LINES, POLL_DISCIPLINE_LINES, POLL_STEP_LINES } from "./poll-discipline-guidance.js";
 import { MODEL_SWITCH_DEADLINE_MS, withDeadlineMs } from "./runtime/deadline.js";
 import { renameOverExistingSync } from "./shared/windows-rename-retry";
 import { createNodeSessionControlBridge, createSessionControlPin } from "./runtime/session-control-bridge.js";
@@ -1375,13 +1378,21 @@ import { installProcessSurvivalLog } from "./process-survival-log";
 //    只拷 src/ 会 `error: Could not resolve: "../package.json"`。
 //    这条不是假设 —— test631 / test646 就是这么红的（它们当时都不在 CI 里，所以没人看见）。
 import agentNodePackage from "../package.json";
+import { buildCommitOfThisInstall } from "./build-info";
+// #3294 —— 「跑的是哪一份字节」。npm 安装树里没有 .git，运行期读 git 这条路不存在，
+// 所以标识由**打包时**写下（prepack），运行期只读。读不到就是 undefined（老制品/源码检出）。
+const AGENT_NODE_BUILD_COMMIT: string | undefined = buildCommitOfThisInstall();
 import { applyNodeCodexHome, resolveNodeCodexHome } from "./codex-home-enforce";
 import { applyReasoningEffortToCodexHome, isReasoningEffortValue } from "./runtime/codex-reasoning-effort.js";
 import { installTeamSkills } from "./runtime/node-skills";
 import { classifyModelAuthError, copresenceTmuxSession, createCodexHealthMonitor, describeModelAuthBlock, gateStatusOnModelAuth, healthIntervalFromEnv, ModelAuthTracker, probeAppServerWs, type NodeHealthReport } from "./runtime/codex-health";
 import { probeWindowsTuiHealth, readWindowsTuiIdentity } from "./runtime/windows-tui-health";
+import { systemdSupervisionSnapshot } from "./runtime/systemd-supervision-snapshot.js";
+import { consumePlannedRestart, currentBootId, writeRestartIntent } from "./runtime/restart-intent.js";
 import { readOpenCodeV2CatalogEndpoint } from "./runtime/opencode-v2-catalog-endpoint";
 import { readOpenCodeCatalog } from "./runtime/opencode-v2-catalog";
+// #3144 —— 清单与采集时刻同进同出（纯函数在 runtime/opencode-catalog-report.ts，可单测）
+import { catalogReport, keepLastCatalog } from "./runtime/opencode-catalog-report";
 import { createAppServerWatchdog, hungKillGraceFromEnv, watchdogLimitsFromEnv } from "./runtime/codex-appserver-watchdog";
 import { appsrvSessionFor, captureAppServerLaunch, hungKillVeto, linuxProcView, listTmuxPanes, markerStillOurs, realHungKillDeps, realRelaunchDeps, relaunchAppServer, relaunchBlocker, snapshotProcessStillAlive, terminateHungAppServer, tmuxSessionId, type AppServerLaunchSnapshot } from "./runtime/codex-appserver-relaunch";
 const AGENT_NODE_VERSION: string = agentNodePackage.version;
@@ -1776,6 +1787,9 @@ const register = async () => {
     server: osHostname(), hostname: osHostname(),
     agent: RUNTIME_AGENT_LABEL, project_dir: process.cwd(),
     version: AGENT_NODE_VERSION,
+    // #3294 —— 与 version 并列：version 是标签，build_commit 是「哪一份字节」。
+    // 老 Hub 会把不认识的顶层键**静默丢弃**（#2211 的先例），所以先发发送侧是安全的。
+    ...(AGENT_NODE_BUILD_COMMIT ? { build_commit: AGENT_NODE_BUILD_COMMIT } : {}),
     node_id: NODE_ID || undefined,
     node_name: NODE_NAME || undefined,
     session_id: activeSessionId,
@@ -1851,7 +1865,9 @@ let claudeLoginDead = false;
  *
  * 失败一律 undefined:心跳既不许被这件事拖住(3s 超时),也不许因为读列表失败被拒。
  */
-async function reportedOpenCodeCatalog(endpoint: { url: string; authorization: string; directory: string } | null): Promise<string[] | undefined> {
+// 上一次成功采到的清单。读失败时沿用它（见 keepLastCatalog 的注释）。
+let lastCatalogReport: { models: string[]; seenAt: string } | undefined;
+async function reportedOpenCodeCatalog(endpoint: { url: string; authorization: string; directory: string } | null): Promise<{ models: string[]; seenAt: string } | undefined> {
   if (RUNTIME !== "opencode" || OPENCODE_GENERATION !== "v2" || !endpoint) return undefined;
   try {
     const snapshot = await readOpenCodeCatalog({
@@ -1860,9 +1876,16 @@ async function reportedOpenCodeCatalog(endpoint: { url: string; authorization: s
       authorization: endpoint.authorization,
       timeoutMs: 3_000,
     });
-    const models = snapshot.models.map(m => `${m.providerId}/${m.id}`).slice(0, 400);
-    return models.length ? models : undefined;
-  } catch { return undefined; }
+    // #3144 —— 清单和它的**采集时刻**必须一起报。
+    // 只报清单时，51 个模型是刚采的还是三周前的分不出，而 sessions 的心跳时间
+    // (`last_seen_at`) 不是采集时刻 —— 那只是「这个节点还活着」。
+    // `observedAt` 是 readOpenCodeCatalog 归一化时写下的，正是这次采集的时刻。
+    lastCatalogReport = keepLastCatalog(lastCatalogReport, catalogReport(snapshot));
+    return lastCatalogReport;
+  } catch {
+    // 读失败：沿用上一次成功的清单（带它自己的 seenAt），而不是让这次心跳把它抹掉。
+    return lastCatalogReport;
+  }
 }
 const reportStatus = async (rawStatus: string, rawTask?: string) => {
   // #667 — idle with nothing running writes the warning, or omits task.
@@ -1919,6 +1942,7 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
     // resume_id 时会整行 DELETE+INSERT,没带的列被清成 NULL;.49 之前的 hub 没有接手逻辑,
     // 这里带上至少让 agent-node 自己的每次上报都把 version 写回去。
     version: AGENT_NODE_VERSION,
+    ...(AGENT_NODE_BUILD_COMMIT ? { build_commit: AGENT_NODE_BUILD_COMMIT } : {}),
     // #2211 — what this process last did with the network's team rules. An old Hub
     // strips an unknown top-level key silently (it is not strict), so shipping the
     // sender first is safe: no node dies, and nothing changes until the Hub reads it.
@@ -1984,6 +2008,9 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
         runtimeReadinessMonitor?.current(),
       ), codexForkCapabilityMonitor?.current()), heartbeatAdoptionCandidates(fileConfig, COMMHUB_URL, NETWORK_ID)),
       ...(sideThreadCapabilitySnapshot ? { side_thread_capability: sideThreadCapabilitySnapshot } : {}),
+      // 2026-10-31 —— systemd 托管状态（三态读数）。与 restart_supervised（声明）分开：
+      // 声明说「我以为我在被托管」，读数说「systemd 说这个 unit 会不会重启我」。
+      ...systemdSupervisionSnapshot(),
       // #1958 — informational; the hub's RFC-024 content-match reads
       // snapshot.model (still the configured value) field-by-field, so extra
       // keys are safe and older hubs drop them (non-strict object).
@@ -1991,7 +2018,12 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
       // #2293 —— 节点自报的 OpenCode V2 模型清单与 loopback 端点。
       // 🔴 必须在 **config_snapshot 里面**：report_status 的顶层 schema 不认这两个键，
       //    放在顶层会被**静默丢弃**（.159 首版就这样白跑过一次，2026-10-25 用独立验证节点发现）。
-      ...(reportedCatalog ? { opencode_catalog: reportedCatalog } : {}),
+      // #3144 —— 清单 + 采集时刻同进同出（只报清单时，读者无法判断它多旧）。
+      // 空字符串表示「采到了模型但上游没给时刻」：显式说出来，而不是让读者当成刚采的。
+      ...(reportedCatalog ? {
+        opencode_catalog: reportedCatalog.models,
+        ...(reportedCatalog.seenAt ? { opencode_catalog_seen_at: reportedCatalog.seenAt } : {}),
+      } : {}),
       ...(catalogEndpoint ? { opencode_server: catalogEndpoint.url } : {}),
     },
   });
@@ -3055,7 +3087,7 @@ async function processWithClaude(
     `- mcp__commhub__get_all_status() — 查看哪些 agent 在线。`,
     `- mcp__commhub__send_task(alias, task, parent_task_id="${currentTaskId}") — 派任务给指定 agent。`,
     `  ⚠ 必须把 parent_task_id 设成你当前任务的 ID，系统会自动把子任务的最终结果串回给 ${from}。`,
-    `- mcp__commhub__get_task(task_id) — 轮询子任务状态，直到 replied/failed。`,
+    GET_TASK_TOOL_LINE,
     `- mcp__commhub__send_message(alias, message) — 发纯消息（不要求对方回复）。`,
     `- mcp__commhub__send_reply(task_id, text) — 给某 task 发回复（不会再触发处理）。`,
     `- mcp__commhub__get_session_status(alias) — 单 agent 详情。`,
@@ -3569,14 +3601,15 @@ async function processWithClaude(
             //       earlier turns (would show the model's "let me
             //       check that" mid-thought as the final answer).
             //
-            // Gated to `soft-fail-empty` classifier with the
-            // "empty vendor result despite success signal" reason —
+            // Gated to the `soft-fail-empty` classifier with
+            // code === "empty_result_after_success" —
             // the other soft-fail-empty flavor (in=0 out=0 cost=0
             // silent reject) means the vendor is broken, not the
             // model choosing thinking-only; re-prompt would burn
             // tokens for nothing.
+            // 2026-10-31 —— 按 **code** 分支，不按 reason 那句散文（文案会变，code 不会）。
             const isThinkingOnlyShape = cls.kind === "soft-fail-empty"
-              && cls.reason === "empty vendor result despite success signal"
+              && cls.code === "empty_result_after_success"
               && !!claudeSessionId
               && (m.num_turns ?? 0) >= 1
               && process.env.ANET_DISABLE_383_REPROMPT !== "1";
@@ -3739,9 +3772,13 @@ const CODEX_INSTRUCTIONS = SYSTEM_PROMPT || [
   `1. 先 get_all_status 看哪些 agent 在线。`,
   `2. 用 send_task(alias, task, parent_task_id=<env CURRENT_TASK_ID>) 派给合适的 agent。`,
   `   ⚠ 必须把 parent_task_id 设成你当前任务的 ID（环境变量 CURRENT_TASK_ID 里），系统会自动把子任务最终结果串回给你的上游。`,
-  `3. 用 get_task 轮询子任务直到 status=replied/failed。允许中途汇报"还在等"，但要继续轮询。`,
+  ...POLL_STEP_LINES,
   `4. 拿到 reply 后整合进你给上游的最终汇报。`,
   `   即使你的 session 中途断开，只要 parent_task_id 设了，结果也会被系统自动 chain 回上游，不必焦虑。`,
+  ``,
+  ...POLL_DISCIPLINE_LINES,
+  ``,
+  ...IDENTITY_POLL_DISCIPLINE_LINES,
   ``,
   `【禁止】`,
   `- 不要回复"收到""好的""ok""在线""待命"等无内容确认。`,
@@ -4274,6 +4311,36 @@ async function processWithOpencode(
       // #1879 —— 选「排队」的第一半：等待期间把「在等、等了多久」持续报出去。
       // 节点会话行本来就带 task 文本，Hub/客户端的节点卡片直接显示它 ⇒ 不用翻日志，
       // 也不会被误读成「节点卡死」。30 分钟硬预算不变（那是在兜住合法的长构建）。
+      // #3071 —— 超时之后这一轮才结束时，把结果作为迟到结果补发回 Hub。
+      // 现场：289 条「TUI 里跑超 30 分钟」的失败任务，thread/turn 全为 null，
+      // 全库迟到结果只有 4 行 —— 那一轮跑完了，但没人在听。
+      // 这里不阻塞任何调用：补发是旁路，失败只写日志。
+      // #3095 —— 观察器挂上时落盘（进程重启后能识别「上次错过了哪一轮」）。
+      onLateReplyArmed: ({ threadId, turnId }) => {
+        if (!taskId) return;
+        saveLateReplyRecord(NODE_DIR, {
+          taskId, threadId, turnId,
+          sessionId: threadId,
+          armedAt: new Date().toISOString(),
+          deadlineAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+        });
+      },
+      onLateReply: (payload) => {
+        if (!taskId) return;
+        log(`[${OPENCODE_PROCESS_BUNDLE_MARKER}] late reply for ${taskId}: ${payload.status} (${payload.replyText.length} chars)`);
+        void callCommHub("send_reply", {
+          in_reply_to: taskId,
+          text: payload.replyText,
+          status: payload.status,
+          thread_id: payload.threadId,
+          turn_id: payload.turnId,
+        }, 0).then((response: any) => {
+          if (response?.ok === false) warn(`[late-reply] hub refused: ${response?.error ?? "?"}`);
+          else clearLateReplyRecord(NODE_DIR, taskId);
+        }).catch((error: any) => {
+          warn(`[late-reply] delivery failed: ${error?.message ?? error}`);
+        });
+      },
       onAdmissionBusy: () => {
         if (busySince === 0) {
           busySince = Date.now();
@@ -7432,7 +7499,20 @@ async function processConfigUpdate(): Promise<void> {
       }
       await drainInFlightThink();
       await closeOpencodeRuntime("config restart_only");
-      log(`[config-apply] exiting with RESTART_SENTINEL=${RESTART_SENTINEL} for parent supervisor`);
+      // 2026-10-31 —— 退出前写**持久标记**：退出码只有 8 bit、语义由接收方解释、且不持久。
+      // wrapper 启动时读它，才知道「这次退出是按计划的」。
+      writeRestartIntent(NODE_DIR, {
+        reason: "apply_restart_only",
+        at: Date.now(),
+        pid: process.pid,
+        // 内核口径，不是自报：读不到就是 null ⇒ 下一次启动会落 unknown_age，而不是冒充 planned
+        boot_id: currentBootId(),
+        instruction_id: updateId,
+        // ConfigUpdate 里没有「目标版本」这一格 ⇒ 记 null。
+        // 记当前版本会是一次编造：那不是这次重启的目标，是它之前的现状。
+        target_version: null,
+      });
+      log(`[config-apply] exiting with RESTART_SENTINEL=${RESTART_SENTINEL} for parent supervisor (restart intent recorded)`);
       process.exit(RESTART_SENTINEL);
     }
 
@@ -7458,7 +7538,41 @@ async function processConfigUpdate(): Promise<void> {
     if (localMode !== update.apply_mode) {
       warn(`[config-apply] mode mismatch hub=${update.apply_mode} local=${localMode}; trusting local for safety`);
     }
-    const mode = localMode;
+    let mode = localMode;
+
+    // #3146 —— hub 现在会把「OpenCode V2 共存节点的纯 model patch」判成 hot
+    // （server/src/config-apply-validate.ts）。但 hub 看不到这台机器上 TUI 会话
+    // 是否还活着，而 hot 切模型唯一的手段就是驱动那个会话。
+    //
+    // 会话不在时的两条路，选降级：
+    //   · 照 hot 走 → ack 一个 rejected，用户的模型改动**根本没发生**
+    //     （生产实测：配置是 copresence，会话却没起，节点回了
+    //       "OpenCode V2 session is not running; model was not changed"）
+    //   · 降级成 restart → 模型改动一定生效，代价是一次重启
+    //
+    // 用户点「切模型」要的是结果，不是「切换方式」。所以这里宁可重启。
+    // 注意方向：#2050 那条闸门是「hot 能力缺失不得否决 hub 请求的重启」，
+    // 这里是反方向（hot 不可行时升级为重启），不会造成 hot↔restart 互相打架。
+    //
+    // 🔴 2026-10-31 —— 这条日志原来把两种完全不同原因说成了一句
+    // "the co-presence session is not running"，于是生产上（.167，共享 server）
+    // 明明是 **setSelectedModel 没被转发出来**，日志却指着 isRunning，
+    // 我据此判断了两次"isRunning 与 ready 语义不一致"，两次都错。
+    // 一个笼统的墓碑文案会让后面每一个人去查错对象 —— 所以分开写。
+    if (mode === "hot" && update.patch.model && RUNTIME === "opencode" && OPENCODE_GENERATION === "v2") {
+      const sessionRunning = opencodeCopresenceSession?.isRunning === true;
+      const switchable = typeof opencodeCopresenceSession?.setSelectedModel === "function";
+      if (!sessionRunning || !switchable) {
+        // 打印「分支 + 输入」，不打印「谓词的布尔」：
+        // 布尔只能区分“方法在不在”，而“方法在但一调用就抛”会被读成 true，
+        // 正好回到这个坑本身（present ≠ 可用）。
+        // 抛错那一支在下面 try/catch 里另有一行，带原始错误。
+        warn(`[config-apply] hot model switch unavailable `
+          + `(session=${sessionRunning ? "running" : "not-running"}, `
+          + `setSelectedModel=${switchable ? "present" : "missing"}); degrading to restart`);
+        mode = "restart";
+      }
+    }
 
     if (!configFilePath) {
       warn(`[config-apply] no configFilePath (node started without --config); rejecting ${updateId}`);
@@ -7471,35 +7585,46 @@ async function processConfigUpdate(): Promise<void> {
     }
     if (mode === "hot" && update.patch.model && RUNTIME === "opencode" && OPENCODE_GENERATION === "v2") {
       const session = opencodeCopresenceSession;
-      if (!session?.isRunning || !session.setSelectedModel) {
-        await callCommHub("ack_config_update", {
-          update_id: updateId,
-          status: "rejected",
-          error: "OpenCode V2 session is not running; model was not changed",
-        });
-        return;
+      // #3166 —— 这一支原来 ack rejected 后 return（模型改动**根本没发生**）。
+      // 与上面 7431 那段「会话不在 ⇒ 降级重启」的说法自相矛盾，而这里才是实际执行到的那个。
+      // 现在统一成同一条哲学：切模型要的是结果 ⇒ 失败了降级重启，绝不 ack rejected 了事。
+      // 🔴 先取成局部量再判：TS 不会因为 `hotUsable` 这个布尔常量而窄化
+      //    `session.setSelectedModel`（TS2722：可能是 undefined）。局部量 + typeof 守卫
+      //    才是同一份判据同时管住类型与运行期。
+      const setModel = session?.isRunning === true ? session.setSelectedModel : undefined;
+      const hotUsable = typeof setModel === "function";
+      if (!hotUsable) {
+        warn(`[config-apply] hot model switch unavailable at apply time `
+          + `(session=${session?.isRunning === true ? "running" : "not-running"}, `
+          + `setSelectedModel=${typeof session?.setSelectedModel === "function" ? "present" : "missing"}); degrading to restart`);
+        mode = "restart";
       }
+      // 只有真正可用时才走「切 + 写配置 + ack applied」这一串；
+      // 降级时**必须跳过它**，否则会 ack 一个没发生的 applied。
+      // 守卫写成 typeof 而不是复用 hotUsable：两者恒等，但只有 typeof 会窄化。
+      if (typeof setModel === "function") {
       // #1976 —— 切换 + 写配置 + ack 一起有上限。超时的多半是「这台机器没有这个模型」。
       try {
         await withDeadlineMs(
-          session.setSelectedModel(update.patch.model),
+          setModel(update.patch.model),
           MODEL_SWITCH_DEADLINE_MS,
           `OpenCode session model switch timed out after ${MODEL_SWITCH_DEADLINE_MS}ms`,
         );
       } catch (switchErr: any) {
         const reason = String(switchErr?.message || switchErr).slice(0, 400);
-        warn(`[config-apply] OpenCode V2 model switch failed: ${reason}`);
-        // 失败路径的 ack 也要有上限:一次就够,别在「拒绝」这件事上再等 4×30s。
-        try {
-          await callCommHub("ack_config_update", {
-            update_id: updateId,
-            status: "rejected",
-            error: `OpenCode session model switch failed: ${reason}`,
-          }, 0);
-        } catch (ackErr: any) {
-          warn(`[config-apply] ack rejected failed: ${ackErr?.message || ackErr}`);
-        }
-        return;
+        // 本地日志保留 message（便于现场排查），**上报给 Hub 的摘要只带
+        // err.name + 白名单 err.code**：message 可能包含上游原文，
+        // 而 ack.error 会进 Hub 库、也可能被界面展示。
+        // 依据：Portal 自己的 mapper 从不读 error.message，
+        // 并有测试把 Error('synthetic-secret') 钉成固定 code —— 这条风险在他们那边已被识别。
+        const errName = typeof switchErr?.name === "string" ? switchErr.name : "Error";
+        const rawCode = typeof switchErr?.code === "string" ? switchErr.code : "";
+        const errCode = /^[A-Za-z0-9_.-]{1,64}$/.test(rawCode) ? rawCode : "unknown";
+        warn(`[config-apply] OpenCode V2 model switch failed (${errName}/${errCode}): ${reason}; degrading to restart`);
+        // #3166 —— 原来这里 ack rejected 后 return：**用户的模型改动没有发生**，
+        // 而他点的是「切模型」。改成降级重启（模型一定生效，代价是一次重启）。
+        // 方向与 #2050 不冲突：那条是「hot 能力缺失不得否决 hub 请求的重启」，这里是反方向。
+        mode = "restart";
       }
       const backup = backupOpencodeConfig(configFilePath);
       const merged = mergePatch(fileConfig, { model: update.patch.model });
@@ -7513,9 +7638,10 @@ async function processConfigUpdate(): Promise<void> {
         status: "applied",
         new_revision: currentConfigRevision,
       });
-      log(`[config-apply] OpenCode V2 session model=${update.patch.model} (no restart, .prev backedUp=${backup.backedUp})`);
-      void reportStatus(lastReportedStatus.status, lastReportedStatus.task).catch(() => {});
-      return;
+        log(`[config-apply] OpenCode V2 session model=${update.patch.model} (no restart, .prev backedUp=${backup.backedUp})`);
+        void reportStatus(lastReportedStatus.status, lastReportedStatus.task).catch(() => {});
+        return;
+      }
     }
     const backup = RUNTIME === "opencode"
       ? backupOpencodeConfig(configFilePath)
@@ -7561,7 +7687,15 @@ async function processConfigUpdate(): Promise<void> {
     }
     await drainInFlightThink();
     await closeOpencodeRuntime("config restart");
-    log(`[config-apply] exiting with RESTART_SENTINEL=${RESTART_SENTINEL} for parent supervisor`);
+    writeRestartIntent(NODE_DIR, {
+      reason: "apply_restart",
+      at: Date.now(),
+      pid: process.pid,
+      boot_id: currentBootId(),
+      instruction_id: updateId,
+      target_version: null,
+    });
+    log(`[config-apply] exiting with RESTART_SENTINEL=${RESTART_SENTINEL} for parent supervisor (restart intent recorded)`);
     process.exit(RESTART_SENTINEL);
   } catch (err: any) {
     error(`[config-apply] failed: ${err?.message || err}`);
@@ -8196,6 +8330,21 @@ if (RUNTIME === "codex" || RUNTIME === "codex-app-server") {
 await register();
 log("已注册到 CommHub");
 
+// 2026-10-31 —— 上一次退出是「按计划的」吗？读了就清。
+//   生命周期 = 一次退出 → 下一次启动（不做 TTL）：标记只回答「我是被计划重启拉起来的吗」，
+//   而这个问题只在启动的那一刻有意义。
+//   坏文件不删、改名保留 ⇒ 既不重复触发，也留下现场（「读失败 ≠ 没有」）。
+{
+  const plannedRestart = consumePlannedRestart(NODE_DIR);
+  if (plannedRestart.verdict === "planned") {
+    log(`[anet] ${plannedRestart.note}`);
+  } else if (plannedRestart.verdict !== "absent") {
+    // stale / stale_reboot / unknown_age / unreadable 都要说出来：
+    // 它们恰恰是「看起来一切正常，但归因是错的」那几格。
+    warn(`[anet] restart-intent ${plannedRestart.verdict}: ${plannedRestart.note}`);
+  }
+}
+
 // Subscribe before the human TUI starts. Lazy-on-first-task attachment can
 // miss the TUI's turn/started notification; relying on thread/read to recover
 // that in-progress turn is not portable across Windows Codex builds.
@@ -8416,6 +8565,66 @@ commhubCompensation?.trigger("startup");
 // register report, dashboard would see `restarting` for up to 3min
 // after a restart instead of ✓ within a few seconds.
 reportStatus("idle").catch((e: any) => warn(`initial reportStatus failed: ${e?.message || e}`));
+
+// #3095 —— 启动时扫「上次进程没等到结果的」记录。
+//
+// 观察器活在进程内：节点在等待期间重启（升级/崩溃/系统重启/手工 stop），
+// 那一轮的结果就再没有人接。原来这是**静默**的 —— 发送方只看到任务 failed，
+// 永远不知道后来「有没有补回来」。
+//
+// 阶段一（本段）：不静默。给原发送方补一条说明，并清掉记录。
+// 阶段二（未实现）：用 readEntriesAfter 续挂观察器把小结果显示回来 —— 见 #3095。
+/**
+ * #3095 阶段二 —— 从共享 opencode server 的历史里读回那一轮的结果。
+ * 只在能确定读到最终回答时返回文本；其余（未完成 / 历史已丢 / 读取失败）返回 null，
+ * 由调用方降级成「告知丢失」。绝不把「不确定」当成「有结果」。
+ */
+async function recoverLateResult(rec: { sessionId: string; turnId: string }): Promise<string | null> {
+  const url = fileConfig.opencodeSharedServerUrl;
+  const passwordFile = fileConfig.opencodeSharedServerPasswordFile;
+  if (!url || !passwordFile) return null;
+  let password = "";
+  try { password = readFileSync(passwordFile, "utf8").trim(); } catch { return null; }
+  if (!password) return null;
+  const entries = await readSessionEntries(url, password, rec.sessionId);
+  if (!entries) return null;
+  const result = extractTurnResult(entries, rec.turnId);
+  return result.state === "done" ? result.text : null;
+}
+
+// #3095 —— 启动扫描：先尝试**把结果读回来**（阶段二），读不到才降级成「告知丢失」。
+{
+  const { records, corrupted } = listLateReplyRecords(NODE_DIR);
+  if (corrupted > 0) warn(`[late-reply] dropped ${corrupted} corrupted pending record(s)`);
+  if (records.length > 0) {
+    log(`[late-reply] ${records.length} pending record(s) at startup — notifying senders`);
+    // 放到后台，绝不阻塞启动（注册/心跳优先）。
+    setTimeout(() => {
+      for (const rec of records) {
+        void (async () => {
+          // 阶段二：共享 opencode server 仍持有历史时，把那一轮的结果读回来。
+          const recovered = await recoverLateResult(rec);
+          const text = recovered ?? `[迟到结果] 节点在等待这一轮期间重启（${rec.armedAt || "时间未知"}），结果没有自动回传。` +
+            `这一轮可能已经在节点 TUI 里跑完，请到该节点查看；如需结果请重发或直接询问节点负责人。`;
+          if (recovered) log(`[late-reply] recovered content for ${rec.taskId} from session history`);
+          return callCommHub("send_reply", {
+            in_reply_to: rec.taskId,
+            text,
+            status: recovered ? "replied" : "failed",
+            thread_id: rec.threadId,
+            turn_id: rec.turnId,
+          }, 0).then((response: any) => {
+          if (response?.ok === false) warn(`[late-reply] startup notice refused: ${response?.error ?? "?"}`);
+          else {
+            clearLateReplyRecord(NODE_DIR, rec.taskId);
+            log(`[late-reply] startup notice sent for ${rec.taskId}`);
+          }
+          }).catch((error: any) => warn(`[late-reply] startup notice failed: ${error?.message ?? error}`));
+        })();
+      }
+    }, 5_000).unref?.();
+  }
+}
 // #656 — 30s+60s+120s 可能跨过这次心跳。满载重试那一行继续报 working。
 // #668 — 回合还在跑时继续报 working，正文是正在处理的那条，不是后来新到的消息。
 // 未设置或超出范围时保持 3 分钟。ANET_STATUS_HEARTBEAT_MS 只给测试把间隔缩短。
