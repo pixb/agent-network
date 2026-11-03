@@ -18,6 +18,16 @@
 - **Docker 先验证**：所有改动 Docker E2E 通过后再合并
 - **向后兼容**：旧 atok_ token 仍然有效
 
+## 分支规则
+
+- **只有两个长期分支**：`main` 是 `upstream/main` 的镜像；`pixb` 是我们的功能分支，从 `main` 分出
+- **main 不写业务提交**：同步只做 `git fetch upstream main` + `git branch -f main upstream/main`（fast-forward），随后 `git push origin main`
+- **上游更新只能经 main 进入 pixb**：`git checkout pixb && git merge main` —— 用 **merge**
+- **禁止把 pixb rebase / reset 到上游**：2026-10-29 那次 rebase 只搬走了 tip 修复，丢掉 RFC-043 的 3 个核心提交，症状是 `anet node create --runtime pi-cli` 报 `unsupported runtime "pi-cli"`（白名单里有、`canonicalizeRuntime` 里没有）。恢复过程与验证见 `docs/tests/report-pi-restore-merge-20261103.txt`
+- **新增 runtime 是一张表，不是一串 if**：`agent-network/src/normalize-runtime.ts` 的 `SUPPORTED_RUNTIME_NAMES` + `canonicalizeRuntime`、daemon 的 `VALID_RUNTIMES`、hub 的 `server/src/create-node-validate.ts` 的 `RUNTIMES` 必须同时改；探针是 `agent-node/src/runtime/runtime-set-parity.test.ts`（#1298 跨包等价门）和 `create-node-validate.test.ts` 的「恰好 N 个」断言
+- **成对包必须同树构建**：`anet` 与 `agent-node` 的 `PAIRED_*` 版本出自同一棵树；只有白名单、没有运行时的半成品包不得外发（`2.3.0-preview.200` / `2.5.0-preview.165` 已删除）
+- **历史快照用 tag 不用长期分支**：例 `backup/pi-20261029`（rebase 前的 pixb，含完整 RFC-043）
+
 ## 可重建与灾难恢复规则
 
 验收标准不是“代码是否提交”，而是：**任一服务器被清空后，只依靠 GitHub 仓库以及仓库明确引用的备份和密钥来源，能否从空机恢复出当前运行的软件与关键流程。** 凡是恢复步骤依赖“某个人记得”或机器上未入库的 `/home/...` 文件，均视为缺口。

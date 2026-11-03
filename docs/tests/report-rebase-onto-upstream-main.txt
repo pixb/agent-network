@@ -1,0 +1,52 @@
+rebase: pixb onto upstream/main (b90e050f) + pi-cli fixes + opencode 1.19.5
+版本: 2.3.0-preview.200 / 2.5.0-preview.165（成对 tgz，不发 npm）
+分支: pixb-rebased（待合入 pixb）
+
+一、背景
+  upstream/main 在我们上次合并 (d634f8cc) 后被 force-push 重写，新增 ~100 个提交：
+    - commhub-server 0.9.0-preview.194 → .199 (6 个版本)
+    - 删除 license / activate 端点与激活码体系 (breaking: aa1058cb)
+    - 多项 CI/测试/告警/目录结构改进
+    - opencode V1 pin 仍停留在 1.18.34（我们已推进到 1.19.5）
+
+二、重做策略
+  从最新 upstream/main (b90e050f) 创建新分支 pixb-rebased，仅 cherry-pick 我们的 5 个功能提交：
+    1. 34ae46b3 - honor explicit --runtime pi-cli in create
+    2. 5a1e1b28 - start pi-cli through agent-node (not claude lane)
+    3. f5b11d95 - opencode V1 pin 1.19.4
+    4. bd6b8535 - pi-cli safe tool set & --pi-unsafe-tools flag
+    5. 184895af - opencode V1 pin 1.19.5
+  跳过版本号提交 (0bbad61f, 1a889383) —— upstream 版本已更高
+  同步补全缺失的 pi-cli 支持（upstream 缺失）：
+    - normalize-runtime.ts: RuntimeName + SUPPORTED_RUNTIME_NAMES + skipsCreateRuntimePicker
+    - create-node-daemon.ts: VALID_RUNTIMES += "pi-cli"
+    - create-node-validate.ts: RUNTIMES += "pi-cli"
+    - opencode-pin.ts: opencodeTransitionNote 修正指向前一 pin
+
+三、验证（Docker 内）
+  tests/test725-agent-node-unit-ci  3200 pass / 3 skip / 0 fail  RESULT: PASS
+  tests/test745-agent-network-unit-ci 2202 pass / 13 skip / 0 fail  RESULT: PASS
+  agent-network tsc --noEmit rc=0；全部 opencode/pi-cli 相关单测通过
+
+四、版本号同步
+  运行 sync-pinned-versions.sh 对齐 upstream 版本号：
+    agent-network: 2.3.0-preview.199 → 2.3.0-preview.200
+    agent-node: 2.5.0-preview.164 → 2.5.0-preview.165
+  PAIRED_AGENT_NETWORK_VERSION = 2.3.0-preview.200
+  PAIRED_AGENT_NODE_VERSION = 2.5.0-preview.165
+
+五、产物
+  /vol2/1000/Download/agent-network-tgz/
+    sleep2agi-agent-node-2.5.0-preview.165.tgz
+      sha256 8f970fe5dd89053dfae30fe0059741268930865483e1a10ea3963770e37e0f9e
+    sleep2agi-agent-network-2.3.0-preview.200.tgz
+      sha256 17b735a7c917f8f41bd1011a0ed4dfd87050ea4839229f96d8f164739da6f3e1
+
+六、待办
+  1. 用 pixb-rebased 替换 pixb 分支（或 merge 到 pixb）
+  2. 重新部署 Hub 并验证 pi-cli 节点创建/启动
+  3. 通知局域网机器升级 tgz (2.3.0-preview.200 / 2.5.0-preview.165)
+
+七、注意
+  - upstream 删除 license/activate 端点，若生产仍依赖激活码需评估影响
+  - Mac 192.168.1.200 连 9200 端口问题仍未解决，需排查 pfctl/本地网络权限

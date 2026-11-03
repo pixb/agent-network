@@ -1,0 +1,49 @@
+pi-cli 恢复 + main/pixb 分支收敛 — 验证报告
+日期: 2026-11-03
+分支: pixb（合并 main 之后）
+
+== 背景 ==
+rebase 到 upstream/main 时丢掉了 RFC-043 的 3 个核心提交，导致
+`anet node create --runtime pi-cli` 报 `unsupported runtime "pi-cli"`
+（白名单里有、canonicalizeRuntime 里没有）。本地成对包
+agent-network 2.3.0-preview.200 / agent-node 2.5.0-preview.165 是残缺树打的，
+已删除；.196/.159 验证可用并保留。
+
+恢复提交（cherry-pick 自 pixb-backup-20261029，全部无冲突）:
+  064767eee  RFC-043 pi-cli 运行时集成 M0-M4（pi-rpc + 枚举接线）
+  829e95abf  RFC-043 pi-cli 收尾补齐（goals/create_node/clone/help）
+  addca7514  VALID_RUNTIMES 补 pi-cli（#1298 跨包等价门）
+  741e06d54  server RUNTIMES 门断言 7 -> 8 个（fe74da08d）
+分支收敛:
+  main  = upstream/main (2bea7b11b)，已推 origin（fast-forward）
+  pixb  = e6bf516ff Merge branch 'main' into pixb
+  合并冲突仅 5 个版本/lock 文件，版本行取上游（.207 / node .175，pair .206/.175）
+
+== 验证结果 ==
+1) agent-network/src/normalize-runtime.test.ts            45 pass / 0 fail
+2) server/src/create-node-validate.test.ts                47 pass / 0 fail
+   （含 "恰好八个" + toContain("pi-cli")）
+3) agent-node/src/runtime/runtime-set-parity.test.ts       3 pass / 0 fail
+   （#1298 跨包等价门：CLI / daemon / hub 三份集合一致）
+4) server/src/clone-node.test.ts                            7 pass / 0 fail
+   需 `COMMHUB_DB=/tmp/test-$$.db`（#435 守卫），pi 克隆分支在内
+5) agent-network: `bun run typecheck` (tsc --noEmit)        exit 0
+6) agent-node:  `bun build src/cli.ts`（pi 编译门）          exit 0
+7) agent-network: `bun build bin/cli.ts`                    exit 0
+8) server: `tsc --noEmit` — 门文件 src/runtime-label.ts 干净（0 错）
+   基线 233 处 TS 错误，其中 clone-node.test.ts:139/143 两处与 main 同树逐字一致，
+   属上游既有基线，非本次合并引入
+
+== 已知缺口（未修）==
+A. tests/test-pi-compile-check 在本机跑不起来（本机问题，非代码问题）:
+   - Dockerfile 写死 registry.npmmirror.com，本机不可达 → bun install 挂起
+   - RUN 里 `bun add -g typescript` 以 /check 为 cwd，会生成 /check/package.json
+     + bun.lock，把 /check 变成 bun workspace 根，使随后的子包 install 直接 exit 1
+   本次以本地等价命令（第 5-8 项）覆盖同一道门。
+B. npm 上所有 agent-node 版本（实测 .147/.148/.154/.159/.165/.175）都不含 pi 运行时，
+   本地 tgz 只有 .154/.158/.159 有。合并后的 pair 指向 2.5.0-preview.175 →
+   `anet node start --runtime pi-cli` 会被 candidate 守卫拒
+   （"the candidate agent-node does not advertise pi-cli"）。
+   要跑起来必须从 pixb 构建并发布/安装带 pi 的 agent-node，再 bump pair。
+C. 旧 pixb-backup 上的 docs 测试报告、.191/.154 发布准备、skill 子模块指针
+   未恢复（判定为历史产物，非日常代码）。
