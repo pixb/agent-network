@@ -50,16 +50,15 @@ echo "── 3) 起来并真答 /health（一次性目录 + 一次性密钥，�
 mkdir -p "$WORK/data" && chmod 777 "$WORK/data"   # 容器 uid 1000 要能写：见头部说明
 # 探针只有一处权威定义：compose.yaml 的 hub.healthcheck（镜像里刻意不写 HEALTHCHECK，
 # 两处定义迟早漂移）。演练用 docker run，所以把同一份探针从 compose.yaml 里读出来传进去，
-# 而不是在脚本里另抄一份 —— 2026-11-04 第一遍就是另抄口径跑挂的（health 状态 = none）。
-HEALTH_CMD="$(python3 - <<'PY'
-import shlex, yaml
-d = yaml.safe_load(open('deploy/compose/compose.yaml'))
-t = d['services']['hub']['healthcheck']['test']
-args = t[1:] if t[0] in ('CMD', 'CMD-SHELL') else t
-print(' '.join(shlex.quote(a) for a in args))
-PY
-)"
-[ -n "$HEALTH_CMD" ] || { echo "  FAIL: 没能从 compose.yaml 读出 hub 探针" >&2; exit 1; }
+# 不在脚本里另抄一份。
+#
+# 读法用 `docker compose config`（compose 自己解析并归一化 flow 序列），不要 import yaml：
+# 本机 python 没有 pyyaml（第一遍就是这么跑挂的：ModuleNotFoundError: No module named 'yaml'），
+# 这个 compose 版本也没有 `config --json`（unknown flag）。
+HEALTH_CMD="$( (cd deploy/compose && docker compose config 2>/dev/null) \
+  | awk '/^  hub:/{f=1} /^  dashboard:/{f=0} f' \
+  | awk '/healthcheck:/{h=1; next} /timeout:|interval:/{h=0} h && /^ *- /{sub(/^ *- /, ""); print}' \
+  | python3 -c 'import sys,shlex; a=[l.rstrip(chr(10)) for l in sys.stdin if l.strip()]; a=a[1:] if a and a[0] in ("CMD","CMD-SHELL") else a; print(" ".join(shlex.quote(x) for x in a))' )"
 echo "  演练用的探针（来自 compose.yaml）: $HEALTH_CMD"
 
 docker run -d --name "$NAME" \
