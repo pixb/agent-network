@@ -1,62 +1,50 @@
-# CommHub Hub 镜像 —— 现网 `anet-hub:compose` 的权威重建定义。
+# CommHub Hub 生产镜像 —— 从本仓库 server/ 源码构建。
+# runbook：deploy/compose/README.md
 #
-# 为什么这份文件是新写的：现网 hub 容器（`anet-hub-1`，2026-10-22 起）的构建定义
-# 在磁盘和 git 里都没有副本 —— 容器 label 指着的
-# `deploy/compose/compose.yaml` 与 `deploy/compose/entrypoint.sh` 都已不在。
-# 本文件按运行中镜像的 `docker history` 逐层还原，不是凭记忆重写。
+# bun 钉在 1.4.0（含 digest）：1.3.14 在 preview.45 上有 uWS HttpContext::onClose
+# 连续 panic 前科，生产 2026-09-02 起换 1.4.0 后再无重启（deploy/hub/README.md #1769）。
+# 基础镜像带完整 tag+digest，过 base-image-pin 门（#1740）。
 #
-# 还原依据（2026-11-04 实测，`docker history anet-hub:compose`）：
-#   FROM oven/bun:1.4.0
-#   ENV npm_config_audit=false npm_config_fund=false
-#   WORKDIR /app
-#   COPY server/package.json /app/server/package.json
-#   RUN cd /app/server && bun install
-#   COPY server/ /app/server/
-#   RUN chown -R bun:bun /app
-#   COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
-#   RUN chmod 755 … ; USER bun ; EXPOSE 9200
-#   ENTRYPOINT anet-hub-entrypoint ; CMD bun run /app/server/bin/commhub.ts
-#
-# 与镜像唯一两处刻意不同（都是往「可复现」方向收紧，不改变运行行为）：
-#   1. 一起 COPY `server/bun.lock`，用 `bun install --frozen-lockfile`。
-#      镜像里只拷了 package.json，装出来的依赖树不由 lockfile 唯一决定；
-#      AGENTS.md「锁定可复现输入」要求 lockfile 参与。
-#   2. 镜像 label 记源码提交（部署身份）。分支模型：pixb 是生产分支、不发 npm，
-#      所以「部署的是哪份代码」只能由源码提交表达。查：
-#        docker inspect anet-hub:compose --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
-ARG BUN_IMAGE=oven/bun:1.4.0
-FROM ${BUN_IMAGE}
+# 2026-11-04 说明（这份文件为什么一度不在仓库里）：本套件的权威副本来自提交
+# 3bf3150c6（2026-10-08，"switch local pm2 to compose"），那个提交**不是 pixb 的祖先**
+# （2026-10-29 那次 rebase 把它掉出去了），于是容器 label 指着的 deploy/compose/compose.yaml
+# 与镜像里的 entrypoint.sh 都从分支上消失了。恢复方式：`git checkout 3bf3150c6 -- deploy/compose …`；
+# 现网镜像内的 entrypoint.sh 与那份副本逐字一致（契约测试里做 diff 校验），
+# 说明现网容器确实是这套定义的产物。下面相对原版只有两处增量，都往「可复现」方向收紧。
+FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
 
-# 与现网镜像一致：装依赖时不审计、不打扰（构建不该联网去 registry 拉统计）。
-ENV npm_config_audit=false \
-    npm_config_fund=false \
-    BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+# 这两个 npm 开关只影响 bun install 的供应链检查端点，不改变任何判据
+# （与 tests/Dockerfile 同理由：npm audit 端点间歇挂起会把 4s 安装变 4 分钟）。
+ENV npm_config_audit=false npm_config_fund=false
 
-WORKDIR /app
-
-# 依赖清单先走，源码后走：源码改动不该让依赖树重新解析。
-COPY server/package.json server/bun.lock /app/server/
-RUN cd /app/server && bun install --frozen-lockfile
-
-COPY server/ /app/server/
-COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
-RUN chmod 755 /usr/local/bin/anet-hub-entrypoint \
- && chown -R bun:bun /app
-
-# 部署身份 = 源码提交（由 compose 的 build args 传入）。
+# ── 增量 1：部署身份 = 源码提交（pixb 生产分支，不发 npm）
+# 「在跑的是哪份代码」必须能从镜像本身问出来，不能靠某台机器上装的是哪个目录：
+#   docker inspect anet-hub:compose --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
 ARG SOURCE_REV=unknown
 LABEL org.opencontainers.image.title="anet-hub" \
       org.opencontainers.image.revision="${SOURCE_REV}" \
       ai.anet.deploy.branch="pixb" \
       ai.anet.deploy.source_revision="${SOURCE_REV}"
 
+# 依赖层与源码层分开：改源码不重新解析依赖树。
+WORKDIR /app
+COPY server/package.json server/bun.lock /app/server/
+# ── 增量 2：`bun install --frozen-lockfile`（原版只拷 package.json，
+# 装出来的依赖树不由 lockfile 唯一决定；AGENTS.md「锁定可复现输入」要求 lockfile 参与）。
+RUN cd /app/server && bun install --frozen-lockfile
+
+COPY server/ /app/server/
+COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
+RUN chmod 755 /usr/local/bin/anet-hub-entrypoint
+
+# 非 root：直接用 bun 镜像自带的 bun 用户（uid 1000 = 常见宿主机首用户，
+# bind mount 的 data/ 直接可写）。
+RUN chown -R bun:bun /app
+
 USER bun
 EXPOSE 9200
 
-# 就绪探针：`/health`。注意容器里 bun 在 PATH 上，`curl` 不在 —— 探针必须用 bun 发。
-# 现网容器用的就是这个形状（实测 docker inspect 的 Healthcheck.Test）。
-HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=30 \
-  CMD bun -e "fetch('http://127.0.0.1:9200/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-
+# healthcheck 归 compose.yaml 管（一份定义，不在镜像里再写一份，避免两处漂移）。
 ENTRYPOINT ["/usr/local/bin/anet-hub-entrypoint"]
+# bin/commhub.ts 自己设 COMMHUB_SERVER=1 并显式 startHub()，不依赖 import 副作用
 CMD ["bun", "run", "/app/server/bin/commhub.ts"]

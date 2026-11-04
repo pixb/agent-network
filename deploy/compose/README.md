@@ -1,143 +1,259 @@
-# CommHub 生产栈（hub + dashboard）—— 可重建定义
+# 生产部署 — Docker Compose 套件（Git 权威）
 
-## 这份文件为什么存在（2026-11-04 盘点）
+> **任何一台机器被夷平后，只凭这个仓库 + 加密备份，就要能把 Hub 与 Dashboard 重建出来。**
+> 本目录是 `docs-site/docs/deploy/clean-server.md` §「在容器里跑」所指向的受维护套件。
+> 数据不在此列：SQLite 内容与 vault 密钥从备份恢复，见下文第 3、6 问。
 
-现网两个容器都在跑，但它们的构建定义**在磁盘和 git 里都没有副本**：
+服务拓扑：
 
+```text
+宿主机
+  ├─ docker compose
+  │    ├─ hub        :9200 ──► bun + commhub-server（源码构建，server/）
+  │    └─ dashboard  :3000 ──► node + @sleep2agi/agent-network-dashboard（npm 钉版本）
+  ├─ ./data/         ← 全部状态：hub.env（密钥）+ commhub.db + uploads/
+  └─ agent 节点、Caddy/frp 隧道等：仍在宿主机上（边界见文末）
 ```
-docker inspect anet-hub-1 --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
-  → /vol1/1000/docker/nec8-docker/agent-network/deploy/compose/compose.yaml   # 该文件不存在
-docker history anet-hub:compose | grep entrypoint
-  → COPY deploy/compose/entrypoint.sh ...                                      # 该文件也不存在
+
+## 0. 快速开始（新机器）
+
+```bash
+# 前置：docker + compose v2（`docker compose version` 能跑）；首次 build 需联网
+git clone <本仓库> && cd agent-network
+
+mkdir -p deploy/compose/data
+cp deploy/compose/hub.env.example deploy/compose/data/hub.env
+$EDITOR deploy/compose/data/hub.env        # 填入 ANET_HUB_SECRET_VAULT_KEY（从加密备份取原值）
+chmod 600 deploy/compose/data/hub.env
+# 可选：cp deploy/compose/.env.example deploy/compose/.env 改端口
+
+docker compose -f deploy/compose/compose.yaml up -d --build
+curl -s localhost:9200/health              # ok:true + version = server/package.json 的版本
 ```
 
-也就是说：容器活着，定义没了。AGENTS.md 的验收标准是「任一服务器被清空后，只靠仓库能否
-恢复出当前运行的软件」，当时的答案是否定的。本目录把这些补成权威副本：`compose.yaml`、
-`Dockerfile.hub`、`entrypoint.sh`（从运行中镜像逐字取出）、`.env.example`、
-`hub.env.example`、`dashboard.env.example`。
+**整机迁移** = 把整个项目目录（含 `data/`）拷到新机器 → `up -d --build`。
+新机器首次会现场构建镜像（源码在仓里，需联网拉基础镜像/装依赖）。
 
-**本轮不改任何运行中的东西**：只补仓库内容。
+## 1. 常驻服务如何启动、脚本在哪里
 
-## 现网实测拓扑（`docker inspect` 的量，不是文档里的理想形状）
+- **权威文件就是本目录**：`compose.yaml`（进程定义）、`Dockerfile.hub` / `Dockerfile.dashboard`
+  （构建）、`entrypoint.sh`（vault fail-closed 预检）。启动命令：
+  `docker compose -f deploy/compose/compose.yaml up -d`
+- `restart: unless-stopped` 负责崩溃自愈与开机跟随 docker daemon 自启（需 docker 服务 enabled，
+  Ubuntu 桌面版默认如此；服务器确认 `systemctl is-enabled docker`）。
+- 就绪判据是 hub healthcheck（`/health`），不是「容器在跑」：dashboard 被
+  `depends_on: service_healthy` 挡在 hub 健康之后。
+- 对应 pm2 时代的 `hub-daemon.sh` / `dash-start.sh` 的预检，本套件由两处承接：
+  vault 密钥 → `entrypoint.sh`（缺了拒启）；端口冲突/版本钉 → compose 本身
+  （一个 compose 项目不会起两个 hub；版本钉在 Dockerfile 与 `server/package.json`）。
 
-| 项 | hub | dashboard |
+## 2. 端口、反向代理、隧道写在哪里
+
+- **端口映射只在 `compose.yaml`**（默认 `9200:9200`、`3000:3000`，可用 `.env` 的
+  `HUB_PORT` / `DASH_PORT` 覆盖）。宿主机对外绑定即 docker 的发布地址。
+- TLS 终结、域名、frp 隧道**不在本套件**（与 pm2 时代相同的边界：在 Caddy/frpc 层）。
+  改了入口先改反代，再动这里。Dashboard 若在纯 HTTP 下访问需 `COOKIE_INSECURE=1`
+  （`compose.yaml` 已设；上 TLS 后应去掉）。
+
+## 3. 环境变量和密钥从何处安全获取
+
+| 内容 | 位置 | 获取方式 |
 |---|---|---|
-| 容器 | `anet-hub-1` | `anet-dashboard-1` |
-| 镜像 | `anet-hub:compose`（`oven/bun:1.4.0` + `COPY server/`） | `anet-dashboard:compose`（**npm 发布包 `0.6.3-preview.56`** 烘进镜像） |
-| 镜像建于 | 2026-10-22 | 2026-10-14 |
-| 宿主端口 | `9200 → 9200` | **`3200 → 3000`** |
-| 网络 | `anet_default`（bridge） | `anet_default` |
-| 挂载 | `./data → /data`（生产 SQLite + uploads + backups） | 无（无状态） |
-| 密钥来源 | `env_file: ./data/hub.env`（实测 0600，gitignore 覆盖） | `env_file`（`COMMHUB_URL`、`COOKIE_INSECURE`） |
-| 健康判定 | `bun -e fetch('/health')`（容器里无 curl） | 镜像无 healthcheck（现网实测） |
-| 依赖 | — | `depends_on: hub: service_healthy` |
-| 运行身份 | `USER bun` | `USER node` |
+| vault 主密钥 `ANET_HUB_SECRET_VAULT_KEY` | `data/hub.env`（0600，不进 git） | **只从加密备份恢复原值**。重新生成的新值解不开既有密文 —— 那不是恢复 |
+| 可选调参（retention/SSE 等） | 同上，`hub.env.example` 列了全部变量名 | 变量名见 example；值不进仓库 |
+| 端口/数据目录 | `.env`（可选，不进 git） | `.env.example` |
 
-两条与旧文档不一致、必须以实测为准的事：
+`data/` 整目录被根 `.gitignore` 忽略。**备份出的 `data/` 含主密钥与全量数据，按密件对待。**
 
-1. **dashboard 的入口是宿主 `:3200`，不是 `:3000`/`:3001`。** `deploy/dashboard/README.md`
-   写的 Caddy `:3000` → pm2 → `:3001` 是 **pm2 时代**的形状；现网由 compose 接管，
-   端口是 compose 的 `DASH_PORT=3200`，容器内 `HOST=0.0.0.0`、`PORT=3000`。
-   实测 `http://192.168.1.3:3000/login` = **404**（宿主 `:3000` 已被 **gitea** 占用，
-   它的登录路径是 `/user/login`），`:3200/login` = 200。
-2. **`HOST=0.0.0.0` 在容器里是 compose 桥接网络的正常形状**，外部可达性由 `ports:` 决定。
-   「只监听 127.0.0.1」那条契约属于 pm2/host-network 路径（dashboard 仓库
-   `deploy/compose/README.md` 里写清了两种路径）。**不要把两条契约混成一条。**
+## 4. 如何换版本并验证真实生效
 
-## 换版本 / 验证真实生效 / 回滚
-
-分支模型（2026-11-04 定义，见仓库根 `AGENTS.md`）：`pixb` 是生产分支，只在本地部署，
-**不发 npm**；`main` 只作为上游同步分支，上游更新用 merge 进 pixb。于是
-**部署身份 = 源码提交**，不是 npm 版本号。
+Hub（源码版本）：
 
 ```bash
-cd deploy/compose
-export ANET_SOURCE_REV=$(git -C ../.. rev-parse HEAD)    # 本次部署的 pixb 提交
-docker compose build                                      # hub 镜像 label 记下这个提交
-docker compose up -d
+git pull                              # server/package.json 的 version 即新版本号
+docker compose -f deploy/compose/compose.yaml up -d --build hub
+curl -s localhost:9200/health         # version 必须 == server/package.json 的 version
 ```
 
-验证生效只问「常驻进程实际加载的是哪份代码」：
+Dashboard（npm 钉版本）：
 
 ```bash
-docker inspect anet-hub:compose --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
-docker inspect anet-hub-1     --format '{{.Image}}'   # 容器实际用的镜像 id
-docker compose ps             # hub 应为 healthy
-curl -fsS http://127.0.0.1:9200/health >/dev/null && echo hub-ready
-# dashboard 同理：镜像由 agent-network-dashboard 仓库构建，
-# 它的 label 里带 dashboard 侧的提交；只量「网页能开」不算数。
+# 改 deploy/compose/Dockerfile.dashboard 的 ARG DASH_VERSION=<新版本>
+docker compose -f deploy/compose/compose.yaml up -d --build dashboard
+# 验证看真跑的产物：进入容器核对安装目录版本，不只看自报 footer
+docker compose -f deploy/compose/compose.yaml exec dashboard \
+  node -p "require('./node_modules/@sleep2agi/agent-network-dashboard/package.json').version"
 ```
 
-回滚 = 检出旧提交重建。源码在 git 里，旧提交永远构建得到；不依赖 registry 上还剩哪个版本。
+版本号自报可以骗人，**构建产物核对不骗人**（与 `deploy/dashboard/README.md` §四同一判据）。
 
-dashboard 镜像在本目录之外构建：
+## 5. 如何回滚
+
+- **代码回滚**：`git checkout <上个好 commit>` → `up -d --build`。
+  Docker 会保留旧镜像层，回滚即重新构建；不需要时旧镜像也可手动保留
+  （`docker images | grep anet-`）。
+- **数据回滚**：见第 6 问的备份恢复。**先停容器再恢复**：
+  `docker compose stop hub` → 恢复 `data/commhub.db` → `up -d`。
+- 两层独立：镜像回滚不动数据，数据回滚不动镜像；搞混了会「进程是新的、数据是旧的」
+  或反之 —— 回滚后按第 4 问重新验证一次。
+
+## 6. 哪些状态只能从数据备份恢复
+
+**软件**（git 可复现）：compose 文件、两个 Dockerfile、server 源码、DASH_VERSION 坐标。
+
+**数据**（git 没有，只有备份能救），全部在 `data/` 一个目录：
+
+| 文件 | 内容 | 备份 |
+|---|---|---|
+| `data/hub.env` | vault 主密钥 + 调参 | 加密备份；`0600`；只有原值有效 |
+| `data/commhub.db` | 用户/网络/任务/会话/令牌（SQLite WAL） | 热备份用 `VACUUM INTO`，停机后可直接拷文件 |
+| `data/uploads/` | 上传的文件与 `.index/` | 直接拷 |
+
+热备份（不停机，推荐例行）：
 
 ```bash
-cd ../agent-network-dashboard/deploy/compose
-export ANET_DASHBOARD_SOURCE_REV=$(git -C ../.. rev-parse HEAD)
-docker compose build           # 产出 anet-dashboard:<tag>，label 带提交
-# 回到本目录：ANET_DASHBOARD_IMAGE_TAG=<tag> docker compose up -d
+docker compose -f deploy/compose/compose.yaml exec hub \
+  bun -e "new (require('bun:sqlite').Database)('/data/commhub.db',{readonly:true}).exec(\"VACUUM INTO '/data/backups/commhub-$(date +%Y%m%d-%H%M%S).db'\")"
 ```
 
-## 数据与密钥（哪些不能从 git 恢复）
+> 🔴 **不要在容器运行时直接 `cp commhub.db`** —— WAL 在写，普通文件拷贝不一致
+> （`deploy/hub/README.md` 同规则）。冷备份（`docker compose stop` 之后）直接拷整个
+> `data/` 即可。
 
-- **hub 的 SQLite 在 `./data/`**（bind mount 到 `/data`）：`commhub.db` + `-wal`/`-shm` +
-  `uploads/` + `backups/` + `hub.env`。`data/` 整条被根 `.gitignore` 排除（本轮补的），
-  所以 clone 仓库 **不会**带来任何生产数据。
-- **`data/hub.env` 里是 vault 主密钥**，权限 0600。恢复必须用**原值**（加密备份 / owner
-  安全交付）：新生成一个 64 hex 解不开既有密文，那不是恢复，是把数据变成砖。
-  entrypoint 对此 fail-closed（不设就拒绝启动）。
-- 登录账号本身在 hub 数据库里（dashboard 网页登录走 `/api/auth/v3` → hub 用户校验），
-  所以「谁能登录」也只能从数据备份恢复。
+恢复 = 停 hub → 用备份覆盖 `data/commhub.db` → `up -d` → 按第 4 问验证
+（`sessions_count` 行数对得上备份、登录后任务/令牌都在）。
 
-## 启动（空机重建）
+## 从 pm2 旧机迁移到本套件
+
+前提：本套件已在测试套件里全链路验证（`tests/test-compose-deploy/`）。步骤：
 
 ```bash
-git clone <repo> && cd agent-network && git checkout pixb
-cd deploy/compose
-cp .env.example .env                     # 端口等
-cp dashboard.env.example dashboard.env   # 填 COMMHUB_URL 等
-mkdir -p data && cp hub.env.example data/hub.env && chmod 600 data/hub.env
-# 填入 ANET_HUB_SECRET_VAULT_KEY 的**原值**（来自加密备份）；没有原值就先别 up
-docker compose build
-docker compose up -d
-docker compose ps                        # hub healthy 后 dashboard 才会起
+# 1. 热备份（pm2 hub 还在跑时，先拿一致快照）
+mkdir -p deploy/compose/data/backups
+bun -e "new (require('bun:sqlite').Database)('$HOME/.commhub/commhub.db',{readonly:true}).exec(\"VACUUM INTO '$PWD/deploy/compose/data/backups/pre-compose.db'\")"
+
+# 2. 停旧进程，释放端口（pm2 定义保留 = 回滚路径）
+pm2 stop commhub-hub anet-dashboard
+
+# 3. 汇集数据（密钥原样搬、快照当主库、上传目录整体搬）
+cp -p "$HOME/.commhub/hub.env" deploy/compose/data/hub.env
+cp deploy/compose/data/backups/pre-compose.db deploy/compose/data/commhub.db
+cp -a "$HOME/.anet/server/uploads" deploy/compose/data/uploads 2>/dev/null || true
+chmod 600 deploy/compose/data/hub.env
+
+# 4. 起 + 验证（见下）
+docker compose -f deploy/compose/compose.yaml up -d --build
 ```
 
-全新空栈（无数据备份）时，hub 会建空库：需要重新注册用户、网络、节点 token —— 这条路径
-只恢复软件，不恢复数据。
+验证清单（全过才算迁移完成）：
 
-### 第一条启动就会踩的坑：数据目录必须能被容器 uid 写
+1. `/health`：`ok:true`、`version` 对、`sessions_count` 与备份一致；
+2. 老 `atok_`/`utok_` 调 REST/MCP 照常 200（令牌在库里，跟着数据走）；
+3. Dashboard `/login` 200 且能登录进看板；
+4. **节点心跳恢复**：`get_all_status` 里在线数恢复（节点连的还是 `host:9200`，
+   SSE 断线自动重连）；
+5. 历史上传文件能下载（验 `COMMHUB_UPLOADS_DIR` 换根没破坏索引）。
 
-镜像是 `USER bun`（uid 1000）。`docker compose up` 时如果 `./data` 不存在，docker 会
-自动建一个 **root owned** 的目录，hub 会在建库时直接抛异常：
-
-```
-at new Database (bun:sqlite:262:28)
-  at createAdapter (/app/server/src/db-adapter.ts:549:17)
-```
-
-日志里看不到「权限」两个字，看起来像数据库坏了。空机重建时先做：
+回滚到 pm2：`pm2 stop` compose 侧没必要 —— `docker compose down` 后
+`pm2 start commhub-hub anet-dashboard`（原 `~/.local/bin/*` 与 runtime 目录一律没动）。
 
 ```bash
-mkdir -p data && chmod 777 data     # 或 chown 到容器 uid 1000
+docker compose -f deploy/compose/compose.yaml down      # 停并删容器，data/ 不动
 ```
 
-演练脚本里就是这么写的（`tests/compose-rebuild/rebuild-drill.sh` 头部记录了这条实测发现）。
+## 明确不覆盖（诚实边界）
 
-### 演练
+- **agent 节点生命周期**：节点（tmux/TUI/各厂商运行时）留在宿主机，照旧连
+  `host:9200`。反过来，**hub 容器内没有宿主机的 `anet`/tmux**，`create_node`
+  主机侧 fan-out 在容器里不可用 —— 节点请在宿主机上 `anet node create/start`。
+- **Caddy / frp 隧道 / weixin**：不在本套件，边界与 pm2 时代相同。
+- **镜像仓库发布**：不发 GHCR，新机器现场 build（这是「拷项目即部署」的代价，
+  换来的是不依赖任何 registry 的可复现性）。
+- **备份的异地存放**：本套件只给出备份命令，备份件存哪、保留多久由运维决定
+  （`data/` 含主密钥，别进任何公开仓库/明文网盘）。
 
-```bash
-bash tests/compose-rebuild/rebuild-drill.sh   # 构建 + fail-closed + 真起 /health，全在隔离资源上
-bash tests/compose-rebuild/compose-contract.sh
+## 验证与演练
+
+- 套件级 E2E（含迁移演练）：`tests/test-compose-deploy/`，报告见
+  `docs/tests/report-test-compose-deploy.txt`。本地跑：`bash tests/test-compose-deploy/run.sh`
+  （需要 docker；不动生产端口与生产数据）。
+
+---
+
+## 8. 2026-11-04 恢复记录与现网实测（量出来的，不是转述）
+
+### 8.1 这套定义曾经从分支上消失
+
+本套件的权威副本来自提交 `3bf3150c6`（2026-10-08，"maintained compose suite +
+E2E tests; switch local pm2 to compose"）。**该提交不是 pixb 的祖先**
+（`git merge-base --is-ancestor 3bf3150c6 HEAD` → 否），2026-10-29 那次 rebase 把它掉出去了
+（AGENTS.md 记录的那次：只搬走 tip 修复，丢掉核心提交）。后果是运行中的容器指向的定义
+从分支上消失：
+
+```
+docker inspect anet-hub-1 → project.config_files = deploy/compose/compose.yaml   # 文件不在
+docker history anet-hub:compose → COPY deploy/compose/entrypoint.sh              # 文件不在
 ```
 
-演练脚本用 `anet-hub:drill` 标签与 `19323` 端口，**不覆盖现网镜像、不抢 9200、不读 `data/`**。
+恢复方式：`git checkout 3bf3150c6 -- deploy/compose tests/test-compose-deploy docs/tests/report-compose-migrate.txt`。
+**证据**：现网镜像里的 `/usr/local/bin/anet-hub-entrypoint` 与恢复出来的 `entrypoint.sh`
+逐字一致（`tests/compose-rebuild/compose-contract.sh` 里做 diff 校验），说明现网容器
+确实是这套定义的产物，不是别的什么定义。
 
-## 契约测试
+教训写进规则：**分支被重写时，未纳入分支的运维定义会静默消失，而容器照跑不误**。
+所以本轮起，compose 定义的完整性由契约测试钉住，不再只靠「目录里应该有文件」。
 
-`tests/compose-rebuild/compose-contract.sh` 钉住：镜像层与 lockfile 参与安装、
-`SOURCE_REV` label、探针用 bun 发（容器无 curl）、`data/` bind mount 存在、
-env 模板不含密钥值、`.env.example`/`hub.env.example` 名字齐全、
-`docker compose config` 能解析本文件（并用故意写重键的样张自检这条检查有牙）、
-README 记录实测端口 `3200` 与数据目录权限要求。
+### 8.2 现网实测（2026-11-04）
+
+| 项 | 实测值 |
+|---|---|
+| dashboard 容器 | `anet-dashboard-1`，创建 **2026-10-14**，镜像 `sha256:e6b84113b0c2` |
+| dashboard 宿主端口 | **3200**（来自 `deploy/compose/.env` 的 `DASH_PORT=3200`；compose.yaml 默认是 3000） |
+| dashboard 自报版本 | `0.6.3-preview.56` = `Dockerfile.dashboard` 里钉的 `ARG DASH_VERSION` |
+| hub 容器 | `anet-hub-1`，创建 **2026-10-22**，自报 `0.9.0-preview.265` |
+| 部署粒度 | 同一份 compose.yaml，两个 service **分别 up**（hub 与 dashboard 创建时间差 8 天） |
+
+> `:3000/login` 返回 404 是**对的**：宿主 `:3000` 是 gitea（它的登录路径是 `/user/login`）。
+> dashboard 的入口是 `:3200`。历史文档里写的 Caddy `:3000` → pm2 → `:3001` 是 pm2 时代形状。
+
+### 8.3 演练新增的两条要求（第一遍跑挂才发现）
+
+1. **`./data` 必须能被容器 uid(1000) 写。** 目录不存在时 docker 自动建的是 root owned，
+   hub 在 `bun:sqlite` 建库时抛异常，日志只有 `at new Database (bun:sqlite:262:28)`，
+   看不出是权限问题。空机重建先 `mkdir -p data && chmod 777 data`。
+2. **构建期 npm 源是慢点。** dashboard 侧一次容器内 `npm ci` 实测 40 分钟未完成
+   （本机 registry 镜像报「免费节点当前繁忙」）。源码构建路径（dashboard 仓库
+   `Dockerfile.source`）已加 `ARG NPM_REGISTRY` + `--mount=type=cache` 复用 npm 缓存。
+   本套件的 dashboard 路径只装一个已发布包，不受这条影响。
+
+### 8.4 旋钮：名称 / 默认 / 现网实测值 / 来源
+
+compose 自动读同目录 `.env`（shell 环境优先）。现网这台机器的 `.env` 内容就是下表第三列，
+它是**唯一的运行期事实源**——新机器要复现现网形状，照抄这张表即可。
+
+| 变量 | 定义里的默认 | 现网 `.env` 实测 | 作用 |
+|---|---|---|---|
+| `COMPOSE_PROJECT_NAME` | `anet` | 未设（= 默认 anet） | 容器/网络名前缀：`anet-hub-1`、`anet-dashboard-1` |
+| `HUB_PORT` | `9200` | `9200` | 宿主侧 hub 端口 → 容器 9200 |
+| `DASH_PORT` | `3000` | **`3200`** | 宿主侧 dashboard 端口 → 容器 3000 |
+| `COMPOSE_DATA_DIR` | `./data` | 未设（= 默认 ./data） | bind mount 宿主侧目录 → 容器 `/data`（hub.env + commhub.db + uploads） |
+| `ANET_SOURCE_REV` | 无默认（label 记 `unknown`） | 未设 | hub 镜像 label 里的源码提交（部署身份） |
+
+> `DASH_PORT` 的默认值（3000）与现网值（3200）**不一致是有意的**：3000 是 compose 的
+> 中性默认，3200 是本机让 dashboard 与宿主 gitea 共存的运维选择。新机器照抄 `.env`，
+> 不要改 compose.yaml 里的默认值。
+
+### 8.5 两条 dashboard 镜像路径（不要混用）
+
+| 路径 | 构建定义 | 部署身份 | 网络/端口 |
+|---|---|---|---|
+| **本套件**（现网形状） | `deploy/compose/Dockerfile.dashboard`（npm 钉版本） | label `ai.anet.deploy.pinned_npm_version` | 桥接网络，`${DASH_PORT:-3000}:3000` |
+| **dashboard 仓库源码构建**（pixb 新代码） | `agent-network-dashboard/deploy/compose/Dockerfile.source` | label `org.opencontainers.image.revision` = pixb 提交 | host 网络，`127.0.0.1:3001` |
+
+两者都会占用 dashboard 的监听端口与镜像标签，**不能同时跑**。pixb 上的新代码只存在于
+源码构建路径（我们不发 npm，registry 上没有它）。
+
+### 8.6 新增的契约测试
+
+`tests/compose-rebuild/`：`compose-contract.sh`（定义完整性，含「与镜像内 entrypoint 逐字一致」）
+与 `rebuild-drill.sh`（真构建 + fail-closed + 真起 `/health`，全在一次性标签/端口/数据目录上）。
