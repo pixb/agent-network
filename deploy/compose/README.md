@@ -260,3 +260,29 @@ compose 自动读同目录 `.env`（shell 环境优先）。现网这台机器�
 
 `tests/compose-rebuild/`：`compose-contract.sh`（定义完整性，含「与镜像内 entrypoint 逐字一致」）
 与 `rebuild-drill.sh`（真构建 + fail-closed + 真起 `/health`，全在一次性标签/端口/数据目录上）。
+
+## 9. 2026-11-04 19:11 现网 dashboard 已切到 pixb 源码构建（部署实测）
+
+dashboard 服务现在跑的是 **`agent-network-dashboard` 仓库 pixb 提交 `71c895c` 的源码构建镜像**
+（`docker inspect anet-dashboard:compose` 的 `org.opencontainers.image.revision`）。
+装发布包那条（`Dockerfile.dashboard` + `ARG DASH_VERSION=0.6.3-preview.56`）**保留**，
+它是回滚件的权威描述，现网回滚标签 `anet-dashboard:rollback-20261104` 就是那份产物。
+
+换版本动作与「现网镜像标签」的耦合点（本轮实测，三条都是硬要求）：
+
+```bash
+docker tag <现网 image id> anet-dashboard:rollback-<日期>     # ① 覆盖标签前先留回滚件
+cd ../../agent-network-dashboard
+git status --porcelain                                       # ② 工作树必须干净
+docker build -t anet-dashboard:compose -f deploy/compose/Dockerfile.source \
+  --build-arg SOURCE_REV=$(git rev-parse HEAD) .             # ③ 身份 = 已推送的 pixb 提交
+cd ../agent-network/deploy/compose
+docker compose up -d --no-build dashboard                    # ④ 必须 --no-build
+```
+
+④ 为什么是硬要求：`build.dockerfile` 指的是 npm 钉版本那份定义，不带 `--no-build` 的 `up`
+会按它重建，把刚部署的 pixb 镜像静默换回 preview.56。
+另记一条 compose 5.5 行为：旧容器名占用时新容器会被命名成 `<短id>_anet-dashboard-1`，
+`docker rm -f` 那个名字再 `up` 一次才恢复成 `anet-dashboard-1`（runbook 引用的是后者）。
+
+完整前后对照、回滚命令与实测证据：`docs/tests/report-dashboard-deploy-20261104.txt`。

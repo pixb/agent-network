@@ -87,6 +87,12 @@ chk "README 记录实测拓扑（容器名/宿主端口/数据挂载）" \
   "grep -q 'anet-dashboard-1' README.md && grep -q '3200' README.md && grep -q 'COMPOSE_DATA_DIR' README.md"
 chk "README 写明 dashboard 的两条镜像路径不可同时跑（本套件桥接 :3200 与 dashboard 仓库 host :3001）" \
   "grep -q 'Dockerfile.source' README.md && grep -qiE '不能同时跑|不可同时跑' README.md"
+chk "README 写明换 dashboard 镜像必须 --no-build（带构建的 up 会按 npm 钉版本定义静默换回旧版）" \
+  "grep -q -- '--no-build' README.md && grep -q rollback-20261104 README.md"
+# 模式以 - 开头时必须用 -- 结束选项解析，否则 grep 报 unrecognized option，
+# 检查在 set -e 下变成硬失败、在非 set -e 下变成静默假阴性（本轮同一坑第二次）。
+chk "README 记录 compose 5.5 的容器命名坑（旧名占用时新容器叫 <短id>_anet-dashboard-1）" \
+  "grep -qE \"_anet-dashboard-1\" README.md"
 chk "README 写明分支模型（pixb 生产 / 不发 npm / 部署身份=源码提交）" \
   "grep -qi '不发 npm' README.md && grep -q '部署身份' README.md"
 chk "README 写明数据目录权限要求（容器 uid 1000 要能写，docker 自动建的是 root owned）" \
