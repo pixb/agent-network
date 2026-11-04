@@ -115,12 +115,52 @@ commit 7468ccb（不发版、不发 npm；发布须先经 main）
    nodes 4→2，tasks/inbox/completions 不受影响（DELETE 级联只动 nodes/sessions/
    team/requirement 引用）。
 
-════════════════════════════════════════════════════════════════════════
-6. 遗留
-════════════════════════════════════════════════════════════════════════
-- Dashboard 侧改动在 pixb 分支，未发布 npm：生产 :3000 看不到新页，直到走
-  发布链路（合 main → 发版 → dash-start.sh 的 VERSION/RUNTIME_BIN 同步 → pm2 重启）。
-- 未读消费（把 user_inbox 的行标成已读）本屏没做：hub 侧入口是
-  POST /api/messages/ack（kind='human_dm' 走 user_inbox 的专用分支）。
-- 42 行历史私信需要一次归档决定（哪些 ack、哪些留）。
+═══════════════════════════════════════════════════════════════════════
+6. 第二轮：已读能力 + 私信并进消息流 + compose 部署定义入库
+   （dashboard 仓库 pixb，7468ccb..b84d315）
+═══════════════════════════════════════════════════════════════════════
+
+6.1 已读能力（上一版缺的那块）
+    新增 app/api/hub/messages-ack/route.ts → POST /api/messages/ack，只放行
+    message_ids / message_id / agent / network_id，其余显式 400。收件箱页按发信人
+    整批 ack。实测（一次性 hub，真会话 cookie）：unread 1 → 0，agent_message 行
+    acked=True；非白名单字段返回 400。
+    为什么用 {agent} 形态：逐条 ack 清不完存量（生产 admin user_inbox 522 行）。
+
+6.2 私信并进 Messages 时间线
+    app/lib/messages-merge.ts：合并只做在前端。hub 侧 inbox.acked 由节点消费、
+    user_inbox.acked 由人 ack，两张表各有语义；把私信在 hub 写成两行必然出现
+    「一处已读一处未读」。去重按带命名空间的 key（ui: 前缀，常量在 lib），
+    永不按内容去重。
+    页面守卫全部改用合并后的列表：admin 的真实形状是 inbox 0 行 / user_inbox 42 行，
+    写死 messages.length 会让搜索框与筛选条整块消失。
+    hub-error-propagation.test.mjs 的空态守卫同步放宽到合并后的列表：继续写死
+    messages.length 会在「读失败 + 收件箱有行」时渲染 EmptyState，正是该测试要拦的事。
+
+6.3 compose 部署定义入库（dashboard 仓库 deploy/compose/）
+    背景：pm2 那条在 agent-network 仓库有权威副本，compose 那份此前只存在于运行机上。
+    新文件：Dockerfile、compose.yaml、dashboard.env.template（只有变量名与占位符）、
+    README.md（现网是 pm2、切换要评审、怎么证明真实生效、dashboard 无状态）。
+    三条实测结论进了定义：
+    - 就绪探针用 /login，不用 /api/hub/health（后者无会话返回 401，会被判不健康）。
+    - 只监听 127.0.0.1:3001：ENV HOSTNAME + network_mode: host，不用 ports:。
+      bin/start.js 的地址优先级是 HOST > HOSTNAME > 默认。
+    - DASHBOARD_PASSWORD 容器内必设：代码回落到 ~/.config/anet/cli.json，容器里无该
+      文件 → 口令为空 → 谁都登不进去，而 /login 照常 200、探针照常 healthy。
+    契约测试：bash tests/compose-contract.sh（npm run test:compose），含「代码里读的
+    每个 env 名字都必须在模板里声明」的反向对齐检查。首跑拦下三处自写错误。
+
+6.4 验证
+    dashboard：npm test 54/54；npm run gates 全绿（named-palette 回到基线 1076）；
+    npm run build 出 /messages/inbox 与 /api/hub/messages-ack；
+    npm run test:inbox 6 项全过；npm run test:compose 全过（含 docker compose config）。
+
+═══════════════════════════════════════════════════════════════════════
+7. 遗留
+═══════════════════════════════════════════════════════════════════════
+- Dashboard 侧改动在 pixb 分支，未发布 npm：生产 :3000 看不到这些，直到走发布链路
+  （合 main → 发版 → dash-start.sh 的 VERSION/RUNTIME_BIN 同步 → pm2 重启）。
+  换版本后必须用 `pm2 describe anet-dashboard` 的 script path 证明真实生效（本次实测过
+  一个反例：pm2 online、/login=200，而 script path 还指着上一版运行时目录）。
+- 42 行历史私信的归档决定未做：现在有按钮了，可以按发信人整批 ack。
 - 生产 hub 未做任何写操作（除 §5.5 那两个残留节点行的删除，按请求执行）。
