@@ -55,6 +55,13 @@
 
 通过 CommHub MCP 工具通信。收到任务直接执行，完成后回复结果。
 
+约定（判据与实测见 `.agents/skills/agent-network-skill/SKILL.md` §7.0 与 `docs/tests/report-dm-visibility-20261104.txt`）：
+
+- **指挥室是用户账号，不是节点**：派活用 utok/atok；不要给 manager 建节点（`report_status` 拒用户 token，人也无 `sessions` 行）。
+- **每项目一个 network**（B 方案）：节点别名带机器+项目；`utok` 无隐式网络，读接口一律带 `?network_id=`。
+- **中途提问用 `dm <用户名>`**（进 `user_inbox`，Dashboard `/messages/inbox` 可读，任务保持 running）；**回答即交付用 `reply --via send_reply`**（进 `inbox`，Messages 页可读）。默认 `reply`（`report_completion`）只写 `completions` + `tasks.result`，**在 Messages 页与收件箱都看不见，人也没有未读**。
+- **派活显式写 `ttl_seconds`**（默认 3600s；上限 86400；`retry_task` 只续 1 小时）。
+
 - **指挥室（manager）是用户账号，不是节点，也不需要节点**：派活用 `utok_` ⇒ `tasks.from_name` = 用户名；`report_status` 拒用户令牌 ⇒ 没有可心跳的东西；人没有 `sessions` 行 ⇒ 不能被 `send_task`/`say` 投递。
 - **交付必须走任务**：节点用 `send_reply`（落 `inbox(session_name=<派活用户名>)`，dashboard Messages 可见）。`report_completion` 只写 `completions`，**不进消息流**；`send_desktop_message`（私信）落 `user_inbox`，**dashboard 没有页面读它**（`/dm` 前端不存在）。
 - **一个项目 = 一个 network**：alias 唯一性按 network 判定，`utok_` 无隐式网络（REST 读必须带 `?network_id=`），节点 alias 带机器+项目前缀。

@@ -1,0 +1,121 @@
+报告：让 manager 与手动节点之间的消息在 Dashboard 上可见
+日期：2026-11-04  网络：net_b91c0d535346（只读测量，未改生产数据）
+关联：.agents/skills/agent-network-skill（submodule，commit c5fc127）
+      agent-network-dashboard（独立仓库/独立 npm 包，分支 pixb，commit 7468ccb）
+
+════════════════════════════════════════════════════════════════════════
+1. 现象与判据
+════════════════════════════════════════════════════════════════════════
+现象：admin 登录 Dashboard（:3200）看不到节点发给他的私信。
+
+判据（三条一起成立才算修好）：
+  A 节点发出的私信在 Dashboard 上有页面能读到；
+  B 页面读的是 hub 真实返回的那张表，不是前端二次加工；
+  C 「读不到」这件事本身有自动化测试会红。
+
+════════════════════════════════════════════════════════════════════════
+2. 只读测量（生产 hub，GET only）
+════════════════════════════════════════════════════════════════════════
+GET /api/messages?scope=user&network_id=net_b91c0d535346（admin 的收件箱）
+  → 42 行，acked 全 0，pending_count=42
+    25 task_expired / 9 task_orphan_suspected / 8 agent_message / 0 human_dm
+GET /api/messages?alias=admin&network_id=…
+  → 5 行 type=reply；pending_count=354
+GET /api/tasks?network_id=…（最近 200 条）
+  → 144 replied / 22 cancelled / 13 failed / 16 expired / 8 delivered / 2 running
+  → from_name=admin 200/200（派活方是用户账号，不是节点）
+  → 过期任务的 TTL：min 600s / median 3600s / max 14400s
+  → 一批 5 条 04:01:44 派出（ttl 7200s）在 06:01:44 集体过期，06:06:03 巡检发出
+    「5 个任务已过期」通知（该通知就是上面的 task_expired 行）
+
+结论：私信数据一直在 hub 的 user_inbox 里，Dashboard 前端没有任何调用带
+scope=user（app/ 下 grep 0 命中）—— 缺的是读它的那一屏，不是丢消息。
+
+════════════════════════════════════════════════════════════════════════
+3. Dashboard 侧改动（独立仓库 agent-network-dashboard，分支 pixb）
+════════════════════════════════════════════════════════════════════════
+commit 7468ccb（不发版、不发 npm；发布须先经 main）
+
+  app/lib/user-inbox.ts                    新增：user_inbox 纯函数层
+  app/lib/hooks.ts                         新增 useUserInbox（?scope=user）
+  app/api/hub/messages/route.ts            透传 scope / kind / unacked_only
+  app/messages/inbox/page.tsx              新页「我的收件箱」
+  app/messages/page.tsx                    头部加入口（带未读数，放在
+                                           `messages.length > 0` 门之外）
+  CHANGELOG.md                             Unreleased 条目
+
+验证：
+  npm test            → 53/53 test files passed（45 via bun test, 8 self-executing）
+                        含新增 app/lib/user-inbox.test.mjs（15 断言）、
+                        app/lib/user-inbox-proxy.test.mjs（8 条源码级契约）
+  npm run build       → 编译成功，产出静态路由 /messages/inbox
+                        （.next/server/app/messages/inbox.html 存在）
+
+未做（明确不做）：
+  - 未发布 npm、未改 ~/.commhub/dashboard-runtime-vNN 与 deploy/dashboard/dash-start.sh
+    的 VERSION/RUNTIME_BIN（生产升级走 npm 发布链路，须先合入 main）。
+
+════════════════════════════════════════════════════════════════════════
+4. 一次性 hub 实测的通道落点（skill 仓 tests/manual_node_scenario.sh）
+════════════════════════════════════════════════════════════════════════
+每条都在 throwaway hub 上真跑（注册真实用户 + 真实节点 token），读回真实 REST：
+
+  通道                       落表                                   Dashboard 页面
+  ─────────────────────────────────────────────────────────────────────────────
+  send_task                  tasks + inbox                          Tasks / Messages
+  report_status              sessions                               Nodes
+  reply --via send_reply     inbox(session_name=派单人用户名) +      Messages
+                           tasks.result
+  reply（默认 =              completions + tasks.result             只有 Tasks 页；
+  report_completion）                                              Messages 与收件箱都没有，人无未读
+  dm（send_desktop_message） user_inbox(kind=agent_message)          /messages/inbox
+  say（send_message）        inbox(session_name=节点别名)            Messages
+
+关键实测细节（不是文档推论）：
+  - 默认 `reply` 跑完后 `SELECT ... FROM inbox` 全程只有派活那一条行；私信表
+    user_inbox 为空。→ 「report_completion 发了，Dash 上看不见」是落表形状，
+    不是投递失败。
+  - `--via send_reply` 后同一文本出现在 `?alias=<用户名>` 与 `?tasks` 的 result
+    里；`?scope=user` 里没有。
+  - `dm` 后同一文本出现在 `?scope=user` 里、`?alias=` 里没有；任务保持 running，
+    下一轮任务照常投递进节点 inbox。
+  - 人类账号没有 sessions 行 → `say <用户名>` 必然 alias_not_found；`dm` 用
+    to_username，节点 token 即可发。
+  - 人↔人私信（/api/dm，kind=human_dm）发件人固定为鉴权用户名，且拒绝 dm_to_self。
+
+自动化结果：
+  python3 scripts/run_pipeline.py   → rollout: 55 passed, 0 failed, 0 errored, 0 regressed
+                                      （11 个 golden case × 5 条判据）
+  python3 scripts/run_evals.py --validate → VALID agent-network-skill.eval.md
+  已知缺口（非本次引入）：scripts/evolve.py 的 staleness 步骤调用仓库里不存在的
+  scripts/staleness_check.py，`evolve.py` 因此恒定 FAILED（其 evals 步骤本身通过）。
+
+════════════════════════════════════════════════════════════════════════
+5. 约定（写进 skill，供派活方与节点双方遵守）
+════════════════════════════════════════════════════════════════════════
+1. 指挥室是用户账号，不是节点。派活用 utok/atok；不要给 manager 建节点
+   （report_status 拒用户 token，人也没有 sessions 行可投递）。
+2. 拓扑 B 方案：每项目一个 network；节点别名带机器+项目；utok 无隐式网络，
+   读接口一律带 ?network_id=。
+3. 中途提问用 `dm <用户名>`（任务保持 running，人收到未读）；回答即交付用
+   `reply --via send_reply`（进消息流）；纯收尾用默认 `reply`（只有 Tasks 页可见）。
+   提问绝不写成 reply：send_reply/report_completion 都是终态，replied 不在
+   retry_task 接受集合里。
+4. 派活显式写 ttl_seconds（默认 3600s = 一小时；上限 86400）；retry_task 只续
+   1 小时，长跑的活重新派。COMMHUB_STALE_OPEN_TASK_HOURS 默认 0（生产未设置），
+   它管的是「开工后静默」，不替代 TTL 决定；要启用需评审后改 ~/.commhub/hub.env。
+5. 残留节点清理：`anet node delete` 先删本地目录再删 hub 行，hub 半边失败会只
+   留 warning；用 `anet node delete <node_id> --hub-only` 重试。本次删掉
+   n_bec69957（manager）与 n_e73e4164（30-pix-auto-video-opencode）后，
+   nodes 4→2，tasks/inbox/completions 不受影响（DELETE 级联只动 nodes/sessions/
+   team/requirement 引用）。
+
+════════════════════════════════════════════════════════════════════════
+6. 遗留
+════════════════════════════════════════════════════════════════════════
+- Dashboard 侧改动在 pixb 分支，未发布 npm：生产 :3000 看不到新页，直到走
+  发布链路（合 main → 发版 → dash-start.sh 的 VERSION/RUNTIME_BIN 同步 → pm2 重启）。
+- 未读消费（把 user_inbox 的行标成已读）本屏没做：hub 侧入口是
+  POST /api/messages/ack（kind='human_dm' 走 user_inbox 的专用分支）。
+- 42 行历史私信需要一次归档决定（哪些 ack、哪些留）。
+- 生产 hub 未做任何写操作（除 §5.5 那两个残留节点行的删除，按请求执行）。
