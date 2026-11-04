@@ -221,10 +221,13 @@ docker history anet-hub:compose → COPY deploy/compose/entrypoint.sh           
 1. **`./data` 必须能被容器 uid(1000) 写。** 目录不存在时 docker 自动建的是 root owned，
    hub 在 `bun:sqlite` 建库时抛异常，日志只有 `at new Database (bun:sqlite:262:28)`，
    看不出是权限问题。空机重建先 `mkdir -p data && chmod 777 data`。
-2. **构建期 npm 源是慢点。** dashboard 侧一次容器内 `npm ci` 实测 40 分钟未完成
-   （本机 registry 镜像报「免费节点当前繁忙」）。源码构建路径（dashboard 仓库
-   `Dockerfile.source`）已加 `ARG NPM_REGISTRY` + `--mount=type=cache` 复用 npm 缓存。
-   本套件的 dashboard 路径只装一个已发布包，不受这条影响。
+2. **构建期慢与失败的根因是 electron 的 postinstall，不是 npm 源**（这条先前的归因不准确，已量过）。
+   dashboard 侧「一次容器内 `npm ci` 跑 40 分钟未完成」，实测到的是
+   `npm error path /src/node_modules/electron` + `RequestError: socket hang up`：
+   `npm ci` 默认装 devDependencies，而 `electron`（devDep）的 install.js 要下载二进制包。
+   dashboard 仓库加 `ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1` 后，同一条 `npm ci` = 43 秒（冷缓存、官方源）。
+   registry 旋钮保留，边界写明：`npm ci` 认 lockfile 里的 resolved URL，换源只部分生效。
+   细节与体积数字见 dashboard 仓库 `deploy/compose/README.md`。
 
 ### 8.4 旋钮：名称 / 默认 / 现网实测值 / 来源
 

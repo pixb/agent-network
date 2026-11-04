@@ -27,6 +27,13 @@ trap cleanup EXIT
 [ -f deploy/compose/Dockerfile.hub ] || { echo "缺 deploy/compose/Dockerfile.hub" >&2; exit 1; }
 
 echo "── 1) 构建（标签用 :drill，绝不覆盖现网的 anet-hub:compose）"
+# 部署身份只在「已提交的树」上成立：镜像内容 = 构建时的工作树，label = 传入的 rev。
+# 工作树有未提交改动时，label 指向的提交并不包含那些改动，之后任何人按 label 去
+# checkout 都还原不出在跑的东西。本轮实测踩过（label 记 3ef356b，proxy 修复当时未提交）。
+if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+  echo "  FAIL: 工作树有未提交改动 —— 演练结论不可复现，先提交再演练" >&2; exit 1
+fi
+
 docker build -t "$TAG" --build-arg SOURCE_REV="$(git rev-parse HEAD)" \
   -f deploy/compose/Dockerfile.hub . > "$WORK/build.log" 2>&1 \
   && echo "  ok: 构建通过（lockfile 精确安装 + 源码拷贝）" \

@@ -164,3 +164,51 @@ commit 7468ccb（不发版、不发 npm；发布须先经 main）
   一个反例：pm2 online、/login=200，而 script path 还指着上一版运行时目录）。
 - 42 行历史私信的归档决定未做：现在有按钮了，可以按发信人整批 ack。
 - 生产 hub 未做任何写操作（除 §5.5 那两个残留节点行的删除，按请求执行）。
+
+## 7.6 部署演练本身抓到两个问题（演练的价值，不是顺带发现）
+
+演练内容：一次性容器（:3099，不碰 :3200/:3001）跑源码构建镜像，逐条量路由。
+
+### 发现 1：`/messages/inbox` 无 cookie 返回 200，而 `/messages` 返回 307
+
+不是数据泄露（取数据的 `/api/hub/*` 自带会话校验），是 **proxy.ts matcher 少写 `:path*`**。
+本项目对此有明文记录：proxy.ts 注释写着 2026-07-31 同类事故（`/nodes/:path*` 漏，
+`/nodes/<alias>` 无 cookie 可达，返回 200 + 36KB 页面壳），并给出规则：新增带子路由的页面，
+matcher 加 `:path*`，同时把该路径加进 `tests/e2e-proxy-auth-boundary.spec.ts` 清单。
+我加 inbox 子页时两条都没做。现已按规则补齐（matcher + 测试清单）。
+
+它能返回 200 的原因：门是**逐页**的 cookie 存在性重定向（proxy.ts），不是中间件全局生效——
+layout 里 `gate: 'auth'` 那个导出本身不产生重定向。proxy.ts 注释同时写明「这不是认证：
+伪造任意 cookie 值也能进门」，真正认证在 `/api/hub` 层。所以这条是页面壳可达，不是数据可读；
+规则仍要执行，因为页面一旦加上服务端取数，泄露立刻开始。
+
+### 发现 2：挂载 `~/.anet` 时 uid 决定成败
+
+`docker run`（镜像默认 uid 10001）只读挂载宿主 `/home/pix/.anet` → 容器读 `config.json`
+报 `EACCES`（宿主文件 600/uid 1000）。这就是 dashboard 仓库 compose.yaml 里
+`user: "1000:1000"` 的由来；用默认 uid 跑，每个 API 请求 500。两条已知失败模式演练里都撞到：
+缺 `config.json` = ENOENT 500，有文件但读不了 = EACCES 500。
+
+### 顺带纠正一条我自己在报告里写下的归因
+
+§8.3（compose 演练）里写「dashboard 侧一次容器内 `npm ci` 实测 40 分钟未完成，
+根因是本机 registry 镜像报『免费节点当前繁忙』」。**这条归因是错的。** 量到的是：
+
+```
+npm error path /src/node_modules/electron
+npm error command sh -c node install.js
+npm error RequestError: socket hang up
+```
+
+`npm ci` 默认连 devDependencies 一起装，`electron`（devDep，被移动端外壳工具链带进来）
+的 postinstall 要下载二进制包。镜像里从不启动 electron，所以 `ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1`
+之后同一条 `npm ci` 从 40 分钟未完成变成 **43 秒**（冷缓存、官方源、同一台机器）。
+registry 旋钮保留，但边界写清了：`npm ci` 认 lockfile 里的 resolved URL，换源只部分生效，
+换 npmmirror 时 electron 下载照样断流。教训是「慢」不等于「网络慢」，要看是哪一步在慢。
+
+### 顺带确认的三件正向事实### 顺带确认的三件正向事实
+- 镜像 label 带 `org.opencontainers.image.revision` = 构建时传入的 pixb 提交；label 记的是
+  **调用构建那一刻**的 HEAD，所以必须「先提交、后构建」，否则 label 对不上任何提交；
+- `/messages/inbox` 与 `POST /api/hub/messages-ack` 在源码镜像里**存在**（生产 preview.56 上是 404）；
+- `bin/start.js` 的地址优先级 HOST > HOSTNAME > 127.0.0.1 在真容器里成立：只给 HOSTNAME
+  （compose 注入的容器主机名）时监听地址是容器名，不是 127.0.0.1。
