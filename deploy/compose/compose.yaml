@@ -1,0 +1,81 @@
+# CommHub 生产栈（hub + dashboard）的可重建定义。
+#
+# 为什么必须补这一份（2026-11-04 实测）：现网两个容器都在跑，但它们引用的构建定义
+# 在磁盘和 git 里都没有副本 ——
+#   docker inspect anet-hub-1 → project.config_files = deploy/compose/compose.yaml
+#   该文件不存在；entrypoint.sh 也不存在（只在镜像里）。
+# 于是「机器被清空后能否重建」的答案原本是否定的：容器活着，定义已经没了。
+# 本文件 + Dockerfile.hub + entrypoint.sh 把这一层补成权威副本。
+#
+# 拓扑照现网实测形状写（`docker inspect` 的量，不是文档里的理想形状）：
+#   项目名 anet → 容器 anet-hub-1 / anet-dashboard-1，网络 anet_default
+#   hub       : 9200 -> 9200，bind mount ./data:/data
+#   dashboard : 3200 -> 3000，无挂载（无状态）
+# 端口值来自 .env 的 HUB_PORT / DASH_PORT，不在这里写死。
+#
+# 六个恢复问题：
+#   1) 常驻服务怎么起 → 本文件 restart: unless-stopped + `docker compose up -d`
+#   2) 端口/反代写在哪 → 本文件 ports:（宿主 9200/3200），反代层见 deploy/dashboard/README.md
+#   3) 密钥从哪来 → env_file：hub 密钥 data/hub.env（0600，不入库），
+#      dashboard 变量 dashboard.env（名字见 dashboard.env.example）
+#   4) 怎么换版本并验证真实生效 → 换 pixb 提交 + `docker compose build --build-arg SOURCE_REV=<sha>`，
+#      验证 `docker inspect` 的 label org.opencontainers.image.revision
+#   5) 怎么回滚 → 检出旧提交重建（源码在 git，旧提交永远构建得到）
+#   6) 哪些状态只能从数据备份恢复 → hub 的 SQLite（bind mount ./data，含 uploads 与 backups）；
+#      dashboard 无状态。见 README「数据与密钥」
+name: anet
+
+services:
+  hub:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile.hub
+      args:
+        # 部署身份 = 源码提交（pixb 生产分支；我们不发 npm）。
+        SOURCE_REV: ${ANET_SOURCE_REV:-unknown}
+    image: anet-hub:compose
+    restart: unless-stopped
+    ports:
+      - "${HUB_PORT:-9200}:9200"
+    # 生产数据库与上传件在这里。这一行是数据与软件的边界：
+    # `docker compose down -v` 不动 bind mount，但删掉本目录 = 删掉生产数据。
+    volumes:
+      - ${COMPOSE_DATA_DIR:-./data}:/data
+    environment:
+      PORT: "9200"
+      # 容器内监听 0.0.0.0 是 compose 桥接网络形状（现网实测 HOST=0.0.0.0）：
+      # 外部可达性由 ports: 决定，不由这里决定。改这里不会让服务少暴露一点。
+      HOST: "0.0.0.0"
+      COMMHUB_DB: /data/commhub.db
+      COMMHUB_UPLOADS_DIR: /data/uploads
+    # 密钥走 env_file：值不进 compose.yaml、不进 git、不进命令行。
+    # data/hub.env 已被根 .gitignore 排除（data/ 整条），权限实测 0600。
+    env_file:
+      - ./data/hub.env
+    healthcheck:
+      # 容器里没有 curl，探针必须用 bun 发（现网容器就是这个形状）。
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:9200/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+
+  dashboard:
+    # 镜像不在这里构建：dashboard 的源码在**另一个仓库**（agent-network-dashboard），
+    # 构建定义在那边的 deploy/compose/（源码路径 Dockerfile.source、装包路径 Dockerfile）。
+    # 跨仓库 build 会把两个仓库的提交历史搅在一起，所以这里只引用镜像名，
+    # 构建步骤写进 README，且要求记回本次部署的 dashboard 提交 SHA。
+    image: anet-dashboard:${ANET_DASHBOARD_IMAGE_TAG:-compose}
+    restart: unless-stopped
+    # depends_on 的 service_healthy 依赖 hub 镜像自带的 healthcheck（实测存在）。
+    depends_on:
+      hub:
+        condition: service_healthy
+    ports:
+      - "${DASH_PORT:-3200}:3000"
+    # 无 volumes：dashboard 无状态，登录用户/token/任务/消息全在 hub 侧。
+    environment:
+      PORT: "3000"
+      HOST: "0.0.0.0"
+    env_file:
+      - ./dashboard.env

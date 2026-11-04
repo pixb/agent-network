@@ -1,0 +1,62 @@
+# CommHub Hub 镜像 —— 现网 `anet-hub:compose` 的权威重建定义。
+#
+# 为什么这份文件是新写的：现网 hub 容器（`anet-hub-1`，2026-10-22 起）的构建定义
+# 在磁盘和 git 里都没有副本 —— 容器 label 指着的
+# `deploy/compose/compose.yaml` 与 `deploy/compose/entrypoint.sh` 都已不在。
+# 本文件按运行中镜像的 `docker history` 逐层还原，不是凭记忆重写。
+#
+# 还原依据（2026-11-04 实测，`docker history anet-hub:compose`）：
+#   FROM oven/bun:1.4.0
+#   ENV npm_config_audit=false npm_config_fund=false
+#   WORKDIR /app
+#   COPY server/package.json /app/server/package.json
+#   RUN cd /app/server && bun install
+#   COPY server/ /app/server/
+#   RUN chown -R bun:bun /app
+#   COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
+#   RUN chmod 755 … ; USER bun ; EXPOSE 9200
+#   ENTRYPOINT anet-hub-entrypoint ; CMD bun run /app/server/bin/commhub.ts
+#
+# 与镜像唯一两处刻意不同（都是往「可复现」方向收紧，不改变运行行为）：
+#   1. 一起 COPY `server/bun.lock`，用 `bun install --frozen-lockfile`。
+#      镜像里只拷了 package.json，装出来的依赖树不由 lockfile 唯一决定；
+#      AGENTS.md「锁定可复现输入」要求 lockfile 参与。
+#   2. 镜像 label 记源码提交（部署身份）。分支模型：pixb 是生产分支、不发 npm，
+#      所以「部署的是哪份代码」只能由源码提交表达。查：
+#        docker inspect anet-hub:compose --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+ARG BUN_IMAGE=oven/bun:1.4.0
+FROM ${BUN_IMAGE}
+
+# 与现网镜像一致：装依赖时不审计、不打扰（构建不该联网去 registry 拉统计）。
+ENV npm_config_audit=false \
+    npm_config_fund=false \
+    BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+
+WORKDIR /app
+
+# 依赖清单先走，源码后走：源码改动不该让依赖树重新解析。
+COPY server/package.json server/bun.lock /app/server/
+RUN cd /app/server && bun install --frozen-lockfile
+
+COPY server/ /app/server/
+COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
+RUN chmod 755 /usr/local/bin/anet-hub-entrypoint \
+ && chown -R bun:bun /app
+
+# 部署身份 = 源码提交（由 compose 的 build args 传入）。
+ARG SOURCE_REV=unknown
+LABEL org.opencontainers.image.title="anet-hub" \
+      org.opencontainers.image.revision="${SOURCE_REV}" \
+      ai.anet.deploy.branch="pixb" \
+      ai.anet.deploy.source_revision="${SOURCE_REV}"
+
+USER bun
+EXPOSE 9200
+
+# 就绪探针：`/health`。注意容器里 bun 在 PATH 上，`curl` 不在 —— 探针必须用 bun 发。
+# 现网容器用的就是这个形状（实测 docker inspect 的 Healthcheck.Test）。
+HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=30 \
+  CMD bun -e "fetch('http://127.0.0.1:9200/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["/usr/local/bin/anet-hub-entrypoint"]
+CMD ["bun", "run", "/app/server/bin/commhub.ts"]

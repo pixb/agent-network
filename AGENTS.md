@@ -12,17 +12,29 @@
 
 ## 开发规则
 
+- **不发 npm：生产从 `pixb` 本地构建部署**。`pixb` 是我们自己的生产分支（2026-11-04 定义），
+  生产机器从 pixb 源码构建；部署身份 = **pixb 的源码提交**，不是 npm 版本号。
+  验证生效只问常驻进程实际加载的是哪份代码（compose：镜像 label
+  `org.opencontainers.image.revision`；pm2：`pm2 describe` 的 script path）。
+  现网已实测过反例：pm2 online + `/login`=200，而 script path 还指着上一版运行时目录。
+- **需要对外发布时才发 npm，且只从 main 发**：功能分支可构建、打包和测试，但不得向 npm
+  发布包或 executable；release 变更必须先合入 `main`，再从该 `main` 精确提交发布。
+  日常交付不走这条路。
+- **不依赖 registry 启动**：常驻服务的启动与构建都不得在运行时去 npm registry 取包。
+  2026-07-29 版本被钉到尚未发布的号上，npx 每次 ETARGET 即退，pm2 无退避重启 34494 次
+  整夜锤 registry（见 `deploy/dashboard/dash-start.sh` 头部注释）；npx 还会把生产服务跑在
+  `~/.npm/_npx/<hash>/` 里，一条 `npm cache clean` 就能删掉线上运行目录。
 - **不频繁发 npm preview**：本地源码开发，大版本完成时统一发
-- **对外 npm 产物只从 main 发布**：功能分支可构建、打包和测试，但不得向 npm 发布包或 executable；release 变更必须先合入 `main`，再从该 `main` 精确提交发布
 - **不改本地全局 npm 包**：只改 git 仓库源码
 - **Docker 先验证**：所有改动 Docker E2E 通过后再合并
 - **向后兼容**：旧 atok_ token 仍然有效
 
 ## 分支规则
 
-- **只有两个长期分支**：`main` 是 `upstream/main` 的镜像；`pixb` 是我们的功能分支，从 `main` 分出
+- **只有两个长期分支**：`main` 只作为**上游同步分支**（`upstream/main` 的镜像）；`pixb` 是我们的
+  **生产分支**，只在本地部署（2026-11-04 定义：生产从 pixb 构建，不发 npm）
 - **main 不写业务提交**：同步只做 `git fetch upstream main` + `git branch -f main upstream/main`（fast-forward），随后 `git push origin main`
-- **上游更新只能经 main 进入 pixb**：`git checkout pixb && git merge main` —— 用 **merge**
+- **上游更新只能经 main 进入 pixb**：`git checkout pixb && git merge main` —— 用 **merge**。后期上游有更新时只走这一条
 - **禁止把 pixb rebase / reset 到上游**：2026-10-29 那次 rebase 只搬走了 tip 修复，丢掉 RFC-043 的 3 个核心提交，症状是 `anet node create --runtime pi-cli` 报 `unsupported runtime "pi-cli"`（白名单里有、`canonicalizeRuntime` 里没有）。恢复过程与验证见 `docs/tests/report-pi-restore-merge-20261103.txt`
 - **新增 runtime 是一张表，不是一串 if**：`agent-network/src/normalize-runtime.ts` 的 `SUPPORTED_RUNTIME_NAMES` + `canonicalizeRuntime`、daemon 的 `VALID_RUNTIMES`、hub 的 `server/src/create-node-validate.ts` 的 `RUNTIMES` 必须同时改；探针是 `agent-node/src/runtime/runtime-set-parity.test.ts`（#1298 跨包等价门）和 `create-node-validate.test.ts` 的「恰好 N 个」断言
 - **成对包必须同树构建**：`anet` 与 `agent-node` 的 `PAIRED_*` 版本出自同一棵树；只有白名单、没有运行时的半成品包不得外发（`2.3.0-preview.200` / `2.5.0-preview.165` 已删除）

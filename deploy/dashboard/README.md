@@ -10,6 +10,32 @@
 数据不在此列:Hub 的 SQLite 内容无法从 repo 复现,要么来自备份,要么重新注册。
 本文档只保证**软件与运行方式**可复现。
 
+## ⚠️ 2026-11-04 分支与部署模型变更(先读这一节,下面的 npm 流程据此重新定位)
+
+新定义(与仓库根 `AGENTS.md` 一致):
+
+- **`pixb` 是我们自己的生产分支**,生产只从 pixb **本地构建**部署,**不发 npm**。
+- **`main` 只作为上游同步分支**;上游更新用 merge 进 pixb。
+- 于是**部署身份 = pixb 的源码提交**,不是 npm 版本号。换版本 = 换提交 + 重建;
+  回滚 = 检出旧提交重建。不依赖 registry 上还剩哪个版本。
+
+现网现状(实测,非推断):dashboard 跑在 **compose 容器 `anet-dashboard-1`** 里
+(镜像 `anet-dashboard:compose`,宿主 `3200` -> 容器 `3000`,项目 `anet`),页面上自报
+`0.6.3-preview.56`,`/messages/inbox` = 404,`POST /api/hub/messages-ack` = 404
+(已存在的代理路由 POST 返 405,所以 404 = 路由不存在)。**下面这套 pm2 流程是历史路径**,
+`dash-start.sh` 留着是因为它是那份固化安装的权威启动器,机器清空后照它能重建出那一条。
+npm `preview` 标签在 `0.6.3-preview.60`,而 `main` 顶端那个 release 号(345)**registry 里 404**,
+从未发布过 —— 也就是发布链在本次变更之前就已经断了一截,新模型正好把这条路关掉。
+
+**源码构建的主路径在 dashboard 仓库**:`agent-network-dashboard/deploy/compose/`
+(`Dockerfile.source` + `compose.yaml` + `dashboard.env.template` + `README.md`),
+部署身份写进镜像 label `org.opencontainers.image.revision`。契约测试:
+`npm run test:compose`。
+
+本文以下章节(第二节起的 npm 发布流程)的定位改为:
+1. **历史路径的权威记录** —— 现网那个固化安装就是这么来的,机器清空后照它能重建出今天的东西;
+2. **将来真要对外发布时才走** —— 那条路仍遵守「只从 main 发」。
+
 ---
 
 ## 一、拓扑(这层最容易猜错)

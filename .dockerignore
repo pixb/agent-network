@@ -1,0 +1,25 @@
+# 构建上下文瘦身（2026-11-04 补）。
+#
+# 父仓库此前没有 .dockerignore：`COPY server/ /app/server/` 会把
+# server/node_modules（实测 35M）当上下文传进 daemon，deploy/compose/data
+# （实测 25M，含生产 SQLite 与备份）也在上下文里 —— 数据进构建上下文
+# 既慢，又意味着任何一次 build 都在往 daemon 复制生产数据库。
+.git
+.gitignore
+**/node_modules
+**/.next
+**/dist
+deploy/compose/data
+deploy/compose/.env
+deploy/compose/dashboard.env
+docs/tests
+test-results
+playwright-report
+screenshots
+*.log
+*.tgz
+# 密钥只以 example 形式入库；真实 env 文件不进镜像层。
+.env
+.env.*
+!.env.example
+!*.env.example
