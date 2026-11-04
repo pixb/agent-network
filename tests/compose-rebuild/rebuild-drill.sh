@@ -30,7 +30,7 @@ echo "── 1) 构建（标签用 :drill，绝不覆盖现网的 anet-hub:compo
 # 部署身份只在「已提交的树」上成立：镜像内容 = 构建时的工作树，label = 传入的 rev。
 # 工作树有未提交改动时，label 指向的提交并不包含那些改动，之后任何人按 label 去
 # checkout 都还原不出在跑的东西。本轮实测踩过（label 记 3ef356b，proxy 修复当时未提交）。
-if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+if [ -n "$(git status --porcelain)" ]; then
   echo "  FAIL: 工作树有未提交改动 —— 演练结论不可复现，先提交再演练" >&2; exit 1
 fi
 
@@ -48,11 +48,27 @@ grep -q "ANET_HUB_SECRET_VAULT_KEY 未设置" <<<"$out" \
 
 echo "── 3) 起来并真答 /health（一次性目录 + 一次性密钥，绝不读 data/）"
 mkdir -p "$WORK/data" && chmod 777 "$WORK/data"   # 容器 uid 1000 要能写：见头部说明
+# 探针只有一处权威定义：compose.yaml 的 hub.healthcheck（镜像里刻意不写 HEALTHCHECK，
+# 两处定义迟早漂移）。演练用 docker run，所以把同一份探针从 compose.yaml 里读出来传进去，
+# 而不是在脚本里另抄一份 —— 2026-11-04 第一遍就是另抄口径跑挂的（health 状态 = none）。
+HEALTH_CMD="$(python3 - <<'PY'
+import shlex, yaml
+d = yaml.safe_load(open('deploy/compose/compose.yaml'))
+t = d['services']['hub']['healthcheck']['test']
+args = t[1:] if t[0] in ('CMD', 'CMD-SHELL') else t
+print(' '.join(shlex.quote(a) for a in args))
+PY
+)"
+[ -n "$HEALTH_CMD" ] || { echo "  FAIL: 没能从 compose.yaml 读出 hub 探针" >&2; exit 1; }
+echo "  演练用的探针（来自 compose.yaml）: $HEALTH_CMD"
+
 docker run -d --name "$NAME" \
   -e HOST=0.0.0.0 -e PORT=9200 \
   -e ANET_HUB_SECRET_VAULT_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
   -e COMMHUB_DB=/data/drill.db -e COMMHUB_UPLOADS_DIR=/data/uploads \
-  -v "$WORK/data:/data" -p "$PORT:9200" "$TAG" >/dev/null
+  -v "$WORK/data:/data" -p "$PORT:9200" \
+  --health-cmd "$HEALTH_CMD" --health-interval 5s --health-timeout 5s \
+  --health-start-period 20s --health-retries 30 "$TAG" >/dev/null
 code=000
 for _ in $(seq 1 40); do sleep 2; code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health")"; [ "$code" = "200" ] && break; done
 [ "$code" = "200" ] && echo "  ok: /health = 200" || { echo "  FAIL: /health = $code" >&2; fail=1; }
