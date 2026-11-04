@@ -54,3 +54,8 @@
 ## 通信
 
 通过 CommHub MCP 工具通信。收到任务直接执行，完成后回复结果。
+
+- **指挥室（manager）是用户账号，不是节点，也不需要节点**：派活用 `utok_` ⇒ `tasks.from_name` = 用户名；`report_status` 拒用户令牌 ⇒ 没有可心跳的东西；人没有 `sessions` 行 ⇒ 不能被 `send_task`/`say` 投递。
+- **交付必须走任务**：节点用 `send_reply`（落 `inbox(session_name=<派活用户名>)`，dashboard Messages 可见）。`report_completion` 只写 `completions`，**不进消息流**；`send_desktop_message`（私信）落 `user_inbox`，**dashboard 没有页面读它**（`/dm` 前端不存在）。
+- **一个项目 = 一个 network**：alias 唯一性按 network 判定，`utok_` 无隐式网络（REST 读必须带 `?network_id=`），节点 alias 带机器+项目前缀。
+- 细则与实测数据见 `.agents/skills/agent-network-skill/SKILL.md` §7.0 与 `references/manual-node.md`。
