@@ -50,6 +50,11 @@ commit 7468ccb（不发版、不发 npm；发布须先经 main）
                         app/lib/user-inbox-proxy.test.mjs（8 条源码级契约）
   npm run build       → 编译成功，产出静态路由 /messages/inbox
                         （.next/server/app/messages/inbox.html 存在）
+  tests/inbox-e2e/run.sh → inbox e2e: PASS (4 checks)（dashboard commit 6207a11）
+                        一次性 hub（端口 19961）+ 一次性 dev server（19962）+ 真登录会话：
+                        代理带 scope=user 回 1 行 kind=agent_message、unread=1；
+                        别名读路径里没有那条私信；/messages/inbox 返回 200 并渲染；
+                        消息流页有入口。只动临时目录/临时端口/临时账号，未连生产 hub。
 
 未做（明确不做）：
   - 未发布 npm、未改 ~/.commhub/dashboard-runtime-vNN 与 deploy/dashboard/dash-start.sh
