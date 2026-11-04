@@ -50,3 +50,9 @@ __pycache__/
 server/build-info.json
 agent-network/build-info.json
 agent-node/build-info.json
+
+# 运行机上 hub 的 compose 工作目录（deploy/compose/ 在仓库里只放定义，不放运行态）。
+# data/ 里是 hub 的 SQLite 与其备份（实测 25M，含 commhub.db 与 backups/）：它落在仓库工作树里，
+# 缺这一条时 `git add -A` 会把生产数据库连备份一起 staged。数据库内容不入 git（AGENTS.md
+# 「区分软件与数据」），要恢复的是加密备份，不是这个目录。
+deploy/compose/data/
