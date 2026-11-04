@@ -7,10 +7,12 @@
 #
 # 只读现网：不构建、不启动、不碰任何运行中的容器。
 set -euo pipefail
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"   # 脚本会 cd，之后 $0 不再指向自己
 cd "$(dirname "$0")/../../deploy/compose"
 fail=0
-chk() { if eval "$2"; then echo "  ok: $1"; else echo "  MISSING: $1" >&2; fail=1; fi; }
-absent() { if ! eval "$2"; then echo "  ok: $1"; else echo "  FORBIDDEN: $1" >&2; fail=1; fi; }
+ran_lines=""   # 执行过的 chk/absent 声明行号（末尾去重比对）
+chk() { ran_lines="$ran_lines ${BASH_LINENO[0]}"; if eval "$2"; then echo "  ok: $1"; else echo "  MISSING: $1" >&2; fail=1; fi; }
+absent() { ran_lines="$ran_lines ${BASH_LINENO[0]}"; if ! eval "$2"; then echo "  ok: $1"; else echo "  FORBIDDEN: $1" >&2; fail=1; fi; }
 
 echo "── 权威副本必须存在（这些此前都不在分支上）"
 for f in compose.yaml Dockerfile.hub Dockerfile.dashboard entrypoint.sh .env.example hub.env.example README.md; do
@@ -147,5 +149,17 @@ else
   python3 -c "import yaml; yaml.safe_load(open('compose.yaml'))" \
     && echo "  ok: YAML 语法合法（本机无 docker，未做 compose 语义校验）" \
     || { echo "  FAIL: YAML 语法非法" >&2; fail=1; }
+fi
+# 自检（本轮踩过两次）：`chk "描述" \` 与它的参数行是一对；中间插进别的内容会被 bash 续行
+# 拼接拆开，chk 收到的是字符串 "chk"，检查静默失效 —— 输出全绿而什么都没测。
+# 声明条数必须等于真正执行过的条数。
+declared="$(grep -c '^[[:space:]]*\(chk\|absent\) "' "$SELF" || true)"
+executed="$(for n in $ran_lines; do echo "$n"; done | sort -u | grep -c '^[0-9]')";
+if [ "${declared:-0}" != "${executed:-0}" ]; then
+  echo "  FAIL: 声明 $declared 条检查，真正执行过的声明行只有 $executed 条（chk 被拆开 = 假绿）" >&2
+  echo "  FAIL: 声明 $declared 条检查，真正执行过的声明行只有 $executed 条（chk 被拆开 = 假绿）" >&2
+  fail=1
+else
+  echo "  ok: 声明的 $declared 条检查全部真正执行（无拆开的 chk 假绿）"
 fi
 [ "$fail" = 0 ] && echo "生产栈可重建契约: PASS" || { echo "生产栈可重建契约: FAIL"; exit 1; }
