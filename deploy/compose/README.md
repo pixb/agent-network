@@ -87,6 +87,27 @@ docker compose -f deploy/compose/compose.yaml exec dashboard \
 
 版本号自报可以骗人，**构建产物核对不骗人**（与 `deploy/dashboard/README.md` §四同一判据）。
 
+## 4b. 进程自报构建标识（compose 路径必须自己写） {#build-info}
+
+镜像 label 只是元数据 —— **进程读不到自己是谁**。`/health` 的 `build_identified`
+只认制品里的 `server/build-info.json`（读取点：moduleDir 与其父目录）。
+
+- 构建时必须传 `--build-arg SOURCE_REV=<40 位 sha>`，可选 `--build-arg SOURCE_DIRTY=false`
+  （树不干净就别谎称干净，默认 `true` = 承认不知道）。
+- sha 不是 40 位十六进制 ⇒ **不写文件**（`/health` 诚实报 `build_identified=false`）；
+  写坏了会读成 `invalid`，那是缺陷，比 absent 更糟。
+- 判据（两条都要看，只看 label 会被骗）：
+
+```bash
+docker exec anet-hub-1 cat /app/server/build-info.json
+curl -s http://127.0.0.1:9200/health | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version'], d['build_identified'])"
+```
+
+实测教训：第一版判 sha 用手写 `case` 模式（`[0-9a-f]` 手敲 40 组、实际 39 组）⇒
+40 位 sha 永不匹配 ⇒ 静默走「不写文件」分支，label 正确而进程自报未识别。
+现在用 `grep -qE '^[0-9a-f]{40}$'`，并有契约门禁止手写重复括号。
+详见 `docs/tests/report-hub-deploy-20261106.txt`。
+
 ## 5. 如何回滚
 
 - **代码回滚**：`git checkout <上个好 commit>` → `up -d --build`。

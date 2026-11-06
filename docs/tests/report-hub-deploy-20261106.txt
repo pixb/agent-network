@@ -72,7 +72,16 @@ drill 里新增两条判据就是这类缺陷的网：制品里必须有 40 位 
 ## 契约与演练
 
     tests/compose-rebuild/compose-contract.sh   48 条 PASS（含自检：声明数 == 真正执行数）
-    tests/compose-rebuild/rebuild-drill.sh      见 /tmp/drill.log 结果（同源码从空库起一遍）
+    tests/compose-rebuild/rebuild-drill.sh      PASS（同一份源码从空库 + 一次性密钥起一遍）
+       ok: /health = 200
+       ok: 制品里有 build-info.json 且 commit 是 40 位 sha
+       ok: 进程自报 build_identified=true（问进程就知道跑的是哪份代码）
+       ok: 镜像自带 healthcheck 判为 healthy
+       ok: 自报版本 = 0.9.0-preview.265
+
+   演练的「工作树必须干净」这道门本次真的拦下一次：我在同一刻还在往仓库写报告，
+   演练直接 `FAIL: 工作树有未提交改动 —— 演练结论不可复现，先提交再演练`。
+   这道门不能松：演练的意义是「别人 checkout 这个提交能得到同样的结论」。
 
 ## 回滚
 
