@@ -156,6 +156,15 @@ else
     && echo "  ok: YAML 语法合法（本机无 docker，未做 compose 语义校验）" \
     || { echo "  FAIL: YAML 语法非法" >&2; fail=1; }
 fi
+chk "hub 镜像把构建标识写进制品（build-info.json，进程自报用）" \
+  "grep -q 'build-info.json' Dockerfile.hub"
+chk "标识 sha 校验失败时不写文件（写坏了读成 invalid，比 absent 更糟）" \
+  "grep -q '不写 build-info.json' Dockerfile.hub"
+chk "dirty 状态默认承认不知道（SOURCE_DIRTY=true）" \
+  "grep -q 'ARG SOURCE_DIRTY=true' Dockerfile.hub"
+chk "drill 判进程自报 build_identified（label 进程读不到，不能只 inspect）" \
+  "grep -q 'build_identified' ../../tests/compose-rebuild/rebuild-drill.sh"
+
 # 自检（本轮踩过两次）：`chk "描述" \` 与它的参数行是一对；中间插进别的内容会被 bash 续行
 # 拼接拆开，chk 收到的是字符串 "chk"，检查静默失效 —— 输出全绿而什么都没测。
 # 声明条数必须等于真正执行过的条数。

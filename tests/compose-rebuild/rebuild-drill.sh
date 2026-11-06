@@ -71,6 +71,15 @@ docker run -d --name "$NAME" \
 code=000
 for _ in $(seq 1 40); do sleep 2; code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health")"; [ "$code" = "200" ] && break; done
 [ "$code" = "200" ] && echo "  ok: /health = 200" || { echo "  FAIL: /health = $code" >&2; fail=1; }
+# 构建标识必须是**制品的一部分**：镜像 label 进程读不到，运维问进程问不出自己跑的是谁。
+# 实测 2026-11-06 部署 .265 后：label=ab240fc1… 而 /health 的 build_identified=false。
+bi="$(docker run --rm --entrypoint cat "$TAG" /app/server/build-info.json 2>/dev/null || true)"
+printf '%s' "$bi" | grep -qE '"commit":"[0-9a-f]{40}"' \
+  && echo "  ok: 制品里有 build-info.json 且 commit 是 40 位 sha" \
+  || { echo "  FAIL: 制品里没有可校验的 build-info.json（/health 只能诚实报未识别）" >&2; fail=1; }
+ident="$(curl -s --max-time 4 "http://127.0.0.1:$PORT/health" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("build_identified"))' 2>/dev/null)"
+[ "$ident" = "True" ] && echo "  ok: 进程自报 build_identified=true（问进程就知道跑的是哪份代码）" \
+  || { echo "  FAIL: 进程自报 build_identified=$ident" >&2; fail=1; }
 # 探针本身也要判得对：compose 定义的 healthcheck 必须把容器判成 healthy
 state=none
 for _ in $(seq 1 20); do sleep 3; state="$(docker inspect "$NAME" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}')"; [ "$state" = "healthy" ] && break; done

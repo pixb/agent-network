@@ -34,6 +34,23 @@ COPY server/package.json server/bun.lock /app/server/
 RUN cd /app/server && bun install --frozen-lockfile
 
 COPY server/ /app/server/
+# ── 构建标识（#3177 的 compose 版）────────────────────────────────
+# `/health` 的 build_identified 只认**制品里的** build-info.json，不认镜像 label：
+# label 是镜像元数据，进程读不到自己是谁。实测（2026-11-06，部署 .265 之后）
+# label = ab240fc1… 而 `build_identified=false`、`commit=null` —— 运维问「跑的是哪份代码」
+# 只能靠 docker inspect，问进程问不出来。npm 那条路靠 prepack 写这个文件，
+# compose 这条路由 ARG 写。
+# 🔴 拿不到 40 位 sha 就**不写文件**（读到 absent 是诚实的），也不要写 "unknown"：
+#    validateBuildInfo 只收 /^[0-9a-f]{40}$/，写坏了会读成 invalid（缺陷），比 absent 更糟。
+#    同理 SOURCE_DIRTY 默认 true —— 不知道就承认不知道。
+ARG SOURCE_DIRTY=true
+RUN case "${SOURCE_REV}" in \
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] ) \
+        printf '{"schema":1,"commit":"%s","dirty":%s,"built_at":"%s","source":"compose_build_arg"}\n' \
+          "${SOURCE_REV}" "${SOURCE_DIRTY}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /app/server/build-info.json ;; \
+      *) echo "SOURCE_REV 不是 40 位 sha（${SOURCE_REV}）⇒ 不写 build-info.json，/health 会诚实报 build_identified=false" >&2 ;; \
+    esac
+
 COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
 RUN chmod 755 /usr/local/bin/anet-hub-entrypoint
 
