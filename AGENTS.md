@@ -6,6 +6,15 @@
 - **前一层不过就不跑后面的**：被依赖的原子能力必须先验证可靠
 - **所有测试在 Docker 里跑**：不碰本地环境，不改生产（`tests/**` 那批；`server/src/*.test.ts` 的定向本地跑见 [docs/runbooks/local-iteration.md](docs/runbooks/local-iteration.md)）
 - **tmux 在测试里一律 `-L`/`-S` 私有 server + `env -u TMUX -u TMUX_PANE`；永远不 `kill-server`**（#505：子 agent 在 pane 里跑 `TMUX_TMPDIR=$d tmux kill-server`，继承的 `$TMUX` 优先于 `TMUX_TMPDIR`，打掉默认 server，71 个节点一起掉）。起真 tmux 会话的测试只在 Docker 里跑；产品代码只经 `agent-network/src/tmux.ts` 调 tmux（`tmux-ratchet.test.ts` 拦新增的裸调用）。
+- **断言的字符串必须是代码真会打的句子**：`grep 重发` 会命中日志里的「…不重发」，
+  「观察窗」这个词代码里根本没有（2026-11-06 实测到两条自打脸的绿）。写断言前先
+  `grep -n "opts.log?.(\|opts.warn?.(" <被测文件>` 取现成的句子。
+- **E2E 里的常驻进程按 PID 管**：测试镜像里常常没有 procps（`oven/bun` 基底实测无 pkill），
+  `pkill` 静默失效 ⇒ 多个 daemon 并存 ⇒ 「谁领了这个任务」变随机 ⇒ 断言打在还没产日志的文件上。
+  用 `DAEMON_PID=$!` + `kill -9` + 轮询确认。
+- **基线用 git 历史里的源码，不在新代码里加 legacy 开关**：修复后的代码经常让「旧语义必死」
+  变得不可达（pi 的 15s ack 被地板 + 证据 + 宽限兜住）。要断言基线，就把修复前的树打进镜像
+  并行跑（`tests/pi-rpc-ack/make-baseline.sh`）。
 - **测试结果保存**：docs/tests/report-testN.txt
 - **每个测试套件独立 Dockerfile**：可并行构建和运行
 - **Docker 权限**：用 `sg docker -c '...'` 执行 docker 命令
@@ -36,6 +45,14 @@
 - **main 不写业务提交**：同步只做 `git fetch upstream main` + `git branch -f main upstream/main`（fast-forward），随后 `git push origin main`
 - **上游更新只能经 main 进入 pixb**：`git checkout pixb && git merge main` —— 用 **merge**。后期上游有更新时只走这一条
 - **禁止把 pixb rebase / reset 到上游**：2026-10-29 那次 rebase 只搬走了 tip 修复，丢掉 RFC-043 的 3 个核心提交，症状是 `anet node create --runtime pi-cli` 报 `unsupported runtime "pi-cli"`（白名单里有、`canonicalizeRuntime` 里没有）。恢复过程与验证见 `docs/tests/report-pi-restore-merge-20261103.txt`
+- **pi 的时间预算是一张表，不是 if**：握手 / prompt ack / ack 后观察窗 / 迟到收尾宽限 / idle
+  五个旋钮，env > flags > 默认，夹进 15s–24h，启动横幅点名每个值的来源（照 grok 的
+  `runtime/grok-build-acp/timeout-resolve.ts` 做法）。改默认值只改
+  `agent-node/src/runtime/pi-rpc/timeout-resolve.ts`，运维口径看
+  [docs-site/docs/guide/pi-slow-local-model.md](docs-site/docs/guide/pi-slow-local-model.md)。
+  失败码 `pi_prompt_ack_timeout` / `pi_prompt_rejected` / `pi_handshake_timeout` /
+  `pi_runtime_busy` 必须同时进 `vendor-error.ts` 的 `NON_REPLAYABLE_RUNTIME_CODES`
+  （探针：`vendor-error-replay-gate.test.ts`）。
 - **新增 runtime 是一张表，不是一串 if**：`agent-network/src/normalize-runtime.ts` 的 `SUPPORTED_RUNTIME_NAMES` + `canonicalizeRuntime`、daemon 的 `VALID_RUNTIMES`、hub 的 `server/src/create-node-validate.ts` 的 `RUNTIMES` 必须同时改；探针是 `agent-node/src/runtime/runtime-set-parity.test.ts`（#1298 跨包等价门）和 `create-node-validate.test.ts` 的「恰好 N 个」断言
 - **成对包必须同树构建**：`anet` 与 `agent-node` 的 `PAIRED_*` 版本出自同一棵树；只有白名单、没有运行时的半成品包不得外发（`2.3.0-preview.200` / `2.5.0-preview.165` 已删除）
 - **历史快照用 tag 不用长期分支**：例 `backup/pi-20261029`（rebase 前的 pixb，含完整 RFC-043）

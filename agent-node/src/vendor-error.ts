@@ -129,6 +129,14 @@ const NON_REPLAYABLE_RUNTIME_CODES = [
   /^opencode_v1_borrowed_(admission|cli)_refused$/,
   /^opencode_v1_host_(admission|start)_refused$/,
   /^opencode_v1_(migration_plan|owned_safe_topology)_refused$/,
+  // 2026-11-04（低端设备 + 本地大模型）：pi 这几类失败都是「对着正在压缩的机器
+  // 重发同一条 prompt」，只会重复一次同样的失败，还会多付一次全量 prefill。
+  // 排队/重发由 pi runtime 自己管（带观察窗、最多一次、零活动才重发），
+  // 不该再走通用 vendor 重放。
+  /^pi_prompt_ack_timeout$/,
+  /^pi_prompt_rejected$/,
+  /^pi_handshake_timeout$/,
+  /^pi_runtime_busy$/,
 ];
 
 export function isNonReplayableRuntimeFailure(code: unknown): boolean {

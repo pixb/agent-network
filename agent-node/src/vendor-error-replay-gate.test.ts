@@ -24,6 +24,14 @@ describe("isNonReplayableRuntimeFailure", () => {
       "opencode_v1_host_start_refused",
       "opencode_v1_migration_plan_refused",
       "opencode_v1_owned_safe_topology_refused",
+      // 2026-11-04（低端设备 + 本地大模型）：pi 这几类都是「对着正在压缩的机器重发同一条
+      // prompt」，只会重复一次同样的失败，还多付一次全量 prefill（摘要请求关闭
+      // prompt-cache 写入 ⇒ 现场实测 82K 摘要 = 7–9 分钟）。排队/重发由
+      // pi runtime 自己管（观察窗 + 最多一次 + 零活动才重发）。
+      "pi_prompt_ack_timeout",
+      "pi_prompt_rejected",
+      "pi_handshake_timeout",
+      "pi_runtime_busy",
     ]) {
       expect(isNonReplayableRuntimeFailure(code)).toBe(true);
     }
@@ -33,6 +41,14 @@ describe("isNonReplayableRuntimeFailure", () => {
     for (const code of [undefined, null, "", "codex_task_skipped", "some_unknown_code", 42]) {
       expect(isNonReplayableRuntimeFailure(code)).toBe(false);
     }
+  });
+
+  test("pi 的超时类失败带着 vendor 特征文本也不得走通用重放（#2028 同一规则）", () => {
+    // 旧版：没有码 ⇒ 只看文本 ⇒ 对忙碌的机器重放 3 次（1.5s/3s 退避），全失败。
+    const piText =
+      'pi \u9519\u8bef: \u7b49 pi \u63a5\u53d7 prompt \u8d85\u65f6 900000ms "error":{"type":"timeout"} "choices":null';
+    expect(isTransientVendorError(piText, true)).toBe(true); // 旧路径：会重放
+    expect(isTransientVendorError(piText, true, "pi_prompt_ack_timeout")).toBe(false);
   });
 });
 

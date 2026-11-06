@@ -1,0 +1,97 @@
+pi RPC 慢设备修复 — Docker E2E 报告（2026-11-06）
+
+套件：tests/pi-rpc-ack/（一次性 hub 127.0.0.1:9200 + 自己的 sqlite + 注册的临时用户/网络/节点令牌；生产 hub、生产端口、生产数据全程未触碰）
+镜像：anet-pi-rpc-ack（oven/bun:1.3.14 + 真 agent-node 源码 + 脚本化 stub pi）
+基线源码：tests/pi-rpc-ack/make-baseline.sh 从 git 历史打出的修复前 agent-node（同一镜像内并行存在）
+
+结果：32 项断言 PASS / 0 FAIL
+本次修复的发布身份 = pixb 的源码提交。不在报告里写死自己的 sha（写死就得再改报告 → 再改 sha）：
+查 `git log --oneline -- docs/tests/report-pi-rpc-ack-20261106.txt` 即得。
+下面「源码身份」一行显示 b995551ec 是**修复前**的 tip（基线源码正是从它打出来的）。
+单测：src/runtime/pi-rpc/（23 项，此前该目录零测试）
+全量：bun test 3363 项，14 项失败 = 基线既有失败（codex TUI / OpenCode 共存 / create doorbell / grok-cli），同一 stash 基线复测确认未新增
+
+=== 现场实测输入（192.168.1.33，GTX 1070 8GB，用户不改模型配置）
+model        strata/swift-1.5-iq2_xs（Qwen3.8-Flash-Next IQ2_XS）
+ctx          131072，maxTokens 32768，thinking xhigh
+compaction   reserveTokens 16384 ⇒ 触发线 131072-16384 = 114688 token
+             摘要 ~82000 token，keepRecentTokens 32768
+速度         decode 21–37 tok/s，prefill 201–224 tok/s，100K prompt 的 TTFT ~496s
+压缩墙钟     7–9 min（82K 摘要的 prefill ≈ 408s，与实测吻合）
+引擎冷启动   ~884s
+
+=== 修复前（基线源码在同一镜像里跑同一条 20s 压缩任务）
+hub 侧：status=failed
+result：[pi-slow-node] pi 错误: timeout waiting pi response for prompt (r2)
+日志：   timeout waiting pi response for prompt —— 硬编 15000ms
+        （agent-node/src/runtime/pi-rpc/runtime.ts 里 prompt 与 get_state 各一处）
+本轮正文：无（压缩期间 stdout 静默，15s 先到）
+压缩成本：日志里没有任何计量 ⇒ 运维只能猜
+
+=== 修复后（同一 stub 时序、同一 hub、同一任务）
+ack 预算 1500ms（地板 15s）+ 证据窗：status=replied，正文 COMPACTED-REPLY
+日志：[pi] prompt ack 15001ms disposition=queued
+      [pi] prompt ack 迟到：…内无 response，但本轮已有活动（run=false 消息=0 压缩=1）
+           ⇒ 视为已接受，继续等本轮，不重发
+      [pi] 本轮压缩 1 次 = 20s，摘要 82000 token，压缩后上下文约 41000 token
+重复提交：0 次
+指挥室可见性：GET /api/messages?alias=<派活用户名> 命中本轮正文
+
+=== 会话滚存（不动用户模型配置的正面杠杆）
+阈值代理 = 会话文件字节数（pi 在 get_state 里给出 sessionFile，节点同机可 stat）
+日志：[pi] 会话滚存：会话文件 4000B ≥ 阈值 1000B（上一轮收尾携带 8 字符）
+      [pi] 会话已滚存 → sess-rol...
+stub 调用记录：{"command":"new_session"} 出现
+写回：节点 config.json 里 session = sess-rolled-1（重启后仍用新会话）
+第二轮：收尾携带 >0 字符 ⇒ 跨任务记忆显式携带，不靠 82K 摘要隐式背着跑 9 分钟
+
+=== 断言清单（32）
+- ok: pi-rpc 单测 + vendor 重放门全绿（30 项）
+- ok: agent-node bundle 构建通过
+- ok: hub /health = 200（一次性 sqlite：/work/e2e.db）
+- ok: 注册一次性用户（不打印令牌）
+- ok: 建网 net_10b40adf6853
+- ok: 铸节点令牌 ntok_（不打印）
+- ok: 节点令牌前缀 = ntok_
+- ok: 基线源码确实是修复前的（prompt 的 ack 硬编 15000）
+- ok: 派活成功 task=6ef94b5e…
+- ok: 基线没有产出本轮正文（15s 的 ack 被 20s 的压缩撞死）
+- ok: 失败原因进了 hub 正文（运维不用翻日志）
+- ok: 基线失败就是那句 timeout waiting pi response for prompt（现场日志里的原句）
+- ok: 基线看不见压缩成本（旧代码没有压缩计量 ⇒ 运维只能猜）
+- ok: 派活成功 task=dd976cab…
+- ok: ack 超时不再等于任务失败：同一个任务交付了（基线那条必死）
+- ok: ack 超时先取证再决定（没有立刻重发 —— 重发会让 pi 把同一任务跑两遍）
+- ok: 本轮零次重复提交（证据窗里没有任何重发）
+- ok: 派活成功 task=fa9e8363…
+- ok: 压缩 20s 的任务在修好语义下正常交付
+- ok: 回复正文就是这一轮产出（归属没串台）
+- ok: 压缩成本从事件流里实测并写进日志（82000 token 那一级），不靠猜
+- ok: 每轮记录 ack 延迟与 disposition（旋钮该设多大靠这个数）
+- ok: 交付进了指挥室按 alias 读到的收件流（Dashboard Messages 页可见）
+- ok: 派活成功 task=788502da…
+- ok: 滚存路径上任务照常交付（status=replied）
+- ok: 真的调用了 new_session（stub 侧的调用记录为证）
+- ok: 日志写明为什么滚存（阈值与会话文件大小）
+- ok: 滚存后写回新 sessionId（config.session 不再是旧会话）
+- ok: 跨任务记忆显式携带（收尾文本），不是靠摘要隐式背着跑
+- ok: 写回落到磁盘上的节点配置（重启后仍用新会话）
+- ok: 滚存后的第二个任务照常交付
+- ok: 第二轮起带上了上一轮收尾（跨任务记忆显式携带，不是 0 字符）
+
+=== 已知坑（写进代码注释与 README）
+1) 基线必须用修复前源码：新代码里 15s 的 ack 已被地板 + compaction_start 证据 + 宽限
+   兜住，「旧语义必死」在新代码里不可达。在新代码里加 legacy 开关来「复现基线」
+   等于让测试钉住一条生产里不该存在的路径。
+2) 镜像里没有 pkill（oven/bun:1.3.10 基底）：stop_daemon 静默失效 ⇒ 多个 daemon 并存
+   ⇒ 「哪个 daemon 领了任务」变随机 ⇒ 断言打在还没产日志的文件上（本次实测到的假失败）。
+   现在按 PID 杀 + 轮询确认。
+3) 断言字符串必须是代码真会打的句子：`grep 重发` 命中「…不重发」自我打脸；
+   「观察窗」这个词代码里根本没有。
+4) MCP send_task 的字段是 alias/task（不是 to_name/content），返回体里是 message_id
+   （就是 task_id）。铸节点令牌的字段是 node_name（不是 alias）。
+5) stub 的文本走 message_update.assistantMessageEvent.text_delta，一轮必须带
+   agent_start/turn_start —— 那才是 runStarted 的证据；排队提交时没有这两个事件，
+   本任务的 settled 就永远不算完成。
+6) ack 之前到达的 agent_settled 是上一轮遗留的：监听器在 ack 之前不得判定完成
+   （否则 queued 的任务立刻「完成」且正文为空）。

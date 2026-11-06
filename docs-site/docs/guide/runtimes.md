@@ -124,6 +124,12 @@ Grok TUI 共存的当前状态见 [Grok 节点](/guide/grok)；`grok-build-acp` 
 
 ---
 
+## 低端设备 + 本地大模型（pi runtime）
+
+节点跑在消费级显卡 + 本地大模型上时，一次自动压缩的墙钟是**分钟级**，与节点等 ack 的
+预算完全不在一个量级。旋钮、会话滚存、失败码、TTL 约定见
+[pi-slow-local-model.md](./pi-slow-local-model.md)。
+
 ## claude-code-cli
 
 复用你**本地已经登录的 Claude CLI 订阅**：不用 API Key、不用 token，跑起来就能干活。

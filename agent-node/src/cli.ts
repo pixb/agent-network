@@ -147,6 +147,14 @@ import {
 } from "./reply-reliability";
 import { isTelemetrySchemaRejection, withoutOptionalTelemetry } from "./register-telemetry-fallback";
 import { resolveGrokAcpTimeout } from "./runtime/grok-build-acp/timeout-resolve";
+import {
+  resolvePiTimeout,
+  describePiTimeout,
+  PI_DEFAULT_HANDSHAKE_MS,
+  PI_DEFAULT_PROMPT_ACK_MS,
+  PI_DEFAULT_LATE_ACK_MS,
+} from "./runtime/pi-rpc/timeout-resolve";
+import { piBusyProgressText, rolloverPiSession } from "./runtime/pi-rpc/runtime";
 import { attachLocalFileLinks } from "./runtime/reply-file-links";
 import { claudeAttemptsDetail, codexTimeoutDetail } from "./runtime/sdk-timeout-detail";
 import { compactionPressure } from "./runtime/compaction-pressure";
@@ -2631,6 +2639,8 @@ let opencodeRuntimeSession: import("./runtime/opencode-acp/runtime").OpencodeRun
 // RFC-043 — pi RPC runtime state. Lazy open on first turn, reused for the
 // node lifetime; crash-restart resets the holder (next turn re-spawns).
 let piSessionId: string | undefined = RUNTIME === "pi" ? (SESSION_ID || undefined) : undefined;
+/** 上一轮的回复正文：会话滚存时拿它当「带给新会话的收尾」。 */
+let piLastReplyText = "";
 let piRuntimeSession: import("./runtime/pi-rpc/runtime").PiRuntimeSession | null = null;
 // Set synchronously immediately after spawn, before initialize or session/new
 // resolves. shutdown() uses this handle during the handshake window.
@@ -4456,6 +4466,68 @@ function currentPiTimeout(): { valueMs: number } {
   return { valueMs: v };
 }
 
+// ── pi 分相超时（2026-11-04，低端设备 + 本地大模型现场）──
+// 现场实测：prompt 前压缩 = 420–540s（摘要关闭 prompt-cache 写入 ⇒ 全量 prefill，
+// 201 tok/s）；引擎冷启动 884s；满 32K 输出 18min。旧版把 ack/握手一起硬编 15s，
+// 于是「压缩一触发就 100% 判失败」。这里分相，各自可配，启动时打印生效来源。
+function currentPiPromptAckMs() {
+  return resolvePiTimeout({
+    envValue: process.env.PI_PROMPT_ACK_TIMEOUT_MS,
+    flagValue: fileConfig.flags?.piPromptAckTimeoutMs,
+    defaultMs: PI_DEFAULT_PROMPT_ACK_MS,
+  });
+}
+function currentPiHandshakeMs() {
+  return resolvePiTimeout({
+    envValue: process.env.PI_HANDSHAKE_TIMEOUT_MS,
+    flagValue: fileConfig.flags?.piHandshakeTimeoutMs,
+    defaultMs: PI_DEFAULT_HANDSHAKE_MS,
+  });
+}
+function currentPiLateAckMs() {
+  return resolvePiTimeout({
+    envValue: process.env.PI_LATE_ACK_MS,
+    flagValue: fileConfig.flags?.piLateAckMs,
+    defaultMs: PI_DEFAULT_LATE_ACK_MS,
+    floorMs: 0,
+  });
+}
+function currentPiLateSettleGraceMs() {
+  return resolvePiTimeout({
+    envValue: process.env.PI_LATE_SETTLE_GRACE_MS,
+    flagValue: fileConfig.flags?.piLateSettleGraceMs,
+    defaultMs: 90_000,
+    floorMs: 0,
+  });
+}
+/** 忙碌策略：queue（默认，排队）/ skip（本轮不提交）/ fail（旧行为）。 */
+function currentPiBusyPolicy(): "queue" | "skip" | "fail" {
+  const raw = String(
+    process.env.PI_BUSY_POLICY ?? fileConfig.flags?.piBusyPolicy ?? "queue",
+  ).trim().toLowerCase();
+  return raw === "skip" || raw === "fail" ? raw : "queue";
+}
+/**
+ * 会话滚存阈值（字节）。0 = 关。
+ *
+ * 这是「不动用户模型配置」的正面杆杆：上下文不涨过阈值，自动压缩根本不触发。
+ * 阈值代理 = 会话文件字节数（节点与 pi 同机 ⇒ 可直接 stat），不是猜 token。
+ * 现场：131072 窗口下 114.7K token 触发压缩，82K 摘要 = 7–9 分钟。
+ */
+function currentPiRolloverBytes(): number {
+  const raw = process.env.PI_SESSION_ROLLOVER_BYTES ?? fileConfig.flags?.piSessionRolloverBytes;
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  if (raw === undefined || raw === "" || Number.isNaN(n)) return 262_144; // 256KB ≈ 64K token
+  return Math.max(0, n);
+}
+/** 滚存时带进新会话的上一轮收尾字符数。0 = 不带（完全断记忆）。 */
+function currentPiRolloverCarryChars(): number {
+  const raw = process.env.PI_SESSION_ROLLOVER_CARRY_CHARS ?? fileConfig.flags?.piRolloverCarryChars;
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10);
+  if (raw === undefined || raw === "" || Number.isNaN(n)) return 1200;
+  return Math.max(0, n);
+}
+
 async function processWithPi(
   task: string,
   _from: string,
@@ -4501,6 +4573,7 @@ async function processWithPi(
       unsafeTools: fileConfig.flags?.piUnsafeTools === true,
       model: MODEL,
       sessionId: piSessionId,
+      handshakeTimeoutMs: currentPiHandshakeMs().valueMs,
       onSession: async (id: string) => {
         piSessionId = id;
         writebackSession(id);
@@ -4515,14 +4588,71 @@ async function processWithPi(
     piRuntimeSession = opened;
   }
 
+  // 会话滚存（2026-11-04，低端设备 + 本地大模型）。
+  // 为什么在节点代码里做而不是让用户改模型配置：现场是 131072 窗口 / 114.7K 触发 /
+  // 82K 摘要 = 7–9 分钟一次，而 session 是长期复用的（config.session 写回），
+  // 越跑越靠近阈值 ⇒ 几乎每个任务都要付一次压缩。上下文不涨过去，压缩根本不触发。
+  // 阈值代理 = 会话文件字节数（pi 在 get_state 里给了 sessionFile，同机可直接 stat）。
+  // 代价：跨任务记忆断。所以滚存时把上一轮收尾显式带进新会话的第一条 prompt，
+  // 记忆变成一段可控文本，而不是靠 82K 摘要隐式背着跑 9 分钟。
+  let rolloverCarry: string | null = null;
+  const rolloverBytes = currentPiRolloverBytes();
+  const perTask =
+    process.env.PI_SESSION_PER_TASK === "1" || fileConfig.flags?.piSessionPerTask === true;
+  if (piRuntimeSession && (rolloverBytes > 0 || perTask)) {
+    let bytes = 0;
+    try {
+      bytes = piRuntimeSession.sessionFile ? statSync(piRuntimeSession.sessionFile).size : 0;
+    } catch {
+      bytes = 0; // 读不到就不滚存：宁可不滚，不能因统计失败而断会话
+    }
+    const due = perTask || (rolloverBytes > 0 && bytes >= rolloverBytes);
+    if (due) {
+      const why = perTask
+        ? "每任务新会话（piSessionPerTask）"
+        : `会话文件 ${bytes}B ≥ 阈值 ${rolloverBytes}B`;
+      const newId = await rolloverPiSession(piRuntimeSession, {
+        handshakeTimeoutMs: currentPiHandshakeMs().valueMs,
+        log,
+        warn,
+      });
+      if (newId) {
+        piSessionId = newId;
+        writebackSession(newId);
+        const carryChars = currentPiRolloverCarryChars();
+        if (carryChars > 0 && piLastReplyText) {
+          rolloverCarry = piLastReplyText.slice(-carryChars);
+        }
+        log(`[pi] 会话滚存：${why}（上一轮收尾携带 ${rolloverCarry ? rolloverCarry.length : 0} 字符）`);
+      } else {
+        warn(`[pi] 滚存未生效（new_session 未成功），本轮继续用旧 session：${why}`);
+      }
+    }
+  }
+
+  const promptText = rolloverCarry
+    ? `[前一轮收尾，会话已滚存，供上下文]\n${rolloverCarry}\n\n[本轮任务]\n${task}`
+    : task;
+
   const outcome = await piThink(piRuntimeSession, {
-    prompt: task,
+    prompt: promptText,
     idleTimeoutMs: currentPiTimeout().valueMs,
+    promptAckTimeoutMs: currentPiPromptAckMs().valueMs,
+    handshakeTimeoutMs: currentPiHandshakeMs().valueMs,
+    lateAckMs: currentPiLateAckMs().valueMs,
+    lateSettleGraceMs: currentPiLateSettleGraceMs().valueMs,
+    busyPolicy: currentPiBusyPolicy(),
     log,
     warn,
     onSubmitted: evidence?.submitted,
     onConsumed: evidence?.consumed,
+    // 排队/压缩不是失败，也不是「卡死」：报出去，指挥室在节点卡片上看得到在等什么。
+    // 不照拄 capacity-retry 的「模型满载」文案：这里的原因是压缩/上一轮，不是满载。
+    onBusy: (reason, waitedMs) => {
+      void reportStatus("working", piBusyProgressText(reason, waitedMs)).catch(() => {});
+    },
   });
+  piLastReplyText = outcome.replyText;
   log(
     `[pi] turn done | reply=${outcome.replyText.length}ch ` +
     `rescued=${outcome.rescued} settled=${outcome.state.settled} deltas=${outcome.state.deltaCount}`,
@@ -8198,6 +8328,29 @@ if (RUNTIME === "grok" && GROK_EXECUTION_MODE === "acp") {
 } else if (RUNTIME === "grok") {
   const raw = process.env.GROK_CLI_TIMEOUT_MS || fileConfig.flags?.grokCliTimeoutMs || "300000";
   log(`  [grok-cli] execution mode=${GROK_COPRESENCE ? "co-presence TUI" : "headless TUI engine"}; idle timeout=${raw}ms`);
+}
+
+// 2026-11-04 — pi 的分相超时 + 滚存阈值，启动就说清哪个旋钮生效。
+// 照 grok #214 的做法：「配置里写了值」不等于「运行时用了这个值」，运维不该猜。
+if (RUNTIME === "pi") {
+  log(
+    `  [pi] ${describePiTimeout("promptAck", currentPiPromptAckMs())} ` +
+    `${describePiTimeout("handshake", currentPiHandshakeMs())} ` +
+    `lateAck=${currentPiLateAckMs().valueMs}ms lateGrace=${currentPiLateSettleGraceMs().valueMs}ms`,
+  );
+  log(
+    `  [pi] idle=${currentPiTimeout().valueMs}ms(flags.piTimeoutMs/flags.timeout/PI_TIMEOUT_MS) ` +
+    `busyPolicy=${currentPiBusyPolicy()} ` +
+    `rollover=${currentPiRolloverBytes()}B` +
+    `${currentPiRolloverBytes() === 0 ? "(关)" : ""} ` +
+    `carry=${currentPiRolloverCarryChars()}chars`,
+  );
+  if (currentPiPromptAckMs().valueMs < 300_000) {
+    warn(
+      "  [pi] promptAck 低于 300s：本地大模型上一次上下文压缩可达分钟级（现场实测 420–540s），\n" +
+      "         比一次压缩还短的 ack 等于把压缩判成失败。调 flags.piPromptAckTimeoutMs / PI_PROMPT_ACK_TIMEOUT_MS。",
+    );
+  }
 }
 
 // Validate token + show user/network info

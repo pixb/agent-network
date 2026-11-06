@@ -56,3 +56,6 @@ agent-node/build-info.json
 # 缺这一条时 `git add -A` 会把生产数据库连备份一起 staged。数据库内容不入 git（AGENTS.md
 # 「区分软件与数据」），要恢复的是加密备份，不是这个目录。
 deploy/compose/data/
+
+# E2E 基线源码包（构建产物，由 tests/pi-rpc-ack/make-baseline.sh 生成）
+tests/pi-rpc-ack/baseline-agent-node.tar

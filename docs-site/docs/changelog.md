@@ -1,5 +1,18 @@
 # 更新日志
 
+## 2026-11-06 pi runtime：低端设备上的压缩不再是任务失败（pixb 源码部署，不发 npm）
+
+现场是 GTX 1070 8GB 跑本地 131K 上下文模型：一次自动压缩 = 7–9 分钟（82K token 摘要，摘要请求关闭 prompt-cache 写入 ⇒ 全量 prefill），而节点等 prompt ack 的预算硬编 15 秒。压缩发生在 ack 之前、期间 stdout 静默 ⇒ 任务 100% 判死，hub 里只剩 `timeout waiting pi response for prompt`。用户明确**不改模型配置**，所以全部解法在节点代码里：
+
+- **分相超时**：握手 45s / prompt ack 900s / ack 后观察窗 30s / 迟到收尾宽限 90s，env > flags > 默认，夹进 15s–24h 并在启动横幅里点名来源；ack 预算短于一次压缩时启动就警告。
+- **忙碌与排队**：发 prompt 前 `get_state` 探测 `isStreaming`/`isCompacting`（忙碌是 pi 自己报的），带 `streamingBehavior: "followUp"` 提交；排队状态报给 hub（节点卡片看得到在等什么，节点保持 working）。
+- **ack 超时是不确定态**：先进观察窗取证（`compaction_start`/消息/压缩都算证据）⇒ 视为已接受、继续等本轮、**不重发**；只有零活动才允许恰好一次排队重发。已接受的轮次给迟到收尾宽限，避免把跑完的一轮 SIGKILL 掉。
+- **会话滚存**：会话文件字节数到阈值（默认 256KB）就 `new_session` 并写回 `config.session`，把上一轮收尾显式带进新会话第一条 prompt（默认 1200 字符）。上下文不涨过阈值 ⇒ 压缩根本不触发；跨任务记忆变成一段可控文本，而不是靠 82K 摘要背着跑 9 分钟。阈值 0 = 关；`new_session` 失败/被取消不谎称已滚存。
+- **结构化失败码**：`pi_prompt_ack_timeout` / `pi_prompt_rejected` / `pi_handshake_timeout` / `pi_runtime_busy` 进 `NON_REPLAYABLE_RUNTIME_CODES` —— 修复前 pi 错误没有 code，被当噪声在最忙的时候重放 3 次。
+- **测试**：`src/runtime/pi-rpc/` 此前零测试，现 23 项单测（真实子进程 + stdio，脚本化 stub pi）；新增 `tests/pi-rpc-ack/` Docker E2E 32 项断言，**基线用 git 历史里修复前的源码在同一镜像内并行跑**（新代码里旧语义已不可达，加 legacy 开关去「复现基线」等于钉住一条生产里不该存在的路径）。报告 `docs/tests/report-pi-rpc-ack-20261106.txt`，操作页 [低端设备跑本地大模型的节点](./guide/pi-slow-local-model.md)。
+
+部署身份 = pixb 源码提交（生产从 pixb 本地构建，不发 npm）。
+
 ## 2026-10-14 Windows native TUI health alpha
 
 Published software alpha CLI2.3.0-preview.179 / Node2.5.0-preview.145: ongoing Windows co-presence health verifies the exact launch generation and owned loopback connection. Missing evidence remains unknown; proven exit or lost connection uses the existing Hub degradation guard. Source/native fake-Codex CI and exact-main formal publication are recorded in `report-test1175-windows-tui-health.txt` and `report-test1175-public.txt`. Both full npm and official GitHub archives are verified; the initial CLI registry-timeout workflow failure remains recorded. Original-device/model acceptance remains pending.
