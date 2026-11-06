@@ -1,0 +1,69 @@
+GitHub CI/CD 能不能跑 — 实测（2026-11-06）
+
+结论一句话：**dashboard 仓库能跑，并且已经抓到我们两个真 bug；parent 仓库的 Actions 被禁用，跑不了。**
+
+## 1. parent（pixb/agent-network）：Actions 被禁用
+
+    gh workflow run scheduled-outcome-guidance.yml -R pixb/agent-network -r pixb
+    → HTTP 422: Actions has been disabled for this repository.
+
+佐证时间线：
+
+    push 触发的 run   最后一批 = 2026-10-29T11:30:50Z（sha b90e050f，main）
+    定时（schedule）  最后一批 = 2026-10-29T09:53:22Z（published artifact drift，pixb）
+    今天（11-06）我们把 main 推到 43b99dce9 ⇒ 没有产生任何 run，也没有 queued/in_progress
+
+仓库本身 `fork=true private=false`（公开仓库 ⇒ 公共仓库的 Actions 分钟数不受私有配额限制），
+`GET /actions/permissions` 又回 `enabled=true`，dispatch 却回 422「已禁用」。
+**启用/禁用 Actions 是仓库设置项（UI 里），REST 没有开启接口** ⇒ 需要人在
+`github.com/pixb/agent-network → Settings → Actions → General` 打开。这条我这边做不到。
+
+## 2. dashboard（pixb/agent-network-dashboard）：能跑
+
+`fork=true private=false`，五个 workflow 全 `state=active`。跑起来的实测：
+
+| workflow | 触发方式 | 提交 | 结果 |
+|---|---|---|---|
+| legion-presentation | dispatch | 18015c3 | ✅ success |
+| OSS readiness gates | dispatch | 18015c3 | ❌ `personal_home: 2` |
+| OSS readiness gates | dispatch | f7ebcfa | ❌ Lint 4 × `Cannot access refs during render` |
+| OSS readiness gates | dispatch | 8b37457 | ✅ success |
+| unit tests | dispatch | ec65c3b | ✅ success |
+| gates | dispatch | ec65c3b | ✅ success |
+
+### CI 抓到的两个真问题（都在我们写的文件里，我们此前没看出来）
+
+1. **`[oss-public-surface] personal_home: 2`** —— `deploy/compose/Dockerfile.source` 与
+   `deploy/compose/README.md` 写了 `/home/<名字>/…` 形状路径。门的判据是形状
+   `(?:^|[^A-Za-z0-9])/(?:home|Users)/[A-Za-z0-9._-]+`，仓库里**除这两个文件外没有别处写这种形状**
+   （其他文件一律写 `$HOME/.anet`）。修法只动形状不动运行时：容器家目录 `/srv/dashboard`
+   （`useradd -d` + `ENV HOME` 同步），README 写 `$HOME/.anet` + 「想知道具体值就 `docker exec … echo $HOME`」。
+   运行时实测（新镜像 2699766de590，一次性容器 :3199）：
+   `$HOME=/srv/dashboard`、`uid 10001`、`$HOME/.anet/config.json` 在、`/login`=200、
+   带会话打 `/api/hub/networks` = 502（hub 故意不可达）、**日志里 ENOENT/EACCES 次数 0**
+   ⇒ 不是当年那个「缺 config.json ⇒ 每个认证请求 500」。
+2. **Lint 4 处 `Cannot access refs during render`**（`app/messages/page.tsx`）：
+   渲染里读写 `meRef` 拿当前用户名。改成仓库既有写法 `useState(() => currentUserAlias())`
+   （`app/lib/chat-unread.ts` 早就是这么写的），memo 依赖补上 `meAlias`。
+
+本地对照（tip ec65c3b）：`npm run lint` 0 errors、`npm test` 333 pass/0 fail、
+`npm run oss:check` 34/34、`npm run gates` exit 0、`npm run build` 通过。
+
+## 3. 为什么 push/PR 不触发（fork 的实测形状）
+
+- `unit-tests.yml` 写的是 `push: branches: ['**']`，今天推了 5 次 pixb ⇒ **0 个 run**
+  （`GET /actions/workflows/unit-tests.yml/runs` 显示从未运行过；仓库 run 总数当时=4，全是 dispatch）。
+- 开 PR #3（`pixb` → `main`，同仓库）⇒ `no checks reported`，队列里也没有。
+- `workflow_dispatch` 稳定可用，且真在 `ubuntu-latest` 上跑完。
+
+⇒ 这条 fork 只认 dispatch（以及面向上游 parent 的 PR）。所以给 `unit-tests.yml` 与
+`gates.yml` 的 `on:` 各加了一行 `workflow_dispatch`（只动 `on:`，不动 job），加完立刻跑绿。
+**这是 fork 上唯一可靠的 CI 入口**；push 触发在 fork 上不要指望。
+
+## 4. 待办（需要人做的）
+
+1. `github.com/pixb/agent-network` → Settings → Actions 里把 Actions 打开（REST 开不了）。
+   打开后同样建议：给 parent 仓库关键 workflow 的 `on:` 加 `workflow_dispatch`（部分已有）。
+2. PR #3（dashboard，`pixb` → `main`，17 个提交 = 我们的全部贡献）等审阅；
+   审阅通过再对 `sleep2agi/agent-network-dashboard` 开上游 PR。
+3. 现网未因本次 CI 工作被触碰：hub `0.9.0-preview.265`（label 93dfdeae7），dashboard `9d868e113`。
