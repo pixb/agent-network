@@ -165,6 +165,11 @@ chk "dirty 状态默认承认不知道（SOURCE_DIRTY=true）" \
 chk "drill 判进程自报 build_identified（label 进程读不到，不能只 inspect）" \
   "grep -q 'build_identified' ../../tests/compose-rebuild/rebuild-drill.sh"
 
+chk "sha 判定用 grep -E '{40}'（手敲 [0-9a-f] 重复串实测少敲一组，静默不写文件）" \
+  "grep -q '\[0-9a-f\]{40}' Dockerfile.hub"
+absent "Dockerfile.hub 里没有手写 20 组以上的 [0-9a-f] 重复串" \
+  "grep -qE '(\[0-9a-f\]){20,}' Dockerfile.hub"
+
 # 自检（本轮踩过两次）：`chk "描述" \` 与它的参数行是一对；中间插进别的内容会被 bash 续行
 # 拼接拆开，chk 收到的是字符串 "chk"，检查静默失效 —— 输出全绿而什么都没测。
 # 声明条数必须等于真正执行过的条数。

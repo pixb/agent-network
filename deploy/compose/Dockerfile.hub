@@ -44,12 +44,16 @@ COPY server/ /app/server/
 #    validateBuildInfo 只收 /^[0-9a-f]{40}$/，写坏了会读成 invalid（缺陷），比 absent 更糟。
 #    同理 SOURCE_DIRTY 默认 true —— 不知道就承认不知道。
 ARG SOURCE_DIRTY=true
-RUN case "${SOURCE_REV}" in \
-      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] ) \
-        printf '{"schema":1,"commit":"%s","dirty":%s,"built_at":"%s","source":"compose_build_arg"}\n' \
-          "${SOURCE_REV}" "${SOURCE_DIRTY}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /app/server/build-info.json ;; \
-      *) echo "SOURCE_REV 不是 40 位 sha（${SOURCE_REV}）⇒ 不写 build-info.json，/health 会诚实报 build_identified=false" >&2 ;; \
-    esac
+RUN if printf '%s' "${SOURCE_REV}" | grep -qE '^[0-9a-f]{40}$'; then \
+      printf '{"schema":1,"commit":"%s","dirty":%s,"built_at":"%s","source":"compose_build_arg"}\n' \
+        "${SOURCE_REV}" "${SOURCE_DIRTY}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /app/server/build-info.json; \
+    else \
+      echo "SOURCE_REV 不是 40 位 sha（${SOURCE_REV}）⇒ 不写 build-info.json，/health 会诚实报 build_identified=false" >&2; \
+    fi
+# 🔴 判 sha 用 grep -E '^[0-9a-f]{40}$'，**不要手写 case 的 [0-9a-f] 重复串**：
+#    本次第一版就是手敲 40 组、实际少敲一组（39），40 位 sha 永不匹配 ⇒ 静默走
+#    「不写文件」分支，镜像 label 正确而 /health 的 build_identified 恒为 false。
+#    数得出来的东西不要靠数：{40} 由 grep 数。
 
 COPY deploy/compose/entrypoint.sh /usr/local/bin/anet-hub-entrypoint
 RUN chmod 755 /usr/local/bin/anet-hub-entrypoint
