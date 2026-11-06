@@ -52,6 +52,20 @@ pi 侧模型来源：`~/.pi/agent/models.json` provider `local` = `swift-1.5-iq3
   `bun add -g` 在 `/check` 生成 lock 把目录变 workspace）。见
   `docs/tests/report-pi-restore-merge-20261103.txt` 缺口 A。
 
+## 🔴 同名号有两套字节（2026-11-06 追加）
+
+`2.3.0-preview.208` / `2.5.0-preview.176` 这组版本号被**复用过**：本文件描述的是 2026-11-03
+打的那一对；2026-11-06 又用同一组版本号打了一对（含 pi 低端设备修复）。分辨只看制品里的
+`build-info.json`，不看版本号：
+
+| 打包日期 | build-info.commit | dirty | 在哪 |
+|---|---|---|---|
+| 2026-11-03 | `45f54ba9…` | **true** | `archive/20261103-pixb/`（回滚身份；dirty ⇒ 那套字节不能只靠这个 commit 复现） |
+| 2026-11-06 | `3adac29e…` | false | `/vol2/1000/Download/agent-network-tgz/`（现用，含 pi 修复） |
+
+装完必须核对：`cat <prefix>/lib/node_modules/@sleep2agi/agent-node/build-info.json`。
+安装顺序、哈希与验证判据见 [report-pair-pack-20261106.txt](./report-pair-pack-20261106.txt)。
+
 ## Install（本地成对）
 
 ```bash

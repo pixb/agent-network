@@ -1,0 +1,95 @@
+成对本地包（pixb，不发 npm）— 2026-11-06 打包报告
+
+## 为什么打包
+
+低端设备 + 本地大模型的 pi 修复（分相超时 / 忙碌排队 / ack 取证 / 会话滚存 / 结构化失败码）
+在 pixb 源码里。现网节点是**从包安装**的形态（`pm2 describe` 的 script path 决定一切），
+所以要落到现网就得有成对本地包。npm 上的 `agent-node` 至今没有任何版本带 pi 运行时
+⇒ 纯 npm 安装会被 candidate 守卫拒（"the candidate agent-node does not advertise pi-cli"），
+所以必须用本地 tarball。
+
+## 版本号不变（用户决定）
+
+沿用 `2.3.0-preview.208` / `2.5.0-preview.176`。代价是**同一版本号存在两套字节**，
+所以身份只能靠制品里的 `build-info.json`（#3177 的构建标识）与文件哈希，不能靠版本号。
+使用侧的做法：先卸载再装。
+
+## 产出
+
+目录：`/vol2/1000/Download/agent-network-tgz/`
+
+    sleep2agi-agent-network-2.3.0-preview.208.tgz   2131703 B
+      sha256 9f84f88f666484f1ed1cd410beea2e08cc0cf0215a1fc9ddee6ba54b739044bb
+    sleep2agi-agent-node-2.5.0-preview.176.tgz       634377 B
+      sha256 6867bdb1fc7cc8f7121a14d551a32f60be72cb995dc6bf469321247028fb13b4
+
+两包的 `package/build-info.json`（同一次构建、同一棵树 ⇒ 成对）：
+
+    {"schema":1,"commit":"3adac29ef126625bd385816b371292bdbd5f0a31","dirty":false,
+     "built_at":"2026-11-06T04:51:15Z","source":"git"}
+
+`dirty:false` 是关键：树干净且与 `origin/pixb` 同步 ⇒ 制品可由这个提交复现。
+成对门：`node scripts/check-pair-published.mjs` → `pair ok: agent-network@2.3.0-preview.208 + agent-node@2.5.0-preview.176`。
+
+## 内容取证（不看版本号，看代码真会打的字符串）
+
+从新包 `package/dist/cli.js` 里 grep：
+
+    PI_PROMPT_ACK_TIMEOUT_MS   3
+    PI_SESSION_ROLLOVER_BYTES  1
+    会话滚存                   1
+    本轮压缩                   1
+    pi_prompt_ack_timeout      2
+    不重发                     1
+
+同一关键字在旧包（Nov 3）里全部为 0 ⇒ 旧包确实是修复前的。
+
+## 旧的一对（回滚身份，已归档，未删除）
+
+    /vol2/1000/Download/agent-network-tgz/archive/20261103-pixb/
+      sleep2agi-agent-network-2.3.0-preview.208.tgz   2134225 B
+      sleep2agi-agent-node-2.5.0-preview.176.tgz       629470 B
+      build-info: commit 45f54ba913266621b31cfc6736093de8e0456615, dirty:true
+
+🔴 **发现**：Nov 3 那一对的 `dirty:true` —— 它是从**有未提交改动的树**打出来的，
+所以那套字节**不能只靠 45f54ba9 复现**。回滚到它只能靠文件本身（已归档保留），
+不能靠 checkout 那个 commit。这是「构建前必须提交并推送」这条规则的实物证据。
+
+## 安装（使用侧，先卸载再装）
+
+```bash
+# ① 卸载旧的（同一个 prefix）
+npm rm -g --prefix <prefix> @sleep2agi/agent-network @sleep2agi/agent-node
+
+# ② 装新的一对（本地 tarball，不连 registry）
+npm i -g --prefix <prefix> /vol2/1000/Download/agent-network-tgz/sleep2agi-agent-network-2.3.0-preview.208.tgz
+npm i -g --prefix <prefix> /vol2/1000/Download/agent-network-tgz/sleep2agi-agent-node-2.5.0-preview.176.tgz
+
+# ③ 核对装上的到底是哪套字节（认 build-info，不认版本号）
+cat <prefix>/lib/node_modules/@sleep2agi/agent-node/build-info.json
+#   期望 commit = 3adac29ef…，dirty = false
+
+# ④ 让 anet 用本地 agent-node（npm 上的包没有 pi 运行时）
+export ANET_AGENT_NODE_BIN=<prefix>/lib/node_modules/@sleep2agi/agent-node/dist/cli.js
+```
+
+## 验证「真的生效」（不是看进程在线）
+
+`pm2 describe <node条目名> | grep -E "script path"` 必须指向 ② 装进去的那个 `dist/cli.js`。
+重启后启动横幅必须出现（来源点名 env/flags/default）：
+
+```
+[pi] promptAck=900000ms(...) handshake=45000ms(default) lateAck=30000ms lateGrace=90000ms
+[pi] idle=1800000ms(...) busyPolicy=queue rollover=262144B carry=1200chars
+```
+
+跑一条任务后应看到 `[pi] prompt ack <N>ms disposition=...`；有压缩时看到
+`[pi] 本轮压缩 1 次 = <秒>s，摘要 <token> token`。
+旧形状的判据（说明没生效）：hub 里出现 `[节点] pi 错误: timeout waiting pi response for prompt`。
+
+## 没有做的事
+
+- 不发布 npm（对外发布只从 main，AGENTS 规则）；本次只是本地成对包。
+- 不碰现网：设备上卸载/安装由用户执行。
+- 不改版本号（用户决定）；因此本报告与 `docs/tests/release-v2.3.0-preview.208-v2.5.0-preview.176.md`
+  都写清了「同名号两套字节」的分辨方法。
