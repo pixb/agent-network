@@ -1,0 +1,108 @@
+两个仓库的 main → pixb 合并 + 代理实测 — 2026-11-06
+
+## 0. 代理（192.168.1.200:1087）
+
+实测类型：**HTTP CONNECT 代理**（`--socks5-hostname` 12s 超时不通）。
+
+    curl -x http://192.168.1.200:1087 https://api.github.com/   → 200 / 1.08s
+
+用法（ssh 到 GitHub 今天反复超时，https 走代理稳定）：
+
+    git -c http.proxy=http://192.168.1.200:1087 fetch --no-tags https://github.com/sleep2agi/<repo>.git main
+
+下载加速实测：Playwright headless shell 117,394,312 B
+
+    直连   22–112 KB/s（挂了一晚上没完，且 Playwright 自带下载器不支持续传）
+    代理   约 1.7 MB/s，一次跑完（curl -C - 续传 + 手动解压）
+
+## 1. dashboard 仓库（详见 report-dashboard-merge-main-20261106.txt）
+
+    main 镜像 d722a34 → ca6bd6e（上游到 0.6.4-preview.397，pixb..main = 215 个提交）
+    merge 提交 0177016（父 9d868e1 + ca6bd6e），冲突 3 处（样式取上游、语义取我们）
+    验证：npm ci ✅ / gates exit 0 ✅ / npm test 55 套件 333 pass 0 fail ✅ / npm run build ✅
+
+**上游一致性已由代理证明**（代理之前无法证明，是上一条报告里记录的缺口）：
+
+    git -c http.proxy=… fetch https://github.com/sleep2agi/agent-network-dashboard.git main
+    FETCH_HEAD = ca6bd6e == 我们合并用的 main  ⇒ 逐字节相同
+
+dashboard 最新 tip：**18015c3**（e2e 前提修正，见 §3）。
+
+## 2. parent 仓库（agent-network）
+
+    main 镜像 2bea7b11b → 43b99dce9（fast-forward，无业务提交）
+    上游领先 119 个提交，126 文件 +7545/−315
+      server/src/tools.ts +165、#3950 token 审计全链、#3682 V2 permission 规则、
+      feishu 接入、发布列车 agent-node 2.5.0-preview.182 / agent-network 2.3.0-preview.216 /
+      commhub-server 0.9.0-preview.275
+    merge 提交 4387e841b（父 839e060aa + 43b99dce9），已推送
+
+冲突 5 处，全是版本对（两个 package.json、两个 package-lock.json、opencode-agent-node-pair.ts）。
+取上游后核对成对包门：
+
+    PAIRED_AGENT_NETWORK_VERSION = 2.3.0-preview.216 == agent-network/package.json ✅
+    PAIRED_AGENT_NODE_VERSION    = 2.5.0-preview.182 == agent-node/package.json   ✅
+    server 0.9.0-preview.275
+    runtime 名单实测三处（server RUNTIMES / daemon VALID_RUNTIMES / hub 校验）都是 8 个且两两相同：
+      claude-agent-sdk claude-code-cli codex-sdk codex-app-server grok-build-acp grok-build-cli opencode-cli pi-cli
+
+### 验证方法：与基线逐条比对，不看总数
+
+`git worktree add /tmp/base-main main` 检出游水 main，同机同依赖跑三套件，再比**失败名字集合**：
+
+    server          基线 7 红   合并后 7 红    新增 0  消失 0
+    agent-network   基线 4 红   合并后 4 红    新增 0  消失 0
+    agent-node      基线 15 红  合并后 15 红   新增 0  消失 0（pass 3397 → 3421）
+    bun install：server no changes / agent-node no changes / agent-network +3 packages（锁文件自洽）
+
+我们的门单独跑（合并后）：
+
+    src/runtime/pi-rpc/runtime.test.ts        16 pass  0 fail
+    src/runtime/pi-rpc/timeout-resolve.test.ts 7 pass  0 fail
+    src/vendor-error-replay-gate.test.ts       7 pass  0 fail（基线只有 6 条：我们加的那条在）
+    src/runtime/runtime-set-parity.test.ts     3 pass  0 fail
+
+那 15 个红是上游本来就红的环境依赖门（#652 create doorbell ×10、#1625 V2 reaps、
+#1957 tmux pane、#3952 token 上报、copresence undici 超时、runGrokCliTurn）。
+
+### 版本号的一条诚实提醒
+
+合并后本树自报 216/182/275，**与上游已发布的号相同**，而树里还含我们自己的改动。
+⇒ 这些号不得从 pixb 发 npm；身份只认提交（镜像 label / build-info.json）。
+
+现网未触碰：hub 跑 0.9.0-preview.265（label 93dfdeae7）、dashboard 跑 9d868e113。
+换版是独立变更，需要单独批准。
+
+## 3. Playwright：浏览器到手了，spec 的前提是错的（已修）
+
+headless shell 走代理下载后解压到 `~/.cache/ms-playwright/chromium_headless_shell-1217`，
+本机直接可跑：`chrome-headless-shell --version` = Google Chrome for Testing 147.0.7727.15。
+
+跑 `tests/e2e-chatpane-viewport-fit.spec.ts` 两次全红，页面快照给出真相：
+
+    快照内容 = "Spin up your first agent" + npx --yes @sleep2agi/agent-network init
+
+⇒ 断言的 `[data-testid="chat-pane"]` 从来没挂载：这是**空页面**，不是布局 bug。
+
+三条实测根因：
+
+1. **`page.route` 拦不到**：dashboard 读 hub 走服务端代理（`app/api/hub/*/route.ts` 里
+   `hubFetch(COMMHUB_URL)`，RSC/server-route 侧发起）。浏览器侧一条 `/api/hub/*` 请求都没有
+   （debug 跑的 `page.on('response')` 一条 [resp] 都没打出来）。
+2. 计划 B 的 scope：`useNetworkId()` 先解析 network_id（sessionStorage，否则 GET
+   `/api/hub/networks` 自动选一个），`useSessions/useNodes` 在 `ready && networkId` 之前不发请求。
+3. 端口假设有据：本机 3000/3100 被别的容器占着（`pixbbs-mcp` 在 3100，回的就是
+   `Cannot GET /nodes`；`homarr` 占 3000），3200 是现网 dashboard。spec 默认 BASE=3100
+   打的正是 pixbbs-mcp。
+4. 还有一个我自己的错：spec 里写了 `node-list-scroll` —— 代码里没有这个 testid，
+   真实的是 `node-list-rail`。凭想象写选择器，测出来的绿就没有意义。
+
+已落地（dashboard pixb `18015c3`）：
+
+- 选择器按真实 DOM 修正；`E2E_LIVE_HUB=1` 时不做任何路由拦截；
+- 缺 live hub 时整组**显式 skip 并写明原因**（现在跑出来是 `2 skipped`，不再是假红/假绿）；
+- `playwright.e2e.config.ts`：dev 服务器固定 3199，`TEST_URL` 与 spec 共用。
+
+要拿到真绿，需要 live hub 夹具（≥1 network、≥1 session、够溢出的 tasks、dashboard 侧登录），
+即 `tests/inbox-e2e/` 那套「真 hub + 真 dashboard」的 Docker 形状加上 Playwright 容器；
+代理现在 1.7 MB/s，拉 mcr playwright 镜像可行。

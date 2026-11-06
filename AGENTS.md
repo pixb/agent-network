@@ -57,6 +57,36 @@
 - **成对包必须同树构建**：`anet` 与 `agent-node` 的 `PAIRED_*` 版本出自同一棵树；只有白名单、没有运行时的半成品包不得外发（`2.3.0-preview.200` / `2.5.0-preview.165` 已删除）
 - **历史快照用 tag 不用长期分支**：例 `backup/pi-20261029`（rebase 前的 pixb，含完整 RFC-043）
 
+## 网络与合并的两条硬规矩
+
+**上游 fetch 走 https + 代理**（本机到 GitHub 的 ssh 今天反复超时；代理是 HTTP CONNECT）：
+
+```bash
+git -c http.proxy=http://192.168.1.200:1087 fetch --no-tags https://github.com/sleep2agi/<repo>.git main
+git merge-base --is-ancestor <FETCH_HEAD> pixb   # 或比对 sha，证明合并的确实是上游 tip
+```
+
+- `upstream` 远端是 ssh 地址，超时后**没有** `upstream/main` 引用可查 ⇒ 只能拿 `origin/main` 镜像合并时，
+  必须把「无法证明镜像等于上游 tip」写进报告，别默认相等。
+- 下载走代理：`curl -x http://192.168.1.200:1087 -C - -o <out> <url>`（实测 1.7 MB/s vs 直连 22–112 KB/s）。
+
+**合并后不许用「测试总数」判断好坏，必须与基线逐条比对失败名字集合**：
+
+```bash
+git worktree add -f /tmp/base-main main            # 基线 = 上游 main 本身
+# 同一台机器同一套依赖跑同样套件，再比集合
+comm -23 <(grep "^(fail)" 合并后.log | sort -u) <(grep "^(fail)" 基线.log | sort -u)   # 新增的红
+git worktree remove --force /tmp/base-main
+```
+
+新增 0 才算「合并没引入红」；`bun install` 后锁文件必须无改动（自洽）。
+成对包门必须当场核对：`PAIRED_*` 常量 == 两个 `package.json` 的 version；runtime 名单三处逐项相同。
+版本号撞上上游已发布号时，**不得从 pixb 发 npm**，身份只认提交。
+
+**UI e2e 断言要有真 hub**：dashboard 读 hub 走服务端代理（`app/api/hub/*` → `hubFetch(COMMHUB_URL)`），
+`page.route` 只拦浏览器请求 ⇒ 拦截式 mock 对它是无效的，跑出来是「`npx init` 引导页」而不是布局 bug。
+选择器必须逐条对着代码里的 `data-testid` 核对（`node-list-rail`，不是想象中的 `node-list-scroll`）。
+
 ## Dashboard 仓库的 issue / PR 规则（英文）
 
 Dashboard 是独立仓库（`pixb/agent-network-dashboard`，upstream = `sleep2agi/agent-network-dashboard`）。
