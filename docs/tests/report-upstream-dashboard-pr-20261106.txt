@@ -1,0 +1,78 @@
+上游提交：dashboard 聊天栏视口修复 — 2026-11-06
+仓库：sleep2agi/agent-network-dashboard（上游） ← pixb/agent-network-dashboard（我们的 fork）
+顺序按 AGENTS：issue → PR → review → 上游。本次是第一次真正对外提交。
+
+========================================================================
+1. 提交物
+========================================================================
+上游 issue：#448  [bug] Chat pane leaves the window bottom empty and jumps back to the bottom
+上游 PR   ：#449  fix(messages): make the chat pane fit the viewport and stop it jumping to the bottom
+  base = sleep2agi:main @ ca6bd6e16
+  head = pixb:upstream/chat-pane-viewport @ 5efb26cdc200d2805ce7836e72df602556db9cc0
+  规模 = 1 commit / 9 files / +384 −75，无依赖变更
+  状态 = OPEN, mergeable=true（REST: merge_commit_sha=8d1d118c…, 无 auto-merge）
+  正文 Fixes #448（GitHub 侧形成 issue 联动关闭关系）
+内容 = AppShell 定高链（h-[100dvh] + min-h-0 + 唯一滚动容器 data-testid=app-main-scroll + 路由切换手动回顶）
+       + 新 app/lib/main-scroll.ts（getMainScroll / scrollMainTop / fillRemainingHeight）
+       + TaskChatPanel 全部自动滚底改容器相对 scrollTo、loadOlder 双 rAF 锚定、切会话清 skipAutoScrollRef
+       + nodes/node/legion-3d 弃用 rect.top+window.scrollY 自测高度，scheduled-tasks 回顶走 scrollMainTop()
+       + tests/e2e-chatpane-viewport-fit.spec.ts 回归脚本
+
+========================================================================
+2. 上游 CONTRIBUTING 前置门（逐条实测，全在 worktree /tmp/dash-upstream 里跑）
+========================================================================
+上游 CONTRIBUTING「开 PR 前」的 5 条命令，在「上游 main + 本 commit」的树上逐条跑：
+  npm run lint                  rc=0   0 errors
+  npm run build                 rc=0   ✓ Compiled successfully in 7.0s（无 dead link 行）
+  npm test                      rc=0   52/52 test files passed，0 fail
+  npm run oss:check             rc=0   PASS（无凭证/私有路径字节序列）
+  npm run oss:surface           rc=0   github: PASS（无私有部署标记）
+  npm run oss:secrets:history   rc=0   PASS（全历史无凭证形状变更）
+文案侧自查：issue/PR 正文里 `192.168.` 与 `/home/` 命中数 = 0（上游明令禁止私有 IP / 个人路径 / 生产数据）。
+模板侧：上游 .github/ISSUE_TEMPLATE/bug_report.md 的 6 个小节逐节填（标题前缀 [bug]）；
+        上游 PULL_REQUEST_TEMPLATE.md 是 0 字节空文件，所以按 CONTRIBUTING 的 5 条 checklist 逐条勾选并写明依据，
+        其中「安全敏感改动要有负向测试」如实写 n/a（本次纯布局/滚动，无 guard）。
+
+========================================================================
+3. 上游 CI 现状（这是本次最有用的新事实）
+========================================================================
+上游已为我们的 fork PR 起 5 条 workflow，全部：
+  unit tests / OSS readiness gates / legion-presentation / gates / scrub-guard
+  → event=pull_request, head_sha=5efb26c, status=completed, conclusion=action_required
+含义：fork 贡献者的 workflow run 需要上游维护者点 “Approve and workflows”（他们仓库的
+「外部贡献者需批准」设置）。这不是失败，也不是通过 —— 是等人。所以我们不能在 PR 上
+自己制造绿；PR 上看到的绿只能由维护者批准后产生。
+上游 main 分支保护：GET branches/main/protection = 404（无保护），因此合并门由人把关。
+
+========================================================================
+4. 一条会咬人的 ref 陷阱（记下来）
+========================================================================
+`git ls-remote https://github.com/sleep2agi/agent-network-dashboard.git main` 返回两行：
+  ca6bd6e16…  refs/heads/main            ← 真分支
+  94c460937…  refs/remotes/origin/main   ← 上游自带的镜像 ref
+用 `cut -c1-9`/第一行取“上游 tip”会取到镜像 ref。判据：读第二列的 ref 全名，只认 refs/heads/。
+结论：上游 main = ca6bd6e16 = 我们 fork 的 main，基线 behind:0（干净）。
+
+========================================================================
+5. 做法与副作用控制
+========================================================================
+- 用 `git worktree add -b upstream/chat-pane-viewport /tmp/dash-upstream ca6bd6e16`，
+  pixb 工作树全程未动（`git worktree list` 记录两条：pixb@6c4f7a9 与 upstream/chat-pane-viewport@5efb26c）。
+- cherry-pick 9d868e113 冲突 2 处（CHANGELOG.md、app/components/AppShell.tsx），按「双方都保留」解，
+  解后 0 处标记残留，拼接处逐行复核（CHANGELOG：我们条目在前、上游字号条目在后；
+  AppShell：上游 useRadiusTier() 与我们的回顶 effect 并存）。
+- 只推了这一条分支；pixb 未变，现网 dashboard（image label 9d868e113…）未动。
+
+========================================================================
+6. 剩余对外提交（同一条 PR 里塞 20 个 commit 违反上游「Keep each change focused」）
+========================================================================
+pixb 相对上游 main：ahead 20 commits / 36 files / +2586 −92（本次只对外提交其中 1 个 commit）。
+拆法：
+  ① 聊天栏视口修复                     —— 已提交（#448 / #449）
+  ② inbox 私信可见性 + 已读操作        —— feat(inbox)×2 + test(inbox) + proxy 路由修复
+  ③ compose / 源码构建部署定义入库     —— feat/fix(deploy)×4 + docs(deploy)×3
+  ④ CI 卫生（canary / dispatch）       —— 本次未包含
+前置补齐项（②③④ 需要）：6 个中文 subject 改成 Conventional 英文
+  （feat(deploy): 源码构建成为主路径… / feat(deploy): Dashboard 的 compose 部署定义入库… /
+    feat(inbox): 节点发给人的私信进 Dashboard… / feat(inbox): 收件箱行并进消息流… /
+    fix(deploy): 构建期 npm 源做成 ARG… / test(inbox): 收件箱端到端脚本…）
