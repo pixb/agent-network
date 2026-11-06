@@ -25,6 +25,8 @@ concurrency:
   group: lint-from-session-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
 jobs:
   hardcoded-from-session:
     name: no hardcoded from_session

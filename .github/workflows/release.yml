@@ -125,6 +125,8 @@ concurrency:
   group: release-gate-${{ github.ref }}-${{ inputs.package || 'tag-push' }}
   cancel-in-progress: false  # never cancel — even superseded runs surface a verdict
 
+permissions:
+  contents: read
 jobs:
   build-tarball:
     name: build tarball

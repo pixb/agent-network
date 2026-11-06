@@ -103,6 +103,8 @@ concurrency:
   group: qa-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
 jobs:
   # 🔴 docs-only 轻量路径的分类器。只改 docs-site/ 的 PR(下载页 bump 之类)不跑那些
   #    镜像里**根本没有** docs-site 的重套件;镜像里有 docs-site 的照跑。

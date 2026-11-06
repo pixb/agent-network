@@ -35,6 +35,8 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
 jobs:
   scan:
     # 这个 name 是 GitHub 上 check 的名字,也是分支保护里 required check 唯一能写的

@@ -25,6 +25,8 @@ concurrency:
   group: deploy-anet-sh
   cancel-in-progress: true
 
+permissions:
+  contents: read
 jobs:
   deploy:
     runs-on: ubuntu-latest

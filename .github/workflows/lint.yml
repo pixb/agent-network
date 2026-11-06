@@ -30,6 +30,8 @@ concurrency:
   group: lint-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
 jobs:
   bare-rm-rf:
     name: no bare rm -rf $VAR

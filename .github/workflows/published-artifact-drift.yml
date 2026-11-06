@@ -66,6 +66,8 @@ on:
       - '.github/scripts/docs-site-drift-notify.sh'
       - '.github/workflows/published-artifact-drift.yml'
 
+permissions:
+  contents: read
 jobs:
   published-pins:
     runs-on: ubuntu-latest
