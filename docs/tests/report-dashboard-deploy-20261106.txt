@@ -61,3 +61,42 @@ tests/e2e-chatpane-viewport-fit.spec.ts 需要在有浏览器的环境跑一次�
 `--with-deps` 在 Arch 上必然失败（apt-get 不存在）；Chromium 运行所需系统库
 （nspr/nss/atk/cups/asound）本机齐 ⇒ `npx playwright install chromium --only-shell`
 即可，不需要装任何系统包。部署本身不依赖它（gate = gates + 54/54 + 镜像 label + 路由核对）。
+
+
+## 追加（同日）：已上线提交的 commit 信息改英文 —— 1f92fae → 9d868e113
+
+用户要求：`pixb` 上那个已上线提交的 commit 信息从中文改成英文。
+改信息会**换 SHA**，而当时运行镜像的 label 就是 `1f92fae`。
+所以这不是「改个文案」，而是一次**必须成对做**的操作：
+
+    ① docker tag anet-dashboard:compose anet-dashboard:rollback-20261106b   # = 01e68aad2e5b（先打，否则无法回滚）
+    ② git commit --amend（英文信息）→ 9d868e113dadf722b8ba5ea39e94ed1ea9e7b656
+       git diff --stat 1f92fae 9d868e113   → 空（**同一棵树**，只是信息换了）
+       git show --stat --format="" HEAD    → 9 files, +381/-75
+    ③ git push --force-with-lease origin pixb
+    ④ docker build -f deploy/compose/Dockerfile.source --build-arg SOURCE_REV=9d868e113… --build-arg SOURCE_DIRTY=false -t anet-dashboard:compose .
+    ⑤ docker compose up -d --no-build dashboard
+
+为什么 ④⑤ 不可省：③ 之后 `1f92fae` **不再在 pixb 历史里**
+（`git merge-base --is-ancestor 1f92fae origin/pixb` 判否）。若此时不重建，
+现网 label 就变成一个分支里查不到的提交 —— 正是 hub 那次抓到的反例
+（label `34cbb9a4` 不在 pixb 历史里，于是无法回答「跑的是哪份代码」）。
+
+换版后实测：
+
+    容器   anet-dashboard-1 Up (healthy)  0.0.0.0:3200->3000
+    label  9d868e113dadf722b8ba5ea39e94ed1ea9e7b656
+           git merge-base --is-ancestor <label> origin/pixb  →  in pixb history ✅
+    路由   /login=200  /messages=307  /messages/inbox=307  /nodes=307（307 = 无会话跳登录）
+    hub    anet-hub-1 Up (healthy) 9200，未被触碰
+    回滚   anet-dashboard:rollback-20261106  = 170f1df5e74d（11-04 版）
+           anet-dashboard:rollback-20261106b = 01e68aad2e5b（中文信息那版，同一棵树）
+
+已知不对称：dashboard 制品里**没有** `build-info.json`（`/app` 里只有源码树），
+它的部署身份只靠镜像 label；hub 有 `server/build-info.json` + `/health` 的
+`build_identified`。要问进程自己是谁，dashboard 目前只能读 label。
+
+对应 issue/PR：issue #1、PR #2（`fix/chat-pane-viewport-fit` = `f9eda92`）。
+`f9eda92` 与 `9d868e113` 树相同（`git diff` 为空）：前者是 PR 审阅用的孪生提交
+（基准 `review-base/chat-pane-viewport` = `bc5374d`，PR 里正好一个提交），
+后者是 pixb 上的正式提交。

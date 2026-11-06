@@ -74,8 +74,12 @@ Dashboard 是独立仓库（`pixb/agent-network-dashboard`，upstream = `sleep2a
   本次踩过：按截断的输出写成「3 个文件 / `components/layout/AppShell.tsx`」，
   实际是 9 个文件 / `app/components/AppShell.tsx` + 新增 `app/lib/main-scroll.ts`。
   写之前跑 `git show --stat` 与 `gh pr diff <n> --name-only` 对数。
-- **已上线的历史不重写**：现网跑的提交（例 `1f92fae`，中文信息）保持原样作为部署身份；
-  英文分支是它的孪生提交，commit 里写明 `git diff 1f92fae <new> ` 为空。
+- **已上线的提交默认不重写**。真要重写（例：commit 信息从中英转换），必须**成对做完**：
+  `--amend` → `push --force-with-lease` → **重建镜像（label 传新提交）→ `up -d --no-build` 换版**。
+  理由：amend 换 SHA 后旧提交**不在分支历史里**，若现网 label 还指着旧 SHA，
+  就变成「跑的代码在分支里查不到」（hub 那次的反例就是 label `34cbb9a4` 不在 pixb 历史里）。
+  做完的标准是 `git merge-base --is-ancestor <现网 label> origin/pixb` 判**是**。
+  动手前先 `docker tag` 旧镜像（`rollback-<日期>`），并核对 `git diff <旧> <新>` 为空（只换信息不换代码）。
 - 实测样例：issue #1 + PR #2（聊天栏视口高度链 + 自动滚底）。
 
 ## 可重建与灾难恢复规则
