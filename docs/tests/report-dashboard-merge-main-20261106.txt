@@ -1,0 +1,63 @@
+Dashboard：main（上游同步到 0.6.4-preview.397）merge 进 pixb — 2026-11-06
+
+## 做了什么
+
+仓库 `agent-network-dashboard`，分支规则要求「上游更新只能经 main 进 pixb，用 merge」。
+本次上游领先很多，实测数字先摆出来：
+
+    fetch 前：pixb..main = 215 个提交      main..pixb = 13 个提交（我们自己的改动）
+    本地 main 落后 origin/main 215 个提交  ⇒ 先把 main 镜像 fast-forward 到 origin/main
+    main = d722a34 → ca6bd6e（无业务提交，纯镜像）
+
+合并：
+
+    git checkout pixb && git merge main
+    merge 提交 = 0177016，父提交两个 = 9d868e1（pixb）+ ca6bd6e（main）
+    合并后：pixb..main = 0（上游全进来了）  main..pixb = 14（只剩我们自己的）
+    推送：origin/main = ca6bd6e，origin/pixb = 0177016
+
+版本随上游走：package.json `0.6.4-preview.345` → `0.6.4-preview.397`（上游发布列车）。
+
+## 三处冲突与解法（逐条按「谁的意图是什么」判，不是无脑取一边）
+
+1. `app/messages/page.tsx`（2 处）
+   上游把整页 `rounded-xl` → `rounded-2xl`（3 → 6 处，xl 归零）；
+   我们改的是**判定条件**：`messages.length` → `timeline.length`（聊天 + 收件箱合并后的列表）。
+   ⇒ 样式取上游、语义取我们：`rounded-2xl` + `timeline.length`。
+   取上游条件的后果写清楚：现网真实形状是「网络 inbox 0 行 + user_inbox 42 行」，
+   写死 `messages.length` 会让搜索框整块消失、把读失败伪装成「这里很安静」——
+   这正是 `hub-error-propagation.test.mjs` 要拦的形状。
+
+2. `app/components/AppShell.tsx`（1 处）
+   上游新增 `useRadiusTier()`（小控件圆角按渲染高度在挂载后量一次）；
+   我们新增路由切换时手动回顶（滚动容器不再随文档免费复位）。
+   ⇒ 两边都留，无冲突语义。
+
+3. `CHANGELOG.md`
+   我们的 `## Unreleased` 在前，上游 `.397 … .346` 各节在后（双方都保留）。
+
+`package.json` / `package-lock.json` 由 git 自动合并（无冲突）。
+
+## 验证（合并后跑，全部退出码为 0）
+
+    npm ci        ✅ 锁文件与 package.json 同步（合并未破坏锁文件）
+    npm run gates ✅ exit 0（token-contrast ✓、accent-text-ratchet ✓；avatar orphan 是既有 warning）
+    npm test      ✅ 55 套件、pass 合计 333、fail 合计 0
+    npm run build ✅ Compiled successfully in 9.9s，72 个静态页生成完毕
+
+## 现网未被触碰
+
+`anet-dashboard-1` 仍跑 label `9d868e113…`（= 合并前的 pixb tip），`anet-hub-1` 未动。
+这次只做了「分支收敛 + 门与构建通过」，**换版是另一个变更**，需要单独批准：
+版本从 345 线跳到 397 线（上游 215 个提交的行为变化），换版前应当
+① 先 `docker tag` 旧镜像做回滚 tag；② 用推送后的提交重建（label=提交）；
+③ `up -d --no-build`；④ 跑 `tests/inbox-e2e/` 与收件箱/聊天相关门。
+
+## 一个诚实的缺口
+
+`git fetch upstream`（`git@github.com:sleep2agi/agent-network-dashboard.git`）本次**网络超时**
+（60s 内未完成，本机到 GitHub 的 ssh 连接今天反复超时），所以我合并的是
+**我们仓库里的 main 镜像 `origin/main` = `ca6bd6e`**，无法在这台机器上重新证明
+`ca6bd6e` 与上游 `sleep2agi/main` 当前 tip 逐字节相同。
+本地也没有 `upstream/main` 引用可查。补法：下次上游同步时成功 `git fetch upstream main`，
+比对 `upstream/main` 与 `main`，不一致再走一次 merge。
