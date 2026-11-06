@@ -351,6 +351,14 @@ async function thinkOnce(
   // response 先到，装了监听就立刻「完成」，回复正文是空的。
   let acked = false;
   let removeListener: (() => void) | null = null;
+  // removeListener 只在 onRecord 闭包里被置空。TS 的控制流分析看不到闭包里的赋值，
+  // 于是把调用点收窄成 null —— 对 null 用 `?.()` 得到 never，报 TS2349「不可调用」。
+  // 把读取放进函数：嵌套作用域里收窄重置回声明类型，调用点就合法了。
+  const clearListener = () => {
+    const off = removeListener;
+    removeListener = null;
+    off?.();
+  };
   const settledPromise = new Promise<void>((resolve) => {
     const onRecord = (r: PiRpcRecord) => {
       reducePiRecord(state, r);
@@ -375,7 +383,7 @@ async function thinkOnce(
   const busy = probe !== null && (probe.isStreaming || probe.isCompacting);
 
   if (busy && busyPolicy === "skip") {
-    removeListener?.();
+    clearListener();
     throw new PiRuntimeError(
       "pi_runtime_busy",
       `模型忙（${reason === "compacting" ? "压缩中" : "上一轮未结束"}），本轮未提交`,
@@ -428,7 +436,7 @@ async function thinkOnce(
     }
   } catch (e: unknown) {
     if (e instanceof PiRuntimeError) {
-      removeListener?.();
+      clearListener();
       throw e;
     }
     // ack 超时是一个**不确定态**：pi 可能已经接受了这条 prompt，回复就在流里。
@@ -456,7 +464,7 @@ async function thinkOnce(
     } else {
       const resendSafe = !state.runStarted && state.messageCount === 0 && state.deltaCount === 0;
       if (!resendSafe || busyPolicy === "fail") {
-        removeListener?.();
+        clearListener();
         throw new PiRuntimeError(
           "pi_prompt_ack_timeout",
           `等 pi 接受 prompt 超时 ${waited}ms（ack 预算 ${ackTimeoutMs}ms，现场压缩可达 9 分钟；`
@@ -496,7 +504,7 @@ async function thinkOnce(
     // 扩展/输入处理器吃了这条 prompt：没有 run 开始，不能等 agent_settled
     // （等到地老天荒只会变成 idle 超时）。
     opts.warn?.("[pi] disposition=handled：本轮没有 run 开始，不等 agent_settled");
-    removeListener?.();
+    clearListener();
     opts.onSubmitted?.();
     opts.onConsumed?.();
     return;
@@ -546,12 +554,12 @@ async function thinkOnce(
         `[pi] idle 超时后 ${graceMs}ms 内收到 settled ⇒ 本轮作为迟到结果交付（不杀进程、不丢正文）`,
       );
       if (watchdog) clearTimeout(watchdog);
-      removeListener?.();
+      clearListener();
       opts.onConsumed?.();
       return;
     }
     client.kill();
-    removeListener?.();
+    clearListener();
     const note =
       state.compactionCount > 0
         ? `本轮观察到压缩 ${state.compactionCount} 次（累计 ${Math.round(state.compactionMs / 1000)}s，`
@@ -563,7 +571,7 @@ async function thinkOnce(
     );
   }
   if (watchdog) clearTimeout(watchdog);
-  removeListener?.();
+  clearListener();
   if (state.compactionCount > 0) {
     opts.log?.(
       `[pi] 本轮压缩 ${state.compactionCount} 次 = ${Math.round(state.compactionMs / 1000)}s，`

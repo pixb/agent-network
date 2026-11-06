@@ -35,7 +35,7 @@ Runtime 决定 `agent-node` 如何驱动 AI；供应商决定模型和计费。�
 | `codex-app-server` | preview | Codex TUI 人机共存（选单里显示为 `codex-cli`）。见[共存指南](/guide/codex-copresence) |
 | `opencode-cli` | preview | 公版 OpenCode 多厂商前端。V1 与 V2 共用这个 id，见下；V2 步骤见 [OpenCode V2](/guide/opencode) |
 | `grok-build-cli` | 实验 | Grok TUI 人机共存，只接收可信任务。见[Grok 节点](/guide/grok) |
-| `pi-cli` | 稳定 | 公版 pi（`@earendil-works/pi-coding-agent`）headless 编程 agent，BYOK 直连任意 OpenAI 兼容端点（本地 ollama / vLLM / OpenAI 等）。见 [RFC-043](/rfcs/RFC-043-pi-cli-runtime-integration) |
+| `pi-cli` | 稳定 | 公版 pi（`@earendil-works/pi-coding-agent`）headless 编程 agent，BYOK 直连任意 OpenAI 兼容端点（本地 ollama / vLLM / OpenAI 等）。见 [RFC-043](https://github.com/sleep2agi/agent-network/blob/main/docs/rfcs/RFC-043-pi-cli-runtime-integration.md) |
 
 OpenCode 的 V1 和 V2 都是 runtime `opencode-cli`，不是两个 runtime id。V1 是默认代际（包 `opencode-ai`），headless 和人机共存都可以。V2（包 `@opencode/cli`）用 `--opencode-generation v2` 创建，目前只在 npm `preview` 通道：只做人机共存，还要 `--opencode-unsafe-tools`（本机工具全开，只用于可信任务）。npm `latest` 上的 `opencode-cli` 仍是 V1。创建、Hub 对话、daemon 和尚未接线的模型目录见 [OpenCode V2](/guide/opencode)。
 
