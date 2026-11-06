@@ -86,7 +86,7 @@ import { OPENCODE_KEYLESS_FREE_MODEL_NOTE, opencodeFreeTierSafePresetWarning } f
 import { resolveRuntimeForResume } from "../src/resume-runtime-infer";
 import { isSameIncarnation, processVanished, resolveOwnedRoots, type OwnedRootCandidate } from "../src/owned-roots";
 import { serializeProfileForConfigJson } from "../src/profile-serialize";
-import { mergeProfilePatch } from "../src/profile-merge";
+import { mergeProfilePatch, droppedProfileKeys } from "../src/profile-merge";
 import { backfillOpencodeGeneration, stampOpencodeGeneration } from "../src/opencode-generation-record";
 import {
   applyOpencodeGenerationCreateOption,
@@ -3267,6 +3267,13 @@ function saveProfile(id: string, profile: Profile) {
   // #542 — an OpenCode node records its generation (absent → "v1"; never overwritten).
   const normalized = normalizeStoredProfile(id, isOpencode ? stampOpencodeGeneration(profile) : profile);
   const toSave = serializeProfileForConfigJson(normalized, profile);
+  // #3418 —— 白名单之外的键会静默消失。生产上就丢过 opencodeConfiguredModelAtLastOpen，
+  // 表现成「下游读到 null、判据永远 false」，查了三轮才找到。丢掉要出声。
+  try {
+    const onDisk = JSON.parse(readFileSync(join(dir, "config.json"), "utf-8"));
+    const dropped = droppedProfileKeys(onDisk, toSave);
+    if (dropped.length) console.warn(`[anet] ⚠ profile 保存会丢掉这些键（不在白名单里）: ${dropped.join(", ")}`);
+  } catch {}
   const body = JSON.stringify(toSave, null, 2) + "\n";
   if (isOpencode) {
     // The profile contains the node ntok_. Never replace through a
@@ -5008,7 +5015,11 @@ Grok co-presence (EXPERIMENTAL — shared human + network TUI; opt in explicitly
 
 Channel:
   anet channel add telegram <name> --bot-token <tok> --allow <uid>
+  anet channel add feishu <name> --app-id <id> --app-secret <secret> --allow <open_id>
+                                [--allow-chat <chat_id>]  Feishu bot (long connection)
   anet channel ls [name]  List channels
+  Note: a channel is an extra inbox next to the Hub one; the node's turn pipeline is
+        the same, so the runtime does not change (grok-build-cli is refused for now).
 
 Setup:
   anet init [--hub <url>]                                 Configure hub URL (global; no token prompt)

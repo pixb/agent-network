@@ -16,6 +16,7 @@ import { clearNodeFromAgentTeams, agentTeamWhoami } from "./agent-teams.js";
 import { parseDbTimestampMs } from "./db-timestamp.js";
 import { z } from "zod/v4";
 import { nodeHealthSchema, normalizeNodeHealth, recordNodeHealth } from "./node-health-store.js";
+import { readTokenUsage, reportTokenUsage } from "./node-token-usage.js";
 import { assertNodeHealthy } from "./node-health-guard.js";
 import { noteModelAuthHealth } from "./model-auth-notify.js";
 import { numberedAliasInClause, parseAliasFilter } from "./alias-filter.js";
@@ -862,18 +863,18 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
 
   server.tool(
     "report_status",
-    "Report agent status. Returns inbox_count.",
+    "Report status; returns inbox_count.",
     {
-      resume_id: z.string().min(1).max(200).describe("Claude Code session UUID (unique per session)"),
-      alias: z.string().min(1).max(200).describe("Human-readable session name for dispatching (e.g. 指挥室/知识哥)"),
+      resume_id: z.string().min(1).max(200).describe("Session UUID"),
+      alias: z.string().min(1).max(200).describe("Session alias for dispatch"),
       status: z.enum(["working", "idle", "blocked", "error", "waiting_input", "offline"]),
-      task: z.string().max(TASK_CONTENT_MAX).optional().describe("Task (session stores 200 chars; full text matches tasks.content)"),
-      output: z.string().max(50000).optional().describe("Recent output (max 4000 chars stored)"),
+      task: z.string().max(TASK_CONTENT_MAX).optional().describe("Task (200 chars stored)"),
+      output: z.string().max(50000).optional().describe("Recent output (4k stored)"),
       score: z.number().min(0).max(10).optional().describe("Self-score 1-10"),
       progress: z.number().min(0).max(100).optional().describe("Progress 0-100"),
       server: z.string().max(200).optional().describe("Server identifier"),
       hostname: z.string().max(200).optional().describe("Agent hostname"),
-      agent: z.string().max(100).optional().describe("Agent type (claude-code / codex / opencode)"),
+      agent: z.string().max(100).optional().describe("Agent type"),
       project_dir: z.string().max(1000).optional().describe("Agent working directory"),
       // #1198 — OS account the process runs as (platform identity only; no env fallback).
       os_user: z.string().min(1).max(256).optional().describe("OS account"),
@@ -895,8 +896,8 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       config_path: z.string().max(1000).optional().describe("Config file path"),
       channels: z.string().max(2000).optional().describe("JSON array of channels"),
       model: z.string().max(200).optional().describe("AI model name"),
-      node_name: z.string().max(200).optional().describe("Stable node display name (may differ from alias)"),
-      network_id: z.string().max(200).optional().describe("Network this agent belongs to"),
+      node_name: z.string().max(200).optional().describe("Node display name"),
+      network_id: z.string().max(200).optional().describe("Network id"),
       // ╭─ 🔴 往 report_status 里加字段之前先读这一段(#1545 实测,zod 4.3.6)─────────╮
       // │ **这份 schema 的子对象一半严一半松,而后果完全不同。**
       // │
@@ -938,7 +939,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         disk_total_gb: z.number().nullable().optional(),
         disk_used_gb: z.number().nullable().optional(),
         disk_avail_gb: z.number().nullable().optional(),
-      }).optional().describe("Host telemetry reported by agent-node"),
+      }).optional().describe("Host telemetry"),
       process_telemetry: z.object({
         rss_bytes: z.number().nullable().optional(),
         rss_mb: z.number().nullable().optional(),
@@ -946,7 +947,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
         cpu_pct: z.number().nullable().optional(),
         uptime_seconds: z.number().nullable().optional(),
         in_flight_count: z.number().nullable().optional(),
-      }).optional().describe("Per-agent process telemetry reported by agent-node"),
+      }).optional().describe("Process telemetry"),
       external_schedules: z.object({
         observed_at: z.string().datetime({ offset: true }).max(64),
         schedules: z.array(z.object({
@@ -966,7 +967,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           revision: z.number().int().min(0).optional(),
         }).strict()).max(64),
         error: z.enum(["invalid_manifest", "unsafe_manifest", "read_failed"]).optional(),
-      }).strict().optional().describe("Node-reported schedules; never includes host paths or commands"),
+      }).strict().optional().describe("External schedules (no paths)"),
       // RFC-024 B6 — masked snapshot of the node's effective config
       // (model + 6 dashboard-editable flags). Secrets ARE NOT in this
       // shape (env._envRef stays on host); the dashboard reads this
@@ -2070,8 +2071,8 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       from_session: z.string().max(200).optional(),
       ttl_seconds: z.number().min(1).max(86400).optional().describe("Task TTL in seconds (default: 3600)"),
       network_id: z.string().max(200).optional().describe("Network scope"),
-      parent_task_id: z.string().max(200).optional().describe("Parent task this dispatch is on behalf of. The child's reply is auto-chained to the parent's originator, so the user sees the result even if the intermediate session ends."),
-      meta: z.any().optional().describe("Optional task metadata, e.g. { attachments: [{ type, path, url, mime, name, size }] }."),
+      parent_task_id: z.string().max(200).optional().describe("Parent task this dispatch serves; the reply auto-chains to its originator."),
+      meta: z.any().optional().describe("Optional task metadata, e.g. { attachments: [{type,path,url,mime,name,size}] }."),
       force: z.boolean().optional().describe("dispatch even if the target is degraded (user tokens only)"),
     },
     async ({ alias, task, priority, context, from_session: _fromIn, ttl_seconds, network_id: netId, parent_task_id: parentIn, meta, force }) => {
@@ -2133,7 +2134,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           recentSql += " ORDER BY created_at DESC LIMIT 5";
           const cands = db.all<{ task_id: string; created_at: string | null }>(recentSql, ...recentParams);
           const verdict = decideParentInference(
-            cands.map((c) => ({ task_id: c.task_id, created_at_ms: c.created_at ? Date.parse(c.created_at) : null })),
+            cands.map((c) => ({ task_id: c.task_id, created_at_ms: parseHubTimestamp(c.created_at) })),
             Date.now(),
           );
           if (verdict.ok) {
@@ -3122,8 +3123,23 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       durable_terminal_cursor: z.boolean().optional().describe("Read terminal outbound journal in monotonic order"),
       after_terminal_seq: z.number().int().min(0).optional().describe("Exclusive terminal journal watermark"),
       limit: z.number().min(1).max(100).optional().default(20),
+      // #3119 —— 轮询增量。生产实测（2026-11-05 近 6h）list_tasks 占全部工具调用 35.7%、
+      // 是最大的一格：每次轮询都拉全量再自己筛。给它一个「只要这之后创建的」，
+      // 空窗口就回极短体，比任何提示词都省（提示词只能劝，改不了接口成本）。
+      created_since: z.string().max(64).optional()
+        .describe("Only tasks created after this (ISO 8601 or 'YYYY-MM-DD HH:MM:SS'); pass previous server_time."),
+      // #3119 —— stats 是全表 GROUP BY：轮询时它比任务列表本身还贵。
+      // #3119 —— 不给 `.default(false)`：要能区分「没传」与「显式传 false」。
+      // 节点令牌没传时默认省略 stats（它是给「看图的人」用的计数，轮询的节点不读它）；
+      // 显式传 false 仍然可以要回来。用户令牌保持旧行为（默认返回 stats）。
+      omit_stats: z.boolean().optional()
+        .describe("Skip per-status counts (they scan every task in scope). Default true for node tokens."),
+      // #3943 —— 服务端水位。调用方不传时间，Hub 用「上次给这个调用者返回的时刻」当下界，
+      // 返回后把水位推到本次的 server_time。客户端连时钟都不用记（也就不会因两边差几秒漏活）。
+      since_last: z.boolean().optional().default(false)
+        .describe("Only tasks created since this caller's previous list_tasks (watermark kept server-side)."),
     },
-    async ({ alias, status, from_name, from_node_id, network_id: netId, before_created_at, before_task_id, durable_cursor, durable_terminal_cursor, after_terminal_seq, limit }) => {
+    async ({ alias, status, from_name, from_node_id, network_id: netId, before_created_at, before_task_id, durable_cursor, durable_terminal_cursor, after_terminal_seq, limit, created_since, omit_stats, since_last }) => {
       const readScope = resolveReadScope(netId);
       if (readScope.denied) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: readScope.denied }) }] };
       if (durable_cursor) {
@@ -3173,6 +3189,35 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
           has_more: tasks.length === limit,
         }) }] };
       }
+      // #3943 —— 两种下界不许同时给：一个来自调用方，一个来自服务端，混用说不清以谁为准。
+      if (since_last && created_since) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "created_since_and_since_last_are_exclusive" }) }] };
+      }
+      // 为什么不给 since_last 也设默认：list_tasks 同时被用来回答「我手上有哪些活」，
+      // 那是一个**全集**问题；默认 since_last 会让「早就派给我、一直没动」的任务消失，
+      // 节点据此得出「没活」——把一个成本问题换成一个正确性问题，不划算。
+      const omitStats = omit_stats ?? callerTokenIsNetwork;
+      const effectiveNetIdForWatermark = enforceNetworkId ?? getNetworkId(netId);
+      const watermarkKey = (() => {
+        if (callerTokenIsNetwork && callerTokenId && enforceNetworkId) {
+          const bound = db.get<{ bound_node_id: string | null }>(
+            "SELECT bound_node_id FROM api_tokens WHERE token_id = ?1 AND network_id = ?2",
+            callerTokenId, enforceNetworkId,
+          )?.bound_node_id ?? null;
+          if (bound) return `n:${bound}`;
+        }
+        return `a:${callerAlias ?? ""}`;
+      })();
+      const readWatermark = (): string | null => {
+        if (!since_last || !effectiveNetIdForWatermark) return null;
+        return db.get<{ watermark: string }>(
+          "SELECT watermark FROM list_tasks_watermarks WHERE network_id = ?1 AND caller_key = ?2",
+          effectiveNetIdForWatermark, watermarkKey,
+        )?.watermark ?? null;
+      };
+      const previousWatermark = readWatermark();
+      const sinceBound = previousWatermark ?? created_since ?? null;
+
       let sql = "SELECT task_id, from_node_id, from_name, to_node_id, to_name, priority, status, content, result, created_at, runtime_submitted_at, consumed_at, thread_id, turn_id, completed_at FROM tasks WHERE 1=1";
       const params: any[] = [];
       sql = addAgentTimelineScope(sql, params, readScope, { from: "from_name", to: "to_name", fromNodeId: "from_node_id", toNodeId: "to_node_id" });
@@ -3180,6 +3225,12 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       if (status) { sql += ` AND status = ?${params.length + 1}`; params.push(status); }
       if (from_name) { sql += ` AND from_name = ?${params.length + 1}`; params.push(from_name); }
       if (from_node_id) { sql += ` AND from_node_id = ?${params.length + 1}`; params.push(from_node_id); }
+      // #3119 —— 必须用 julianday 比，不能直接拿字符串比：
+      // tasks.created_at 存的是 'YYYY-MM-DD HH:MM:SS'（空格），而客户端传 ISO 带 'T' 与 'Z'。
+      // 字符串比较在第 11 个字符就分高低（' ' 0x20 < 'T' 0x54）⇒ **同一天的记录会被判成"更早"**
+      // ⇒ 用 ISO 传参几乎永远返回空列表。上线后发现（生产实测：传 2026-11-05T00:00:00Z 返回 0 条，
+      // 而库里当天明明有记录）。julianday 两种格式都认。
+      if (sinceBound) { sql += ` AND julianday(created_at) > julianday(?${params.length + 1})`; params.push(sinceBound); }
       if (before_created_at && before_task_id) {
         sql += ` AND (created_at < ?${params.length + 1} OR (created_at = ?${params.length + 1} AND task_id < ?${params.length + 2}))`;
         params.push(before_created_at, before_task_id);
@@ -3187,8 +3238,36 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       sql += ` ORDER BY created_at DESC, task_id DESC LIMIT ?${params.length + 1}`;
       params.push(limit);
       const tasks = db.all(sql, ...params);
+      // 水位在**查询之后**推进：这样「两次调用之间创建」的任务不会因为并发被跳过。
+      // 用本次响应里的 server_time 作为下一次的下界；首次调用没有水位 ⇒ 全量，且 since_from=null
+      // （不假装有水位，否则调用方会以为「之前那些已经看过了」）。
+      const serverTime = new Date().toISOString();
+      if (since_last && effectiveNetIdForWatermark) {
+        db.run(
+          `INSERT INTO list_tasks_watermarks(network_id, caller_key, watermark, updated_at)
+           VALUES(?1, ?2, ?3, datetime('now'))
+           ON CONFLICT(network_id, caller_key) DO UPDATE SET watermark=excluded.watermark, updated_at=excluded.updated_at`,
+          [effectiveNetIdForWatermark, watermarkKey, serverTime],
+        );
+      }
 
-      // Stats
+      // Stats（#3119：轮询时默认仍然返回，调用方可用 omit_stats 显式关掉）
+      if (omitStats) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({
+          ok: true,
+          ...(durable_cursor ? { capability: "list_tasks.immutable-node-cursor.v1" } : {}),
+          tasks,
+          count: tasks.length,
+          next_cursor: tasks.length === limit ? {
+            before_created_at: tasks[tasks.length - 1]?.created_at,
+            before_task_id: tasks[tasks.length - 1]?.task_id,
+          } : null,
+          // 客户端把这个值原样当下一轮的 created_since，避免两边时钟不一致。
+          server_time: serverTime,
+          ...(since_last ? { since_from: previousWatermark, since_to: serverTime } : {}),
+          stats_omitted: true,
+        }) }] };
+      }
       const statsParams: any[] = [];
       let statsSql = "SELECT status, COUNT(*) as count FROM tasks WHERE 1=1";
       statsSql = addAgentTimelineScope(statsSql, statsParams, readScope, { from: "from_name", to: "to_name", fromNodeId: "from_node_id", toNodeId: "to_node_id" });
@@ -3207,11 +3286,47 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
               before_created_at: tasks[tasks.length - 1]?.created_at,
               before_task_id: tasks[tasks.length - 1]?.task_id,
             } : null,
+            // #3119 —— 轮询水位由服务端给，客户端别用本地时钟（两边差几秒就会漏活或重复）。
+            server_time: serverTime,
+            ...(since_last ? { since_from: previousWatermark, since_to: serverTime } : {}),
             stats,
           }),
         }],
       };
     }
+  );
+
+  // ── #3952 Token 审计（admin 2026-11-05）──
+  // ── #3952 Token 审计（admin 2026-11-05）──
+  // audience=protocol：agent-node 按名字直接调、从不 list，所以它**不进 tools/list**，
+  // 也就不吃那个只剩 3 B 的 node 预算。这不是偷懒，是那条预算的实际约束推出来的唯一合理归类。
+  server.tool(
+    "report_token_usage",
+    "Node reports its own LLM token counts (never content).",
+    {
+      hour: z.string().max(13).optional(),
+      model: z.string().max(100).optional(),
+      input_tokens: z.number().int().min(0).optional(),
+      output_tokens: z.number().int().min(0).optional(),
+      cache_read_tokens: z.number().int().min(0).optional(),
+      turns: z.number().int().min(0).optional(),
+      cost_usd: z.number().min(0).optional(),
+    },
+    async ({ hour, model, input_tokens, output_tokens, cache_read_tokens, turns, cost_usd }) => {
+      if (!callerTokenIsNetwork || !enforceNetworkId || !callerAlias) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "network_token_required" }) }] };
+      }
+      const node = resolveCallerNode();
+      if (!node) return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "alias_unknown" }) }] };
+      const r = reportTokenUsage({
+        networkId: enforceNetworkId, nodeId: node.node_id,
+        hour: hour ?? null, model: model ?? null,
+        inputTokens: input_tokens ?? null, outputTokens: output_tokens ?? null,
+        cacheReadTokens: cache_read_tokens ?? null,
+        turns: turns ?? null, costUsd: cost_usd ?? null,
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(r) }] };
+    },
   );
 
   // ── V2: cancel_task (取消任务) ──
@@ -3324,7 +3439,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       kind: z.string().min(1).max(80).optional().default("agent_message"),
       meta: z.record(z.string(), z.unknown()).optional(),
       from_session: z.string().max(200).optional(),
-      network_id: z.string().max(200).optional().describe("Network scope (auto-resolved for single-network user tokens; ntok stays bound to its network)."),
+      network_id: z.string().max(200).optional().describe("Network scope (auto-resolved for single-network user tokens; ntok stays bound)."),
     },
     async ({ to_user_id, to_username, title, message, severity, kind, meta, from_session: _fromIn, network_id: netId }) => {
       const fromMismatch = fromIdentityMismatchReply(_fromIn);
@@ -3601,7 +3716,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     "Set the per-node config (model + flags) and push a doorbell; the node pulls, validates and applies (hot or restart per field). RFC-024.",
     {
       ...NODE_ID_ALIAS_FIELDS,
-      base_revision: z.number().int().min(0).describe("Current revision per the dashboard's last GET — 409 if hub's current revision differs."),
+      base_revision: z.number().int().min(0).describe("Revision from the dashboard's last GET — 409 if the hub's differs."),
       patch: z.object({
         model: z.string().max(200).optional(),
         flags: z.record(z.string(), z.unknown()).optional(),
@@ -4314,7 +4429,7 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
       lines: z.number().int().min(1).max(LOGS_MAX_LINES).optional().describe("How many of the newest matching lines (default 500, max 2000)."),
       level: z.enum(["info", "warn", "error"]).optional().describe("Only lines of exactly this level."),
       grep: z.string().min(1).max(LOGS_GREP_MAX).optional().describe("Case-insensitive substring, matched after redaction."),
-      since_ts: z.number().int().min(0).optional().describe("Only lines at/after this epoch-ms timestamp (follow mode; client de-dupes by line key)."),
+      since_ts: z.number().int().min(0).optional().describe("Only lines at/after this epoch-ms (follow mode; client de-dupes by line key)."),
       network_id: z.string().max(200).optional(),
     },
     async ({ node_id, child_node_id, alias, lines, level, grep, since_ts, network_id }) =>
@@ -7015,9 +7130,9 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     description: z.string().max(20_000).optional().describe("markdown"),
     checklist: z.array(reqChecklistItem).max(100).optional().describe("replaces the whole list"),
     project_id: z.string().max(200).nullable().optional(),
-    owner: reqPerson.nullable().optional().describe("负责人 (a person): {kind:'user', id | username} (ids / usernames from requirements_people; names resolve in the task's network); a node is rejected with owner_must_be_human — use agent_owner"),
+    owner: reqPerson.nullable().optional().describe("Owner (person): {kind:'user', id|username} from requirements_people; a node gets owner_must_be_human — use agent_owner"),
     agent_owner: reqPerson.nullable().optional().describe("负责 Agent: {kind:'node', id | alias}"),
-    participants: z.array(reqPerson).max(100).optional().describe("REPLACES the whole list (like owner/agent_owner; omitted people are removed, [] clears). For a few, use participants_add/participants_remove."),
+    participants: z.array(reqPerson).max(100).optional().describe("REPLACES the list (omitted removed; [] clears). For a few use participants_add/_remove."),
     external_url: z.string().max(500).nullable().optional(),
     parent_id: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/).nullable().optional().describe("parent requirement (same network, no cycles, ≤ 5 levels); null detaches"),
   };
@@ -7052,13 +7167,13 @@ export function registerTools(server: McpServer, clientIP?: string, enforceNetwo
     parent_id: z.string().max(200).optional().describe("children of this requirement ('none' = top level)"),
     department_id: z.string().max(64).optional().describe("owner (or its Agent's owner) in this department or below"),
     top_level: z.boolean().optional(), q: z.string().max(200).optional(),
-    overdue: z.boolean().optional().describe("true = open tasks whose due is past (date-only: before today, Asia/Shanghai); false = rest"),
+    overdue: z.boolean().optional().describe("true = open tasks past due (date-only: before today, Asia/Shanghai); false = rest"),
     due_within_days: z.number().int().min(0).max(365).optional().describe("open tasks not yet overdue, due by the end of today + N days (0 = later today)"),
     limit: z.number().int().min(1).max(1000).optional().describe(`page size, default ${REQ_LIST_MCP_DEFAULT_LIMIT}`),
     cursor: z.string().max(600).optional().describe("next_cursor from the previous page"),
-    view: z.enum(["full", "summary"]).optional().describe("default summary (no bodies; has_description/checklist_count instead); full = everything"),
-    changes: z.boolean().optional().describe("with updated_since: only tasks changed since then (incl. archived; +deleted ids +server_time; with include_last_event also newer events)"),
-    include_last_event: z.boolean().optional().describe("default false; true adds last_event per row (~150 B/row: type, field, actor, at, summary; null if none)"),
+    view: z.enum(["full", "summary"]).optional().describe("default summary (no bodies; has_description/checklist_count); full = everything"),
+    changes: z.boolean().optional().describe("with updated_since: only tasks changed since then (+deleted ids +server_time; with include_last_event also newer events)"),
+    include_last_event: z.boolean().optional().describe("default false; true adds last_event per row (~150 B: type/field/actor/at/summary; null if none)"),
   };
   const reqListKeys = Object.keys(reqListShape);
   server.registerTool(

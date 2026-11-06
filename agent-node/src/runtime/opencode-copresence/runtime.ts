@@ -202,8 +202,13 @@ export interface OpenCodeCopresenceSession {
   readonly backgroundControl?: SessionBackgroundControl;
   /** V2 only. The model the TUI session is running, `provider/id`. Read-only. */
   selectedModel?(): Promise<string | undefined>;
+  /** #3952 —— 会话累计用量（调用方转增量后再上报）。 */
+  usageSnapshot?(): Promise<{ input?: number; output?: number; cache?: { read?: number } } | undefined>;
   /** V2 only. Switch the live session. The caller writes node config. */
   setSelectedModel?(model: string): Promise<void>;
+  /** V2 only. 把一条新指令**并进正在跑的那一轮**（delivery:"steer"），不进队列。
+   *  必须是显式动作：steer 会改写进行中的回合，半新半旧比排队更糟。 */
+  steer?(prompt: string): Promise<void>;
   notify(message: string, timeoutMs?: number, sender?: string): Promise<void>;
   submit(
     prompt: string,
@@ -1260,7 +1265,9 @@ export function wrapSharedCopresenceSession(
     get isRunning() { return core.isRunning; },
     get backgroundControl() { return core.backgroundControl; },
     ...(core.selectedModel ? { selectedModel: () => core.selectedModel!() } : {}),
+    ...(core.usageSnapshot ? { usageSnapshot: () => core.usageSnapshot!() } : {}),
     ...(core.setSelectedModel ? { setSelectedModel: (model: string) => core.setSelectedModel!(model) } : {}),
+    ...(core.steer ? { steer: (prompt: string) => core.steer!(prompt) } : {}),
     notify: (message, timeoutMs, sender) => core.notify(message, timeoutMs, sender),
     submit: (prompt, timeoutMs, sender, evidence) => core.submit(prompt, timeoutMs, sender, evidence),
     async close(mode?: { restart?: boolean }) {

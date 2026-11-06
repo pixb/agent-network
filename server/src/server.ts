@@ -53,7 +53,7 @@ import { restrictedMemberSeesFile, restrictedMemberAttachmentsDenied } from "./r
 import { dmParticipantSeesFile, listDmThread, listDmThreads, sendHumanDm } from "./human-dm.js";
 import { groupMemberSeesFile, groupUnreadFor, listGroupMessages, listGroupThreads, markGroupRead, memberGroup, sendGroupMessage } from "./group-messages.js";
 import { getTaskAccessMode, isTaskScoped, listProjectGrants, replaceTaskGrants, newMemberTaskAccess } from "./task-access.js";
-import { canMessageAgent, isAgentRestricted, visibleAgents, listAgentGrants, listGroupGrants, getAgentAccessMode, replaceAgentGrants, restrictedNetworkIds, usernameIsAgentAlias, listAgentGroups, createAgentGroup, updateAgentGroup, replaceAgentGroupMembers, deleteAgentGroup, usersGrantedGroup } from "./agent-access.js";
+import { canMessageAgent, isAgentRestricted, visibleAgents, listAgentGrants, listGroupGrants, getAgentAccessMode, replaceAgentGrants, restrictedNetworkIds, usernameIsAgentAlias, listAgentGroups, createAgentGroup, updateAgentGroup, replaceAgentGroupMembers, deleteAgentGroup, usersGrantedGroup, listDepartmentGrants, departmentCoverage } from "./agent-access.js";
 import { broadcastVerdict, dispatchVerdict, humanOnlyVerdict, NODE_PERMISSION_MODES, nodeDecide, nodeIdentity, nodePermissionDeniedBody, nodePermissionsFlag, streamVerdict, writeVerdict, type NodeIdentity, type NodePermissionMode, type Verdict } from "./node-permissions.js";
 import { validateAvatarUrl } from "./avatar-validate.js";
 import { narrowTags, parseStoredTags, validateScalarAttr } from "./node-attrs-validate.js";
@@ -108,6 +108,7 @@ import { startDueReminderTimer } from "./requirement-due-reminders.js";
 import { clearNodeFromRequirements, handleRequirementsRequest } from "./requirements.js";
 import { readHubProviders, putHubProvider, providerWriteStatus } from "./hub-provider-config.js";
 import { readLastConfigUpdate } from "./node-config-last-update.js";
+import { readTokenUsage, tokenUsageCoverage } from "./node-token-usage.js";
 import { readBuildInfo } from "./build-info.js";
 import { requestProviderApplication } from "./daemon-provider-snapshots.js";
 import { requestNodeSecrets, getScopedSecrets } from "./scoped-secrets.js";
@@ -3050,6 +3051,11 @@ return Bun.serve({
           restricted: isAgentRestricted(targetUid, netId),
           grants: listAgentGrants(netId, targetUid),
           group_grants: listGroupGrants(netId, targetUid),
+          // 部门维度授权(admin 2026-11-05)：与组授权同构，展开源是部门子树。
+          department_grants: listDepartmentGrants(netId, targetUid),
+          // 覆盖率必须一起给：没填 department_id 的节点永远不可能被部门授权覆盖，
+          // 否则用户会以为「授权了就该全看见」，然后在界面上找不到人。
+          department_coverage: departmentCoverage(netId),
         }));
       }
       // 网络 admin 不能改 owner / 其他 admin 的授权(对他们本来也不生效,但别让 admin 去碰平级)。
@@ -3059,7 +3065,8 @@ return Bun.serve({
       let body: any;
       try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid JSON" }, { status: 400 })); }
       if (!body || typeof body !== "object" || Array.isArray(body)) return withCors(req, Response.json({ ok: false, error: "invalid JSON" }, { status: 400 }));
-      if (body.grants === undefined && body.node_ids === undefined && body.agent_access === undefined && body.group_grants === undefined) {
+      if (body.grants === undefined && body.node_ids === undefined && body.agent_access === undefined
+        && body.group_grants === undefined && body.department_grants === undefined) {
         return withCors(req, Response.json({ ok: false, error: "grants or agent_access required" }, { status: 400 }));
       }
       const result = replaceAgentGrants({
@@ -3068,13 +3075,14 @@ return Bun.serve({
         grants: body.grants ?? body.node_ids,
         agentAccess: body.agent_access,
         groupGrants: body.group_grants,
+        departmentGrants: body.department_grants,
         actorUserId: resolved.user.user_id,
       });
       if (!result.ok) {
         return withCors(req, Response.json({ ok: false, error: result.error, ...(result.detail ? { detail: result.detail } : {}) }, { status: result.status }));
       }
       logAudit(resolved.user.user_id, resolved.user.username, "member_agent_grants_changed", "network", netId,
-        JSON.stringify({ user_id: targetUid, agent_access: result.agent_access, grants: result.grants.map((g) => ({ node_id: g.node_id, alias: g.alias, can_message: g.can_message })), group_grants: result.group_grants.map((g) => ({ group_id: g.group_id, can_message: g.can_message })) }).slice(0, 4000),
+        JSON.stringify({ user_id: targetUid, agent_access: result.agent_access, grants: result.grants.map((g) => ({ node_id: g.node_id, alias: g.alias, can_message: g.can_message })), group_grants: result.group_grants.map((g) => ({ group_id: g.group_id, can_message: g.can_message })), department_grants: result.department_grants.map((g) => ({ department_id: g.department_id, can_message: g.can_message })) }).slice(0, 4000),
         undefined, netId);
       // 已连着的观察流 / 用户流按旧权限鉴权过,断开让它按新权限重连。
       closeUserStreamsInNetwork(netId, targetUid);
@@ -6386,6 +6394,57 @@ return Bun.serve({
     // {model, flags, config_revision} the node last posted via
     // report_status (B6). NEVER reads per-node files. Network-scoped
     // via addNetworkScope so a netA viewer can't read a netB node.
+    // ── #3952 Token 审计（admin 2026-11-05）──
+    // GET /api/token-usage?network_id=…&since_hours=24
+    //   人（成员/owner/admin）读本网络各节点的 LLM token 计数聚合；节点令牌不给（user_token_required）。
+    // 为什么走 REST 而不是 MCP 工具：tools/list 的 user 预算只剩 ~500 B，
+    // 而一个带 schema 的新工具要 ~900 B —— 审计页本来就是人看的表，REST 更合适。
+    // 只回计数：没有 prompt、没有消息 id、没有凭据（表形状决定的）。
+    if (url.pathname === "/api/token-usage" && req.method === "GET") {
+      const token = requestToken(req, { allowQueryToken: false });
+      const resolved = token ? resolveToken(token) : null;
+      if (!resolved) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      if (isNodeCredential(resolved)) return withCors(req, Response.json({ ok: false, error: "user_token_required" }, { status: 403 }));
+      // 作用域用 handler 顶部已解析的 restScope —— 它已经做过「是不是这个网络的成员」，
+      // 且 denied 分支在上面统一 return 403。**不要**再在这里自己查一次网络：
+      // 上一版调了一个本文件里不存在的 `getNetworkId()` ⇒ 这个端点自 .273 上线起一直 500，
+      // 而所有人都只会看到「空了」，不会看到「坏了」。（#3951 由 HTTP 测试抓出）
+      // 与 catalog 端点（/api/providers 等）**同一口径**：显式给了就用，没给就回退到
+      // 「唯一所属网络」，多个/零个才 400。上一版只认 restScope.networkId，
+      // 于是一个只属于一个网络的用户在这里拿到 400、在同一页的 /api/providers 上拿到 200 ——
+      // 相邻两个端点对同一用户给不同答案，客户端被迫多写一条分支。
+      // 三档，按"信息量从高到低"取：
+      //   ① restScope.networkId   —— 显式参数 / 节点绑定 / 管理员指定
+      //   ② restScope.networkIds 长度==1 —— 普通用户只属于一个网络
+      //   ③ 以上都拿不到时，退回「这个**人**自己所属的网络」再判一次唯一性
+      // 为什么需要 ③：authCtx 为 null（无鉴权/遗留全局模式）时 resolveRestNetworkScope
+      // 会返回 {networkId: requested||null, networkIds: null} —— 那不是「属于所有网络」，
+      // 而是「这份 scope 没带成员信息」。此时若直接 400，唯一所属网络的用户会被拒，
+      // 而同一页的 /api/providers 却放行。
+      const scopeIds = restScope.networkIds ?? (restScope.networkId ? null : getUserNetworkIds(resolved.user.user_id));
+      const netId = restScope.networkId ?? (scopeIds && scopeIds.length === 1 ? scopeIds[0] : null);
+      if (!netId) return withCors(req, Response.json({ ok: false, error: "network_required" }, { status: 400 }));
+      const raw = Number(url.searchParams.get("since_hours") ?? 24);
+      const sinceHours = Number.isFinite(raw) ? Math.max(1, Math.min(24 * 90, Math.floor(raw))) : 24;
+      const nodes = readTokenUsage(netId, sinceHours);
+      const totals = nodes.reduce((acc, r) => ({
+        input_tokens: acc.input_tokens + r.input_tokens,
+        output_tokens: acc.output_tokens + r.output_tokens,
+        // cache 单列：它可能是 total 的几百倍，绝不能加进 total
+        cache_read_tokens: acc.cache_read_tokens + r.cache_read_tokens,
+        total_tokens: acc.total_tokens + r.total_tokens,
+        cost_usd: Number((acc.cost_usd + r.cost_usd).toFixed(6)),
+      }), { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, total_tokens: 0, cost_usd: 0 });
+      return withCors(req, Response.json({
+        ok: true, network_id: netId, since_hours: sinceHours,
+        // 空表也要说清口径：0 行可能因为「没人上报」，也可能因为「窗口里没用量」。
+        note: nodes.length ? undefined : "这个窗口里没有任何节点上报过 token 用量（不是「用量为 0」）",
+        nodes, totals,
+        // #3950 —— 分母。只有 1 行时，读表的人必须能分清「只有 1 台在干活」还是「只有 1 台有这能力」。
+        coverage: tokenUsageCoverage(netId, nodes.length, (sql: string, ...params: any[]) => db.all(sql, ...params)),
+      }));
+    }
+
     const nodeConfigMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/config$/);
     if (nodeConfigMatch && req.method === "GET") {
       const nodeId = decodeURIComponent(nodeConfigMatch[1] ?? "");
