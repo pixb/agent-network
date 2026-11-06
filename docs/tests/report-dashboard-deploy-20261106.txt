@@ -1,0 +1,63 @@
+Dashboard 现网换版（聊天栏高度链 + 自动滚底修复）— 2026-11-06
+
+## 换了什么
+
+Dashboard 仓库 pixb `1f92fae0016be420a3f1a57ccc0bb2c14695ffd7`
+（fix(nodes): 右侧聊天栏占不满窗口底部 + 过一会自己弹回底部）。
+上一版现网身份 = `71c895c478204ac43935828bd52d77c5b8ca5ea8`（2026-11-04 部署）。
+
+## 部署前 gate（本机，非现网）
+
+    npm run gates      ✅ color-ratchet / avatars / token-contrast / accent-text-ratchet / no-build-artifacts
+    npm test           ✅ 54/54 test files（46 via bun test + 8 self-executing）
+    提交并推送         ✅ pixb 1f92fae → origin/pixb 同步（构建身份 = 这个提交）
+
+e2e 回归（tests/e2e-chatpane-viewport-fit.spec.ts）在跑：Playwright 需要下载
+headless shell（112 MiB，实测 CDN ~112 KB/s）。`--with-deps` 在 Arch 上必然失败
+（apt-get 不存在），本机 Chromium 依赖库齐（nspr/nss/atk/cups/asound），
+所以 `--only-shell` 下载即可，不动系统包。
+
+## 换镜像序列（照 README §9）
+
+1. 先给现网镜像打回滚 tag（不先打就没法回滚）：
+       anet-dashboard:rollback-20261106 -> 170f1df5e74d (1.65GB, 2026-11-04 那版)
+2. 源码构建，label 传刚推送的提交：
+       docker build -f deploy/compose/Dockerfile.source --build-arg SOURCE_REV=1f92fae... -t anet-dashboard:compose .
+       → 新镜像 01e68aad2e5b, 1.65GB
+3. `docker compose up -d --no-build dashboard`
+   🔴 `--no-build` 是硬要求：父 compose 的 build.dockerfile 指 npm 钉版定义
+   （Dockerfile.dashboard，ARG DASH_VERSION=0.6.3-preview.56），
+   不带 --no-build 的 plain `up` 会用 npm 的 preview.56 覆盖掉 pixb 源码镜像。
+
+## 部署后核对（实测）
+
+    容器   anet-dashboard-1  Up (healthy)  0.0.0.0:3200->3000  created 2026-11-06T06:00:39Z
+    label  org.opencontainers.image.revision = 1f92fae0016be420a3f1a57ccc0bb2c14695ffd7  ✅ = 推送的提交
+    镜像   anet-dashboard:compose = 01e68aad2e5b (1.65GB)
+    回滚   anet-dashboard:rollback-20261106 = 170f1df5e74d（上一版，换 tag 前先打的）
+    hub    未触碰：anet-hub-1 Up 2 weeks (healthy)，只被 depends_on 的 health 门「等待」
+
+路由（未登录视角，判的是授权门没有被改坏）：
+
+    /login               200
+    /messages            307
+    /messages/inbox      307
+    /nodes               307
+    POST /api/hub/messages-ack   401
+    GET  /api/hub/messages       401
+
+产物取证（不看版本号，看代码真会打的标记；在运行中的容器里 grep）：
+
+    .next/server/chunks/ssr/[root-of-the-server]__1m0kpsx._.js        ← app-main-scroll + fillRemainingHeight
+    .next/server/chunks/ssr/app_lib_14fo2_o._.js                      ← 同上（app/lib/main-scroll.ts）
+    .next/server/chunks/ssr/app_legion_3d_page_tsx_022q58v._.js       ← 同上
+
+日志：`docker logs anet-dashboard-1 | grep -cE "ENOENT|EACCES"` = 0
+
+## 遗留（不是缺口，是待跑的证据）
+
+tests/e2e-chatpane-viewport-fit.spec.ts 需要在有浏览器的环境跑一次。本机是
+无头 Arch：Playwright 需要下载 headless shell（112 MiB，实测 CDN ~112 KB/s），
+`--with-deps` 在 Arch 上必然失败（apt-get 不存在）；Chromium 运行所需系统库
+（nspr/nss/atk/cups/asound）本机齐 ⇒ `npx playwright install chromium --only-shell`
+即可，不需要装任何系统包。部署本身不依赖它（gate = gates + 54/54 + 镜像 label + 路由核对）。
