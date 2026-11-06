@@ -1,0 +1,101 @@
+GitHub CI 体检与整改 — 2026-11-06
+仓库：pixb/agent-network（parent）+ pixb/agent-network-dashboard
+执行环境：GitHub-hosted ubuntu-latest，触发方式 workflow_dispatch（fork 上 push 不触发，见 §3）
+
+========================================================================
+0. 结论
+========================================================================
+parent    action pins ✅  agent-node typecheck ratchet ✅  docs-site build ✅  Docker E2E ✅
+dashboard unit tests ✅  gates ✅  OSS readiness gates ✅  legion-presentation ✅  scrub-guard ✅
+唯一残留红：parent 的 "Original frontdoor docs fixtures"（结构性，见 §5，非本次引入）
+
+========================================================================
+1. 这一周 CI 根本没跑：证据与判定
+========================================================================
+现象：parent 仓库所有 run（push + schedule）停在 2026-10-29（main b90e050f 三条 success），之后 0 条。
+API 侧：
+  GET /repos/pixb/agent-network/actions/permissions  ->  enabled=true  allowed=null
+  GET /repos/pixb/agent-network/actions/workflows    ->  86 个全部 state=active
+触发侧：
+  gh workflow run <任意 workflow> -R pixb/agent-network -r pixb
+    -> HTTP 422: Actions has been disabled for this repository.
+判据：enabled=true 且 workflow 全 active，却在 dispatch 时被拒 => 压制不在仓库设置页里。
+同期同一 token 对 pixb/agent-network-dashboard 的 dispatch 成功 => 不是组织层统一禁用，是单仓库。
+组织层两个端点均 404（token 无 org 管理员权限）：orgs/pixb/actions/permissions、
+orgs/pixb/settings/billing/actions => 组织层与账单只能由 owner 眼看。
+
+2026-11-06 解除后实测：dispatch 成功进队列，run 42213359979 completed/success。
+
+由此产生的长期手段：.github/workflows/ci-canary.yml（parent + dashboard 各一条）
+  - 零 uses: 步骤（只有 echo）。dashboard 实测过这个区分：加 uses: 时被 allowlist 拒 ->
+    startup_failure 且 jobs=[] 且无日志；零 uses 的 job 不受该原因影响。
+  - 因此：canary 红 = 调度/runner/allowlist 问题；canary 绿而别的门红 = 代码问题。
+  - 触发：gh workflow run ci-canary.yml -r <branch>；parent 版另挂 schedule（cron 23 * * * *）。
+
+========================================================================
+2. parent 用 CI 抓到并修掉的三条红（commit 240b4dfd6）
+========================================================================
+2.1 agent-node typecheck ratchet：新增 2 个身份 -> 新增 0
+   - agent-node/src/runtime/pi-rpc/runtime.ts  TS2349 ×7（每个 removeListener?.()）
+     根因：removeListener 只在 onRecord 闭包内被赋值/置空，TS 控制流分析看不到闭包内赋值，
+     调用点类型收窄成 null；null?.() 的 callee 类型是 never => "This expression is not callable"。
+     修法：读取放进 clearListener()（嵌套作用域内收窄重置回声明类型），顺带把「摘监听+置空」
+     从 7 处展开收成 1 处。
+   - agent-node/src/cli.ts  TS2345：goal routing 调用点传入的 union 含 "pi"，
+     而 src/goals/routing.ts 的 GoalRoutingRuntime 只列 5 个 runtime。
+     上游加 goal routing 时不知道有 pi。按 AGENTS 的「新增 runtime 是一张表」补齐 "pi"。
+   验收（仓库自己的脚本，不是我重写判据）：
+     agent-node typecheck: 81 行 / 40 个身份 ｜ 基线 40 身份 / 81 行 ｜ 新增 0 ｜ 变多 0 ｜ 消失 0 ｜ 变少 0
+
+2.2 docs-site build：3 条死链 -> 0
+   CI 只报数量不报目标；本地跑产品自己的构建拿到精确清单（该 workflow 头部就写了：
+   不要自造扫描器，我自造的那版报 671 条全是误判）：
+     /rfcs/RFC-043-pi-cli-runtime-integration  in guide/runtimes.md, guide/introduction.md, guide/agent-node.md
+   站点没有 rfcs 分区（RFC 在仓库根 docs/rfcs/），站点绝对路由 /rfcs/... 解析不到页面。
+   改成仓库里既有惯例（其余 RFC 引用都是这种写法）：
+     https://github.com/sleep2agi/agent-network/blob/main/docs/rfcs/RFC-043-pi-cli-runtime-integration.md
+   验收：npm run build -> build complete in 23.55s，无 dead link 行。
+
+2.3 权限收紧（commit a226deae9）：25 个 workflow 无顶层 permissions: 块 => 继承默认 contents: write
+   叠加「允许 Actions 创建并批准 pull request」+ main 无分支保护 => 任何安装第三方 action 的
+   workflow 都拿着可写默认分支的 token。全部补 permissions: contents: read；
+   真需要写的 workflow 保留自己的作用域块。86 个文件全部 YAML 解析通过。
+
+========================================================================
+3. fork 上的触发事实（两仓库相同）
+========================================================================
+fork 的 push 事件不启动 workflow。因此 pixb 分支上的门只能靠：
+  - workflow_dispatch（需要显式 trigger），或
+  - 向 parent 开 PR（pull_request 事件）。
+实测：dashboard 的 unit-tests/gates 加 workflow_dispatch 后 dispatch 立刻可用；
+无 dispatch 的 4 条（action-pins / agent-node-typecheck / docs-site-build / e2e-docker）
+之前报 422 "Workflow does not have 'workflow_dispatch' trigger"，加完即可触发。
+dashboard 的 scrub-guard 同法补上。
+
+========================================================================
+4. dashboard 侧 CI 抓到并修掉的两条真 bug（前一报告已记，此处只记状态）
+========================================================================
+  - 镜像 home 是 /home/dashboard => OSS 扫描判 personal_home；改 /srv/dashboard。
+  - app/messages/page.tsx 渲染期读写 meRef => 4 处 "Cannot access refs during render"；
+    改 useState(() => currentUserAlias())，memo 依赖补 meAlias。
+今天复测（head 6c4f7a9）：6 条 workflow 全 completed/success。
+
+========================================================================
+5. 残留红：Original frontdoor docs fixtures
+========================================================================
+失败点：step "Complete original render baseline and witnessed-red inputs" 内
+  Error: Command failed: npm run build
+  AssertionError [ERR_ASSERTION]: original frontdoor suite baseline failed
+判据：该 workflow 要构建「原版」套件基线，依赖已发布的 npm 制品；pixb 不发 npm（AGENTS 规则），
+所以这条在 pixb 上结构性地跑不通。它是既有设计，不是今天引入的（同一 head 上其它门全绿）。
+处置建议：要么把该 workflow 限定成只在能取到发布制品的分支上跑，要么在 workflow 头部
+写明「pixb 上预期不可运行」，避免将来把它当 required check 卡住合并。
+
+========================================================================
+6. 待办（与本次体检直接相关）
+========================================================================
+  - 第三方 action 从 tag 钉到完整 SHA（parent 约 90 处 @v4/@v5/@v2；dashboard 少量）。
+    钉完才可能打开组织层 "Require approval of pinned to full SHA commit" 策略。
+  - 两仓库 main 均无分支保护（GET .../branches/main/protection = 404）。
+    配合 Read and write 令牌 + 允许 Actions 批准 PR，这是可利用面；需要「必须 PR + 必须通过指定检查」。
+  - 上面第 5 条的处置决定。

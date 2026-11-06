@@ -1,0 +1,38 @@
+name: CI canary (is CI running at all)
+
+# Why this exists, in one line: on 2026-11-06 every push- and schedule-triggered run in
+# this repository had stopped on 2026-10-29 while `GET /repos/.../actions/permissions`
+# reported `enabled=true` and all 86 workflows reported `state=active`. Dispatching any
+# workflow returned HTTP 422 "Actions has been disabled for this repository". Nothing in
+# the repository itself was wrong; the disable lived above it, and a green dashboard of
+# "no runs today" is indistinguishable from a healthy quiet repo.
+#
+# So this workflow answers exactly one question, as fast as possible: can a run be
+# scheduled and completed at all? It deliberately has NO `uses:` steps — the failure mode
+# observed on 2026-11-06 was `startup_failure` with `jobs: []` and no log at all, because
+# the Actions allowlist rejected `actions/checkout@v4` while dispatch itself was accepted.
+# A zero-`uses:` job cannot fail for that reason, so a red here means scheduling/runner,
+# not tests. Keep it that way: adding a third-party action to this file turns it back
+# into an ordinary CI job and destroys the distinction.
+#
+# Run it after any Actions settings change, and whenever a dashboard of runs looks
+# suspiciously empty:  gh workflow run ci-canary.yml -r <branch>
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report the probe
+        run: |
+          echo "canary ok"
+          echo "repo=${{ github.repository }} ref=${{ github.ref_name }} sha=${{ github.sha }}"
+          echo "event=${{ github.event_name }} actor=${{ github.actor }}"
