@@ -57,6 +57,27 @@
 - **成对包必须同树构建**：`anet` 与 `agent-node` 的 `PAIRED_*` 版本出自同一棵树；只有白名单、没有运行时的半成品包不得外发（`2.3.0-preview.200` / `2.5.0-preview.165` 已删除）
 - **历史快照用 tag 不用长期分支**：例 `backup/pi-20261029`（rebase 前的 pixb，含完整 RFC-043）
 
+## Dashboard 仓库的 issue / PR 规则（英文）
+
+Dashboard 是独立仓库（`pixb/agent-network-dashboard`，upstream = `sleep2agi/agent-network-dashboard`）。
+它的**对外产物一律英文**，顺序是 **issue → PR → 审阅 → 上游**：
+
+1. **先 issue**：现象、复现、测量到的根因、期望行为、不在范围内的东西。写「实测」的数值，不写猜测。
+2. **再 PR**，指向**我们自己的仓库**（`origin` = `pixb/…`），不是直接指 upstream。commit 信息英文。
+3. **审阅通过之后才提 upstream**（`sleep2agi/…`）。上游没批准之前，现网只走我们自己的分支。
+
+配套约定：
+
+- **PR 要能被一眼审完**：基准分支取「修复之前的那个提交」（例：`review-base/chat-pane-viewport` = `bc5374d`），
+  这样 PR 里就是**一个提交**的 diff。审完可以删掉那个基准分支。
+- **commit 信息必须与代码一致**：文件路径、改了哪个组件、为什么，逐条对着 `git show --stat` 写。
+  本次踩过：按截断的输出写成「3 个文件 / `components/layout/AppShell.tsx`」，
+  实际是 9 个文件 / `app/components/AppShell.tsx` + 新增 `app/lib/main-scroll.ts`。
+  写之前跑 `git show --stat` 与 `gh pr diff <n> --name-only` 对数。
+- **已上线的历史不重写**：现网跑的提交（例 `1f92fae`，中文信息）保持原样作为部署身份；
+  英文分支是它的孪生提交，commit 里写明 `git diff 1f92fae <new> ` 为空。
+- 实测样例：issue #1 + PR #2（聊天栏视口高度链 + 自动滚底）。
+
 ## 可重建与灾难恢复规则
 
 验收标准不是“代码是否提交”，而是：**任一服务器被清空后，只依靠 GitHub 仓库以及仓库明确引用的备份和密钥来源，能否从空机恢复出当前运行的软件与关键流程。** 凡是恢复步骤依赖“某个人记得”或机器上未入库的 `/home/...` 文件，均视为缺口。
