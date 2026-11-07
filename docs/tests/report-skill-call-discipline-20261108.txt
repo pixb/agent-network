@@ -1,0 +1,113 @@
+# agent-network-skill：拉取 v0.6.0 并评估 → 修成 v0.6.1
+
+日期：2026-11-08（UTC 时间戳见下）
+范围：子模块 `.agents/skills/agent-network-skill`（remote `pixb/agent-network-skill`）
+父仓库：只动子模块指针 + 本报告，不改 server/agent-node 代码
+
+## 1. 拉取
+
+- 起点 `e063068`（"TTL 口径补一条硬规则"）→ fast-forward 到 `b9682f7`（v0.6.0，
+  "调用纪律两条硬规则——一轮一个 commhub 调用、参数压短"），22 files，+1120/−102。
+- 拉取方式：`git fetch --all --prune`（ssh 直接通，未走代理）+ `git merge --ff-only origin/main`。
+
+## 2. 独立复核（不引用 commit message 的自述）
+
+| 检查 | 命令 | 实测 |
+|---|---|---|
+| eval spec 形状 | `python3 scripts/run_evals.py --validate` | `VALID` |
+| 全链路（12 golden 起真 hub 跑真任务，含 holdout case-3） | `python3 scripts/run_pipeline.py` | `RESULT: PASS`，rollout 60 passed / 0 failed / 0 errored / 0 regressed |
+| narrated e2e | `bash tests/manual_node_e2e.sh` | `ALL E2E ASSERTIONS PASSED` |
+| 脚本守卫手测 | compose/verify/guard 逐项 | 81 字摘要拒、缺段拒、绝对路径拒、未跟踪拒、未提交拒、sha12 不匹配 `exit 3` |
+
+新规则引用的 hub 事实逐条对着源码核对，全部为真：
+
+- `sessions.task` 只留前 200 字符、盲切 → `server/src/shared/task-content-limit.ts`
+  （`SESSION_TASK_PREVIEW_MAX = 200`，`sessionTaskPreview() = slice(0,200)`）
+- `report_status(working)` 只在 `to_name = ?1 AND content = ?2` 全等时把 delivered/acked
+  改成 running，无 task_id 分支 → `server/src/tools.ts:1488-1505`
+- `report_completion` 先 `task_id`，未命中则 `to_name+content` 取最近一条，
+  `result.slice(0,4000)` 写进 `tasks.result`，`completions` 存全量 → `server/src/tools.ts:1592-1610`
+- `duplicate_send` 是真错误码，窗口默认 5 分钟 → `server/src/send_dedup.ts:16,222,242`
+- 「一个节点一个槽位」= `sessions` 的 `UNIQUE (network_id, alias)` → `server/src/db.ts:39,1557`
+- 参数预算是纪律不是 hub 上限：`send_task.task`/`context`/`message` 的 zod 上限都是 10000
+  （300/200/400 更严）→ `server/src/tools.ts:2068,2070,2421`
+
+commit message 里 "run_evals 55 passed" 与实测 60 不矛盾：55 = 不含 holdout（`case-3`，
+`split: "test"`，5 条检查），`generate_verification.py` 调 `run_evals.py --rollout` 时不带
+`--include-holdout`，报的就是 55。
+
+## 3. 评估出的问题（用户口径：skill 必须通用，不得针对单一项目）
+
+P1 单项目/单机耦合（最严重）
+- 12 个 `evals/golden/case-*/input.json` 全部写死
+  `"hub_source": "/vol1/1000/docker/nec8-docker/agent-network/server"`，v0.6.0 新增的
+  `case-12` 继续复制；`tests/manual_node_e2e.sh:21` 直接
+  `bun run /vol1/1000/docker/nec8-docker/agent-network/server/bin/commhub.ts`
+  ⇒ 闸门只在「源码恰好在那个路径的那台机器」上成立。
+- 示例文本绑死某内容项目的某一轮（"第7轮 seg-01：头三段配图，3 张暖金佛像特写入库"），
+  出现在 SKILL.md、README.md、references/payload-files.md、references/manual-node.md 和两个测试里。
+- 绝对路径守卫枚举自家挂载点：`*/home/*|*'/vol1/'*|*'~/'*|*'C:\'*`
+  （`scripts/anet_payload.sh`、`tests/manual_node_scenario.sh:575`）。
+
+P2 与自己脚本自相矛盾
+- §1.1 说"一轮最多一个 commhub 调用，脚本不豁免"，而 `scripts/anet_manual_node.sh` 的
+  `working` 一条命令打 3–4 个调用（`get_task` + `ack_inbox` + `report_status` + `get_task`，
+  `scripts/anet_manual_node.sh:604-640`），`reply` 打 2 个；§7.4 第一句
+  "Every command in §7 is a commhub call, so it is one round" 按字面是假的。
+
+P3 说过头的句子
+- "A 4-line pointer fits inside [the 200-char preview]"：实测默认正文 258 字符，
+  前 200 字符切在第 3 行，第 4 行整行被切。
+- "`report_completion` 是一次性的，所以一批 report 哪个都不生效"：三条各自带
+  `task_id` 的 report 三条都落；真正落不到的是把多任务塞进一个 `task=` 串。
+- `wiki/skill-impact.md` 给两条 2026-11-07 的 proposal 记 `Held-out validation score: 1.0000`，
+  而其唯一证据 `raw/2026-11-07T192707Z-66718fafa7e2.json` 只有一个步骤
+  `validate the eval spec`；分数来自 `wiki_maintenance.py --validation-score`（人工传入，工具不算）。
+
+P4 脚本鲁棒性
+- `die()` 把退出码打进消息：实测 stderr `the file has no segment seg-09 2`、
+  `… do not guess 3` ⇒ 按句子写断言必然打不中。
+- 字符预算用 `${#…}` 量，非 UTF-8 locale 按字节计：同一正文 UTF-8 下 257、
+  `LC_ALL=C` 下 293（中文 ≈3×）⇒ 守卫会在合法正文上拒，且打印数字随 locale 漂。
+
+## 4. 修复（v0.6.1，子模块提交 `647909d` 行为 + `49bd12f` 证据）
+
+- 通用性：12 个 golden input 删掉 `hub_source`；hub 源码解析顺序
+  `ANET_E2E_HUB_SRC`（可指 `server/` 或 repo 根）→ 相对 skill 目录
+  （`<repo>/.agents/skills/agent-network-skill` → `../../../server`）→ `$PWD/server` →
+  `$HOME/agent-network/server`；e2e 不再硬编码路径。示例全部换成中性内容（补单元测试 + 更新文档），
+  文档里的 sha12 用脚本真跑出来的值（`3f7c64c57fb6` 等）。绝对路径改成按形状判定
+  （token 以 `/`、`~/`、`X:\`/`X:/`、`\\host\` 开头），URL 不误报（实测 `https://…` 通过）。
+- 一轮的定义：一轮 = 一次状态迁移；脚本为让那次迁移可证明而做的读（取字节正文、确认落状态）
+  属于同一轮。§1.1 / §7.4 / Gotchas / AGENTS.md / `references/manual-node.md` 同步。
+- `report_completion` 语义改写为 hub 真实行为（`status IN ('delivered','acked','running')`
+  才改任务行；第二次 report 不改任务行但会再插一行 `completions`）。
+- 200 字符预览的说法收窄成实测：摘要行 + `file:/seg:/sha12:` 在 200 内（约到第 95 字符）。
+- 脚本：新增 `guard --body`（compose 与测试共用同一份规则，测试里的重复模式删掉）；
+  计数全部交给 python；`die()` 不再把退出码打进消息；新增 `--summary-max`；`usage()` 打整个头部。
+- 证据台账：新增 `raw/2026-11-07T201812Z-bca66563c29c.json`（pipeline 报告）与
+  `raw/2026-11-07T201902Z-f26e338e0150.log`（同一次运行叙述，60 passed / 0 failed）；
+  新增 `wiki/patterns/portable-protocol-content.md`；两条旧 pattern 的 Evidence 写清各自
+  证据只覆盖"spec 形状校验"；`wiki/skill-impact.md` 追加 amendment 说明旧分数是人工传入。
+
+## 5. 修复后的闸门（同一台机器，同一套依赖）
+
+- `python3 scripts/run_pipeline.py` → `RESULT: PASS`，`rollout: 60 passed, 0 failed, 0 errored, 0 regressed`
+- `bash tests/manual_node_e2e.sh` → `ALL E2E ASSERTIONS PASSED`
+  （指针正文 258 字符，`acked -> running -> replied` 逐字节回环）
+- `python3 <factory>/scripts/skill_graph.py run <skill>` → spec / security / pipeline / eval_schema 全 PASS
+- `python3 <factory>/scripts/security_scan.py <skill>` → `Status: CLEAN`
+- `python3 <factory>/scripts/validate.py <skill>` → 通过（2 条既有 WARN：SKILL.md 676 行 > 500；
+  两处脚本提及未写"运行它"）
+- `python3 scripts/wiki_maintenance.py validate` → `wiki: valid`
+- `verification_errors()` → none；`VERIFICATION.md` 版本 0.6.1、`clean: true`、
+  commit `647909d`（证据单独成提交，符合"证据绑定提交"）
+
+## 6. 未做与遗留
+
+- 没有第二台机器可跑：**"从非常规路径的克隆跑通整套闸门"只在纸面成立**，
+  `wiki/patterns/portable-protocol-content.md` 的 next experiment 就是这一条。
+- `install.sh` / `install.ps1` 未同步 v0.6.1 文案（只改了 `plugin.json` 与 `SKILL.md` 的 version）。
+- 子模块已 push 到 `pixb/agent-network-skill` main（`b9682f7..49bd12f`）。
+- 本仓库侧只提交子模块指针 + 本报告；`AGENTS.md` 的通信约定段未引用 v0.6.x 的新纪律，
+  若要把"一轮一个调用/短参数"写进 AGENTS.md，另开窄变更。
