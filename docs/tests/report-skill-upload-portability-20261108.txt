@@ -105,3 +105,29 @@ eval spec 加了两条命令型判据。`guard-refuses-absolute-path` 两个 run
 - 两份旧报告里「install.sh / install.ps1 的 0.6.1 文案未同步」一条**不成立**：脚本里没有版本号字符串，
   已在本轮改掉（见 [report-skill-call-discipline-20261108.txt](report-skill-call-discipline-20261108.txt) 末尾）。
 - SKILL.md 687 行 > 500 的 WARN 保留未动（排版重构，收益低于扰动）。
+
+## 8. 追加（同日，操作员定口径）：本仓库**不建** commhub_tasks；skill 只定通用规则
+
+操作员三条口径（原话要点）：
+1. **当前项目暂时不用创建 commhub_tasks** —— 本仓库不新增这个目录。
+2. **skill 只是定规则，是通用 skill，不是针对本项目** —— 协议内容里不出现本项目的目录、词汇、轮次。
+3. **单个任务要独立的文件** —— 都写进一个文件会让单个任务读到别的 task 的正文，白烧 token。
+
+据此做的事（按发生顺序，含一次回退）：
+
+| 步骤 | 事实 |
+|---|---|
+| 子模块清空 | `git rm commhub_tasks/v061/{spec.md,report-seg-01.md}`（子模块提交 `06034b0`，已 push）：一个项目轮次的规格与交付报告不该住在通用协议仓库里 |
+| 我先建了父仓库 `commhub_tasks/`（README + v061 两份） | **与口径 1 冲突，已撤销**：目录删除，未提交 |
+| 内容去处 | 移到 `docs/specs/2026-11-skill-precision-round/`（项目文档，不是派活目录）。六个段 sha12 移动前后逐条复算一致：seg-01 `4d2bc4552176`、seg-02 `145a1ce70f62`、seg-03 `05c2b0779bf0`、seg-04 `02470c6adfb3`、seg-05 `8b4d9cc266d8`、seg-06 `e4e9a5d03839`（移动说明与 verify 命令都写在第一个锚点之前 ⇒ 段字节不变） |
+| skill 侧新规则 v0.6.7 | 「一任务一文件」`commhub_tasks/<round>/<task-slug>.md`（目录名只是示例，skill 不规定任何项目采用它）；指针 `file: … sha12: <整文件哈希>`，**不带 `seg:`**；段指针作为第二形态保留（任务是一篇文档的一节时），此时 sha12 是**段级**哈希 |
+| 脚本随之改 | `compose`/`verify` 的 `--seg` 变可选：无 `--seg` ⇒ 整文件为单位（实测：compose 出的 sha12 `756d1c7db68e` 与独立算的 `sha256(文件去尾换行)[:12]` 相等；verify 正确哈希 exit 0、错哈希 exit 3）；有 `--seg` ⇒ 段级单位与段级哈希（与 v0.6.5 记的口径一致） |
+| e2e 随之加 | 新增一块「一任务一文件」断言：指针不含 `seg:`、指针所指就是该任务自己的文件、整文件 sha12 对独立算法、错哈希 exit 3、指针走通 acked→running→replied，且该文件里 `seg-` 锚点数 = 0。原段指针块保留（两种形态都有实测覆盖） |
+
+口径 3 的技术理由（写进 `references/payload-files.md`）：工人 `git pull` 之后读指针所指的**文件**；
+一个文件装六个任务，它就为六个任务付 token，其中五个是别人的活，而 ≤300 字符的任务正文没法告诉它读到哪停。
+一任务一文件让"读的成本 = 这个任务本身"，顺带让指纹无歧义（指针指文件，哈希就是文件的）。
+
+环境事实（影响闸门可复现性，非本轮代码问题）：本机 `python3`（pyenv 3.12.13）无 rpath，
+`ldd` 显示 `libpython3.12.so.1.0 => not found`，需 `LD_LIBRARY_PATH=/home/pix/.pyenv/versions/3.12.13/lib`；
+中途 `/vol1/1000/pix` 一度不可达，factory 的权威路径是 `/home/pix/.pi/agent/skills/agent-skills-platform`。
