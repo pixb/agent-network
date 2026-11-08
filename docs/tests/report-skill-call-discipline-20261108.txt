@@ -107,7 +107,13 @@ P4 脚本鲁棒性
 
 - 没有第二台机器可跑：**"从非常规路径的克隆跑通整套闸门"只在纸面成立**，
   `wiki/patterns/portable-protocol-content.md` 的 next experiment 就是这一条。
-- `install.sh` / `install.ps1` 未同步 v0.6.1 文案（只改了 `plugin.json` 与 `SKILL.md` 的 version）。
+  **（2026-11-08 同日已实测销账：在 `/tmp/anet-portable/anet` 的 worktree 里、去掉 `ANET_E2E_HUB_SRC`，
+  pipeline 60 checks 0 failed、manual-node e2e 全绿。过程与证据见
+  [report-skill-upload-portability-20261108.txt](report-skill-upload-portability-20261108.txt) 第 1 节。）**
+- ~~`install.sh` / `install.ps1` 未同步 v0.6.1 文案（只改了 `plugin.json` 与 `SKILL.md` 的 version）。~~
+  **本条不成立（2026-11-08 复核）**：`grep -n "0\.6\.|version" install.sh install.ps1` 零命中 ——
+  两个安装脚本里根本没有版本号字符串，没有可同步的文案。写这条时没核对脚本内容，是报告自身的错；
+  留删除线不删段，是为了留下「报告也会写错、要复核」这件事本身。
 - 子模块已 push 到 `pixb/agent-network-skill` main（`b9682f7..49bd12f`）。
 - 本仓库侧只提交子模块指针 + 本报告；`AGENTS.md` 的通信约定段未引用 v0.6.x 的新纪律，
   若要把"一轮一个调用/短参数"写进 AGENTS.md，另开窄变更。

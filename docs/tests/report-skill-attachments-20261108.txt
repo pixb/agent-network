@@ -64,3 +64,6 @@ v0.6.2（子模块 `c0e94bd` 行为 + `e4490f3` 证据，已 push）补两条命
 - planner 侧传文件仍需 REST（hub `/mcp` 无上传工具）；`upload_file` 只在 grok ACP 线。
 - 60 次/小时/调用者：一轮一文件，别一条任务一个文件。
 - 没做跨网络下载的负向 E2E（"A 网络上传、B 网络节点取件 ⇒ 404"）：本次只断言了未知 id 的 404。
+  **（同日 v0.6.3 已补：e2e 注册第二个用户+网络，在该网络 init 节点，取其网络的文件 ⇒ 非零退出、
+  走 404 那句话、不落文件。实测输出与证据见
+  [report-skill-upload-portability-20261108.txt](report-skill-upload-portability-20261108.txt) 第 3 节。）**

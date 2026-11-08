@@ -1,0 +1,107 @@
+# Skill v0.6.3：dispatcher 的上传命令、跨网络 404 实测、两条规则进闸门
+
+日期：2026-11-08
+范围：子模块 `.agents/skills/agent-network-skill`（v0.6.2 → v0.6.3）；父仓库代码未改
+前置：[report-skill-attachments-20261108.txt](report-skill-attachments-20261108.txt)（hub 侧附件边界，逐条 file:line）
+
+## 为什么继续
+
+上一份报告留下三条口子：dispatcher 侧只能手写 curl；跨网络被拒（404）只有代码阅读没有实测；
+「协议 skill 在任何克隆上可验」是纸面主张。本轮把这三条变成实测，并把 v0.6.1 的两条规则钉进闸门。
+
+## 1. 通用性从纸面变实测（A）
+
+在 **worktree** 里跑，路径与本机开发树完全不同、没有任何测试或 golden input 写过它，且
+`ANET_E2E_HUB_SRC` 从环境里去掉（`env -u ANET_E2E_HUB_SRC`）：
+
+```
+git worktree add /tmp/anet-portable/anet pixb
+  pipeline:   RESULT: PASS   rollout 60 passed / 0 failed / 0 errored / 0 regressed
+  e2e:        ALL E2E ASSERTIONS PASSED（含附件块）
+```
+
+hub 源码由 skill 目录相对解析（`<repo>/.agents/skills/agent-network-skill` → `../../../server`）。
+唯一与主机相关的是**依赖**：`server/node_modules` 用软链接指过去 —— 那是运行前提，不是写进 skill 的路径。
+
+## 2. dispatcher 侧：`anet_payload.sh upload`（B）
+
+```bash
+ANET_TOKEN=… bash scripts/anet_payload.sh upload --file commhub_tasks/r07/spec.md \
+    --hub "$COMMHUB_URL" --network <network_id> --name spec.md --mime text/markdown --allow-untracked
+#   uploaded: commhub_tasks/r07/spec.md (5123 bytes) -> file_id 3c63099f0bf34bf398708698da2decaf
+#   sha12: 54b3cd5aa536
+#   put on the pointer line:  attachment: 3c63099f…  sha12: 54b3cd5aa536
+#   and in the dispatch:  meta.attachments = [{type:"file", file_id:"3c63099f…", …}]
+```
+
+三条设计（都是实测出来的）：
+
+- **12 MiB 在本地拒**，一个字节都不上网络：exit 3，消息里带字节数和上限。
+- **access string 只从环境读**（`ANET_TOKEN`），**故意不做成命令行参数** —— argv 在 `ps` 和 shell 历史里可读；
+  header 通过 curl 的 stdin config（`-K -`）传进去。缺 token 直接拒并点名 `ANET_TOKEN`。
+- 未入 git 的文件要 `--allow-untracked`（明说"我要走 hub 这条路，不是分支"）；**`dirty` 在这条路上不拒**，
+  因为字节随附件走，sha12 钉住是哪一版（git 那条路才拒 dirty：工人拉的是分支，不是你 working tree）。
+
+## 3. 跨网络 404 从代码阅读变成实测
+
+`tests/manual_node_e2e.sh` 现在注册第二个用户（自带 network）、在**那个网络**里 init 节点，然后取第一个网络上传的文件：
+
+```
+node of network net_76067d43492f cannot read the file uploaded in net_d5a2d90e0b45 (hub answers 404, not 403)
+```
+
+断言三件事：非零退出、走 404 那句话、**不落任何文件**。同一轮 e2e 还断言：13 MiB 被拒、缺 ANET_TOKEN 被拒、
+`bad_attachments`、`files`、取回字节逐字节相同、错 sha12 exit 3 且不落文件、未知 id 404。
+
+## 4. 两条规则进闸门 —— 以及一条被撤掉
+
+eval spec 加了两条命令型判据。`guard-refuses-absolute-path` 两个 runner 都绿；
+**`guard-counts-characters-not-bytes` 撤掉了**，理由是实测到的自相矛盾：
+
+| 运行方式 | 结果 |
+|---|---|
+| `run_pipeline.py`（含 holdout） | 84 checks，**0 failed** |
+| 验证器 rollout（`generate_verification.py`） | 77 checks，**11 failed**（7 个 val case 全红在这条上） |
+
+根因：这条判据量的是 **python 的解码默认**，不是脚本的计数 —— CJK 正文要经过 `python3 -c` 管道，
+文本编码随环境 locale 变，而验证器在剥了环境的情况下跑。它在量主机，不在量协议。
+撤掉（子模块 `c59ca66`），并把原因写进 `wiki/patterns/portable-protocol-content.md`：
+**量到 runner 环境的闸门比没有闸门更糟**，它会因协议管不着的原因大声失败。
+
+正解留给下一轮（已写进 pattern，未实施）：`guard --json` 自己同时报**字节数**与**字符数**，
+判据变成一个程序内的算术比较，管道里没有 locale 依赖。
+
+撤掉之后：`run_evals.py --rollout --include-holdout` = **72 checks, 0 failed, 0 errored, 0 regressions**。
+
+## 5. 闸门（本机同一套依赖）
+
+| 闸门 | 结果 |
+|---|---|
+| `run_pipeline.py` | `RESULT: PASS`，`rollout: 72 passed / 0 failed / 0 errored / 0 regressed` |
+| `tests/manual_node_e2e.sh` | `ALL E2E ASSERTIONS PASSED` |
+| `skill_graph.py run`（删 `.skill-cache`） | spec / security / pipeline / eval_schema 全 PASS |
+| `security_scan.py` | CLEAN |
+| `validate.py` | VALID（2 条既有 WARN：SKILL.md 687 行、2 处脚本提及未说"运行"） |
+| `wiki_maintenance.py validate` | valid |
+| `verification_errors()` | none；`VERIFICATION.md`：Eval rollout **66 passed, 0 failed, 0 errored, 0 regressed** |
+| 外路径 worktree（无 `ANET_E2E_HUB_SRC`） | pipeline PASS（60 checks）、e2e PASSED |
+
+证据：`raw/2026-11-08T024525Z-*`（v0.6.3 首轮 pipeline/e2e/外路径两份）、
+`raw/2026-11-08T025049Z-*`（撤判据后的 pipeline 与 e2e）。
+
+## 6. 提交
+
+子模块 `pixb/agent-network-skill` main（已 push 到 `23d6a50`）：
+
+- `758eed0` 行为 v0.6.3（upload + e2e 跨网络 + eval 判据 + 文档）
+- `c59ca66` 撤掉 locale 判据（单独提交，写清为什么）
+- `23d6a50` `VERIFICATION.md`（证据单独成提交）
+
+## 7. 遗留（不藏）
+
+- `guard --json` 报字节数 → 让 locale 规则有一条**量脚本本身**的闸门（本轮撤掉了旧判据，新判据未做）。
+- planner 侧传文件仍无 MCP 工具（hub `/mcp` 上没有；`upload_file` 只挂在 grok ACP 的独立 stdio MCP）。
+- 60 次/小时/调用者 ⇒ 一轮一文件。
+- 两份旧报告里「install.sh / install.ps1 的 0.6.1 文案未同步」一条**不成立**：脚本里没有版本号字符串，
+  已在本轮改掉（见 [report-skill-call-discipline-20261108.txt](report-skill-call-discipline-20261108.txt) 末尾）。
+- SKILL.md 687 行 > 500 的 WARN 保留未动（排版重构，收益低于扰动）。
