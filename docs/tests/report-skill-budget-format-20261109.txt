@@ -1,0 +1,80 @@
+# Skill v0.6.8：通用化、正文预算、Dashboard 版式
+
+日期：2026-11-09
+子模块：`.agents/skills/agent-network-skill` `a3a97aa` → `01c1502`（已 push 到 `origin/main`）
+父报告前置：`docs/tests/report-skill-audit-20261109.txt`（审计，含第 6 节 Nodes 界面实测）
+
+## 三条改动（逐条对应审计发现）
+
+1. **§7.6 出图规则移出通用 skill**（审计 F1）。v0.6.6 写进去的是 pix-auto-video 那一轮的验收条款
+   （`seed=<逐字> raw_sha12=<逐字> sha12=<图>`、`assets/prompts/<段>.txt`、"停止出图"、commit `cef15af`/`29552f5`、
+   到货 029/077、引用本项目另一个 skill）。现在只留**通用道理**（英文）：派工点名每个输入的指纹、
+   到货回报它实际使用的指纹 + commit、本机指纹 ≠ 派工指纹就停并回报、"同输入不同输出"不算可复现证据。
+   末尾明说：出图轮的词汇属于那个项目自己的文档。
+2. **真实标识符去号**（F2）。别名 `200-pix-auto-video-manual-doubao`（SKILL.md 三处）换成形状
+   `<machine>-<project>-<role>`（示例 `ws01-export-manual-node`）；网络 `net_b91c0d535346`
+   （SKILL.md、references/manual-node.md、references/ttl-and-expiry.md、`anet_manual_node.sh` 注释）
+   换成"one production network, id withheld"。**数字与结论一条没减**。
+3. **语言**（F3）。`references/ttl-and-expiry.md` 原 48/86 行中文 ⇒ 全篇英文；pi 的启动横幅与失败码
+   降级为"某一个 runtime 的例子"。
+
+## 预算：hub 真值 vs 协议预算（读源码，全部 file:line）
+
+| 面 | hub 真值 | 协议预算（v0.6.8） | v0.6.7 之前 |
+|---|---|---|---|
+| `send_task.task` | **10 000**（`server/src/shared/task-content-limit.ts:18`） | ≤300（不变，理由写进文档） | ≤300 |
+| 节点卡预览 `sessions.task` | **200，盲切**（同文件 `:20`） | 第 1 行 ≤80 | 第 1 行 ≤80 |
+| `report_completion.result` | 存前 **4000**（`server/src/tools.ts:1592`、`:1605`） | **≤1200** | ≤400 |
+| `send_reply.text` | 收 **10 000**（`server/src/tools.ts:2485`） | **≤1500** | 无明文 |
+
+派工正文**不扩大**的实测理由：`report_status(status="working")` 要求工人逐字回传正文
+（`to_name+content` 精确匹配，无 task_id 分支）；节点卡只看得到前 200 字符。
+交付正文 400→1200 的理由：Dashboard 任务面板折叠在 300px ≈ 12 行，400 字符装不下"结论 + 证据行 + 长报告在哪"。
+
+## 版式：按渲染面定，不按口味定
+
+Dashboard 实测（`../agent-network-dashboard`）：**任务聊天面板渲染 markdown**
+（`app/components/TaskChatPanel.tsx:492-493`、`MarkdownContent :561`、`m.result :1725`、`m.content :1769`，
+折叠 `COLLAPSE_MAX_PX = 300` ≈12 行）；**节点卡** `line-clamp-2`（`app/nodes/NodesView.tsx:803`）、
+**列表行/紧凑网格** `truncate`（`:872`、`:927`）、**Tasks 详情** `whitespace-pre-wrap`（`components/TaskDetail.tsx:329`、`:345`）、
+**Messages/收件箱** 纯文本（`app/messages/page.tsx:443`、`:488`）⇒ **四个面是纯文本，一个面是 markdown**。
+规则因此写为"第 1 行自足 + 空行分块 + `- ` 列表 + `key: value` 字段；禁表格/`#`/`**`/反引号"，
+表连 file:line 落进 `references/payload-files.md` 新章节 "What renders where"。
+Dashboard 侧只做 issue，不改码：`docs/issues/dashboard-task-delivery-plain-text.md`（英文，可直接提 `pixb/agent-network-dashboard`）。
+
+## 脚本与闸门
+
+- `scripts/anet_payload.sh`：`guard --kind task|result`（result = ≤1200 交付文本，行数上限解除、markup 必检）、
+  `--no-markup`、`--max` 按 kind 默认（300 / 1200）、`compose` 的交付行默认改成 `result <= 1200 chars`。
+- 新增两条命令型判据：`guard-enforces-the-delivery-budget`（1200 收、1201 拒）、
+  `guard-refuses-markup-the-plain-surfaces-cannot-render`。
+- golden `case-13` 基线重做（promote）：旧基线把指针字符数写进 verdict，400→1200 让该数字 255→256；
+  现在基线带 sha12 + `pointer_within_dispatch_budget` 断言，**不再编码会随预算移动的数**。
+  第一次 `--promote` 在 regression 时**拒绝覆盖**（正确行为），改为先让基线只装内容敏感量再 promote。
+
+## 途中判红三次，都按事实修（没有调绿）
+
+1. 合成测试正文没有换行 ⇒ 第 1 行 1200 字符 ⇒ 被 line-1 预算拒 ⇒ 判据在测自己的数据。修数据。
+2. 判据写成 heredoc + 末尾转义引号 ⇒ `sh -c` 下 "unexpected EOF while looking for matching `\"'"。
+   改成单行 `python3 -c "…"`。
+3. **`run_evals.py` 的 `_run_one` 没传 cwd** ⇒ 从仓库根跑时 24 条判据 RED；
+   而且 `guard-refuses-absolute-path` 在那里是**空转绿**（命令找不到 = 非零 = "拒了" = 通过）。
+   修 `_run_one(cmd, output_path, cwd)`，`run_command_checks` 传 skill_dir。
+   修后实测：仓库根 96/0，`/tmp` 下 96/0。
+
+## 闸门（本机同一套依赖，`LD_LIBRARY_PATH=/home/pix/.pyenv/versions/3.12.13/lib`）
+
+- `run_pipeline.py`：`RESULT: PASS`，`rollout: 104 passed / 0 failed / 0 errored / 0 regressed`（13 scenario × 8 判据）
+- `run_evals.py --json --rollout`：96/0（val）；`--include-holdout`：104/0
+- `tests/manual_node_e2e.sh`：`ALL E2E ASSERTIONS PASSED`
+- `skill_graph.py run`（删 `.skill-cache`）：spec / security / pipeline / eval_schema 全 PASS
+- `security_scan.py`：`Status: CLEAN`；`validate.py`：`Status: VALID`（2 条既有 WARN）
+- `wiki_maintenance.py validate`：`wiki: valid`；新增 pattern 2 条
+  （`hub-budget-versus-protocol-budget`、`dashboard-plain-text-surfaces`）+ 台账 1 条
+- `VERIFICATION.md`：`clean: true`，`Eval rollout: 96 passed, 0 failed, 0 errored, 0 regressed`
+
+## 遗留
+
+- Dashboard 的 markdown 渲染（issue 已备，未提）：落地前 skill 继续用"两面都好看"的子集。
+- SKILL.md 783 行（validate WARN >500）：下一轮把 §7 的运维细节继续外移到 references。
+- `agentmemory` 服务本机不可达（`http://localhost:3111`），本轮事实未入库。
