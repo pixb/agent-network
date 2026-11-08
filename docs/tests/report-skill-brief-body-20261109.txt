@@ -1,0 +1,94 @@
+# 派工正文可以写成格式化正文了（skill v0.7.0，实机演示）
+
+日期：2026-11-09
+子模块：`.agents/skills/agent-network-skill` `c4b01ba` → `f64e83c`（已 push 到 `origin/main`）
+前置：`docs/tests/report-skill-audit-20261109.txt`、`report-skill-budget-format-20261109.txt`、`report-skill-resend-rule-20261109.txt`
+
+## 操作员的问句
+
+「reply 的格式不错，但发布的任务还不是漂亮格式对吗？可以扩充字数限制，写成美观的格式化吗？」
+
+答：**可以，而且限制从来不在 hub。** 用本机临时节点 `3-agent-network-pi`（node `n_9d315ae5`，
+runtime `pi-cli`，model `local/swift-1.5-iq3_xxs`，network `net_b91c0d535346`，hub `http://192.168.1.3:9200`）
+当场做了对照实验。
+
+## 实机测量（hub API 读回，逐条）
+
+| task_id | 正文长度 | delivered | running(started_at) | replied |
+|---|---|---|---|---|
+| `8eb6c799-99cc-4889-b8b5-1e3f5b0a17ec` | 277 | 18:23:52 | 18:23:52 | 18:24:09 |
+| `0537ef6c-a2da-424d-b520-c13e94ea26b8` | 484 | 18:27:40 | 18:27:40 | 18:28:00 |
+| `649f3979-eef3-4c66-9ef3-75a4704c42a4`（对照） | 117 | 18:28:43 | 18:28:43 | 18:29:00 |
+
+三条都走通 `delivered → running → replied`，用时约 17–20 秒。
+关键机制在 hub：`working` 那一步要**逐字**匹配正文
+`UPDATE tasks SET status='running', started_at = datetime('now') WHERE to_name = ?1 AND status IN ('delivered','acked') AND content = ?2`
+（`server/src/tools.ts:1492-1493`），而节点上报的是它从 hub 取回的正文 ⇒ **长度不影响这一匹配**（三条实测都命中）。
+
+顺带纠正我自己的一个读法错误：REST 任务行**没有 `acked_at` 字段**（字段是
+`delivered_at / started_at / runtime_submitted_at / consumed_at / completed_at`）。我一开始打印
+`d.get("acked_at")` 得到 `None`，写成「acked_at 为 null、逐字回传没落地」——那是**字段不存在**，不是没落地。
+按 `started_at` 读才算数（本轮已改口径）。
+
+## hub 真实上限（读源码，file:line）
+
+| 面 | 真值 | 出处 |
+|---|---|---|
+| `send_task.task` | 收 **10 000** | `server/src/tools.ts:2068`（`TASK_CONTENT_MAX`，定义在 `server/src/shared/task-content-limit.ts:18`） |
+| 节点卡预览 | **200，盲切** | 同文件 `:20` `SESSION_TASK_PREVIEW_MAX` |
+| `report_completion.result` | 存前 **4000** | `server/src/tools.ts:1592` |
+| `report_status.task` | 收 10 000 | `tools.ts:871` |
+| `report_completion.task` | 收 10 000 | `tools.ts:1564` |
+
+⇒ 「扩大字数限制」在 hub 侧根本不是瓶颈；**代价只有两处**：节点卡只看得到前 200 字符（⇒ 第 1 行必须自足），
+以及工人每一轮都要为正文付上下文。
+
+## 新规则（skill v0.7.0，§1.2a）
+
+- **brief body**（无 payload 文件）：≤1200 字符，第 1 行 ≤80 自足，**必须有 `accept:` 块**，
+  markdown-safe（空行分块、`- ` 列表、`key: value`；禁表格 / `#` / `**` / 反引号）
+- pointer body 保持：规格超过一个参数、需要 `sha12` 证明、需要在 git 里评审、跨轮复用时用它
+- 机械判据：`bash scripts/anet_payload.sh guard --body "…" --kind brief`
+  （实测一对：1200 收 / 1201 拒；删掉 `accept:` 拒；加表格拒）
+
+派给 `3-agent-network-pi` 的演示正文（484 字符，dashboard 的任务面板会渲染成列表）：
+
+```text
+演示任务：只读汇报本节点的环境，不写盘不联网
+purpose: a formatted task body the task pane renders as a list
+
+steps:
+- pwd
+- git rev-parse --abbrev-ref HEAD
+- git rev-parse --short HEAD
+- node --version, and say so if it is unavailable
+
+accept:
+- the result names the branch, the commit sha and the node version
+- the result lists each command you ran, in the order you ran it
+
+deliverable: the result text only, nothing written to disk
+report_completion once, result <= 1200 chars, line 1 is the conclusion
+```
+
+节点到货 641 字符，里面自己用了 markdown 表格与反引号 —— 任务面板渲染正常，
+Tasks 详情页（纯文本面）会露出 `|` 与反引号。**这正是 skill 把版式按面定的原因**，
+也是 dashboard 那条 issue 的内容（`docs/issues/dashboard-task-delivery-plain-text.md`，未提）。
+
+## 闸门（本机同一套依赖，`LD_LIBRARY_PATH=/home/pix/.pyenv/versions/3.12.13/lib`）
+
+- `run_pipeline.py`：`RESULT: PASS`，`rollout: 143 passed / 0 failed / 0 errored / 0 regressed`（13 scenario × 11 判据）
+- `run_evals.py --json --rollout`：132 passed / 0 failed（val）
+- `tests/manual_node_e2e.sh`：`ALL E2E ASSERTIONS PASSED`，新块输出
+  `brief body 382 chars: accepted; no-accept and with-a-table: refused`
+  `brief body round-tripped byte-exactly: acked -> running -> replied`
+- `skill_graph.py run`：spec / security / pipeline / eval_schema 全 PASS
+- `validate.py`：VALID（2 条既有 WARN，SKILL.md 828 行）
+- `wiki_maintenance.py validate`：valid；新 pattern `brief-body-in-the-parameter` + 台账 1 条
+- `VERIFICATION.md`：`clean: true`，`Eval rollout: 132 passed, 0 failed, 0 errored, 0 regressed`，版本 0.7.0
+
+## 遗留
+
+- SKILL.md 已 828 行（WARN >500）：下轮把 §7 运维细节外移
+- Dashboard markdown issue 已备未提
+- `agentmemory` 本机不可达（`http://localhost:3111`）
