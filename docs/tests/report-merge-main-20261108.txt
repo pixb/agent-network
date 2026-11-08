@@ -1,0 +1,133 @@
+合并报告：main（上游 tip 84afe2467）→ pixb
+日期：2026-11-08
+执行：pix 指挥室（pi）
+
+=========================================================
+1. 上游 fetch 方式与「镜像 == 上游 tip」的证明
+=========================================================
+本机到 GitHub 的 ssh 反复超时（AGENTS 硬规矩），上游 fetch 走 https + HTTP CONNECT 代理：
+
+  git -c http.proxy=http://192.168.1.200:1087 fetch --no-tags \
+      https://github.com/sleep2agi/agent-network.git main
+  → FETCH_HEAD = 84afe24677ebb806ab8f105ff0936b13dbbb0fdd
+
+三个引用逐字相同，因此「origin/main 镜像等于上游 tip」是实测，不是假设：
+
+  FETCH_HEAD（https+代理直取上游）  = 84afe2467
+  origin/main（我们 GitHub 上的镜像） = 84afe2467
+  本地 main（git branch -f main origin/main 之后）= 84afe2467
+
+合并前 main 落后 origin/main 14 个提交（本地指针旧），合并后 main == 上游 tip。
+
+=========================================================
+2. 本次进入 pixb 的上游内容（43b99dce9..84afe2467，14 个提交）
+=========================================================
+A. 桌面端升级兜底清单跟随版本（12 个，每个只改 1 个文件、16 行）
+   文件：docs-site/docs/public/desktop/update/fallback.json
+   逐条（PR 号 = 上游 #3377..#3388）：
+     e5b8dff5d 0.2.477 (#3377)   ba25549aa 0.2.478 (#3378)
+     38631db55 0.2.479 (#3379)   ccbfbcf2c 0.2.480 (#3380)
+     f28feaf4c 0.2.481 (#3381)   881b02f1d 0.2.482 (#3382)
+     4973a2e1a 0.2.483 (#3383)   2d550644c 0.2.484 (#3384)
+     b6ce5d4d1 0.2.485 (#3385)   9c1594ea5 0.2.486 (#3386)
+     4f4039a85 0.2.487 (#3387)   84afe2467 0.2.488 (#3388)
+   性质：纯数据（升级兜底清单），不改产品代码。
+
+B. 飞书通道两条（新增文件，父仓 scripts/）
+   c9ec29649 feat(feishu): 每日一行巡检 —— scripts/hub-feishu-doctor.sh（新增 42 行）
+     每天记一行可判读数：channels / worker / 长连接 ESTAB / 白名单通配。
+     设计要点写在文件头：只在异常时报 ⇒「没跑」与「没问题」同形，所以固定一次一行。
+   b66c32698 test(feishu): 用生产判定函数验「谁能进」 —— scripts/feishu-access-sim.ts（新增 44 行）
+     直接 import adapter 真正调用的 resolveFeishuAccess，跑 5 种情形钉死「谁能进」。
+
+合并产物（pixb 侧）：
+  merge commit 19b0f2a9b  "Merge main (upstream sync through 84afe2467) into pixb"
+  3 files changed, 102 insertions(+), 16 deletions(-)  —— 无冲突（ort，干净合并）
+
+=========================================================
+3. 合并后当场核对的成对/一致性门
+=========================================================
+- lockfile 自洽：server / agent-network / agent-node / docs-site 各 `bun install --frozen-lockfile`
+  全部 exit=0，`git status --porcelain -- '*bun.lock' '*/package.json'` 输出为空（无改动）。
+- 成对包同树：agent-network/src/opencode-agent-node-pair.ts
+  PAIRED_AGENT_NETWORK_VERSION = 2.3.0-preview.216 == agent-network/package.json 2.3.0-preview.216
+  PAIRED_AGENT_NODE_VERSION    = 2.5.0-preview.182 == agent-node/package.json   2.5.0-preview.182
+- runtime 名单三处逐项相同（8 项，逐字比对）：
+  agent-network/src/normalize-runtime.ts SUPPORTED_RUNTIME_NAMES
+  server/src/create-node-validate.ts RUNTIMES
+  agent-node/src/runtime/create-node-daemon.ts VALID_RUNTIMES
+  探针实测：agent-node/src/runtime/runtime-set-parity.test.ts → 3 pass / 0 fail
+  以及 server/src/create-node-validate.test.ts → pass=47 fail=0（189 expects）
+- 上游新增脚本实跑：
+  `bun run scripts/feishu-access-sim.ts` → 5/5 情形符合预期，exit=0
+  （注：commit 信息写「四情形」，代码实际判 5 种情形并打印「五种情形都符合预期」——
+   按「commit 信息必须与代码一致」这条规矩记在案，上游文案与代码差一项，代码为 5。）
+  `node docs-site/scripts/check-desktop-update-route.mjs` → 16 checks passed，
+  并显式确认「with 0.2.488 fallback ok」，即本次带进来的兜底清单版本。
+
+=========================================================
+4. 全量本地套件的基线逐条比对（AGENTS 硬规矩：不比总数，比失败名字集合）
+=========================================================
+基线树 = 上游 main 本身：`git worktree add -f /tmp/base-main main`（HEAD 84afe2467），
+同一台机器、同样 `bun install --frozen-lockfile`、同一个 canonical runner：
+  cd <树>/server && bun run scripts/test-aggregate.ts
+两棵树用各自的 ANET_SERVER_TEST_ROOT 并行跑，互不共用临时 DB。
+
+合并后（pixb @ 19b0f2a9b）：
+  SERVER_AGGREGATE_RESULT {"files":255,"pass":2909,"fail":10,"skip":0,"expects":15873,"bad":true}
+基线（main @ 84afe2467）：
+  SERVER_AGGREGATE_RESULT {"files":255,"pass":2908,"fail":10,"skip":0,"expects":15868,"bad":true}
+
+失败名字集合逐条比对（`(fail)` 行去掉 ms 后排序取集合）：
+  comm -3 merged.failnames.txt baseline.failnames.txt  → 输出为空 ⇒ 集合完全相同
+⇒ 新增红 0 条。
+
+红名单（基线就红，两边同形；3 个文件 10 条断言 / 7 个唯一名字）：
+  server/src/daemon-provider-snapshots.test.ts  pass=11 fail=6（两边逐字相同）
+  server/src/hub-provider-config.test.ts        pass=4  fail=3（两边逐字相同）
+  server/src/health-redaction.test.ts           pass=93 fail=1（两边逐字相同）
+    唯一名字：#473 … > alert_baselines and clk_tck_assumed_reason are actually read (not just produced)
+  失败形态是 `expect(received).toBe(expected)`（不是 Cannot find package / ENOENT 一类环境缺失），
+  即上游 main 自己在这台机器上带的红，与本次合并无关；要清它得单开一条线，不夹在这次合并里。
+
+逐文件计数差异只有 2 处，且都是「pixb 多、且是绿」，来源可指到代码（不是抖动）：
+  server/src/clone-node.test.ts          合并后 pass=7  expects=52 / 基线 pass=6  expects=49
+  server/src/create-node-validate.test.ts 合并后 expects=189 / 基线 expects=187
+  原因：RFC-043 的 `pi-cli` runtime 只存在于 pixb（上游 main 的 RUNTIMES 少这一项）。
+  `git diff main HEAD -- server/src/*` 直接指到三处：
+    server/src/create-node-validate.ts   + "pi-cli"  （1 行）
+    server/src/clone-node.test.ts        + test("pi-cli session file is copied when present (RFC-043 M0/S2)")
+    server/src/create-node-validate.test.ts 断言数随之 +2
+  ⇒ 合并方向正确：pixb 侧能力没被上游覆盖掉（2026-10-29 rebase 丢 RFC-043 那类事故没有重演）。
+
+=========================================================
+5. 六个恢复问题的回答（本次变更）
+=========================================================
+1) 常驻服务怎么起：不变。本次合并没有动任何启动器 / 编排脚本，deploy/、ops/ 无改动。
+2) 反代 / 隧道 / 端口：不变，本次无涉及。
+3) 环境变量与密钥来源：不变。新增的 hub-feishu-doctor.sh 只读节点目录与
+   channels/feishu/access.json，不写任何密钥值；脚本里的路径/主机名是运维事实，已入库。
+4) 怎么换版本并验证生效：pixb 是生产构建源；生效只问常驻进程实际加载哪份代码
+   （compose 镜像 label org.opencontainers.image.revision / pm2 script path）。
+   本次合并后现网**未换版**（未部署），要用上游那两条飞书巡检脚本时必须显式换版并按 label 核对。
+5) 怎么回滚：合并是单个 merge commit，回滚 = `git revert -m 1 19b0f2a9b`（代码级）；
+   现网回滚仍是「换回上一版镜像/运行时目录」，本次不涉及。
+6) 只能从数据备份恢复的状态：无新增。本次不带任何数据库 schema/migration 变化。
+
+=========================================================
+6. 结论与未做的事
+=========================================================
+- 合并干净（无冲突），门全过，新增红 0（失败名字集合与基线逐字相同），lockfile 自洽，
+  成对包与 runtime 名单当场核对一致 ⇒ 判定：**可以推送 pixb**。
+- 未做（不夹带）：
+  * 3 条基线红（daemon-provider-snapshots / hub-provider-config / health-redaction）是上游 main
+    在这台机器上的既有红，需单独立项修，不借合并顺手改生产代码。
+  * 现网部署/换版：本次只推源码，不部署；部署时按 label 核对真实生效。
+  * hub-feishu-doctor.sh 的 cron 挂载：脚本已入库，但「装到哪台机的 crontab」属于运维动作，
+    要单独按 runbook（docs/runbooks/feishu-channel-ops.md）走，本报告不声称已挂。
+
+产物文件（本机，供复核）：
+  /tmp/merged-server-test.log   /tmp/baseline-server-test.log
+  /tmp/merged.failnames.txt     /tmp/baseline.failnames.txt
+  /tmp/merged.stats2.txt        /tmp/baseline.stats2.txt
+  /tmp/base-main（基线 worktree，比对完已 `git worktree remove --force`）
