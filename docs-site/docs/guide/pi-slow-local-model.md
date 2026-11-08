@@ -46,7 +46,7 @@ hub 里留下这句：
 | 空闲预算 | `PI_TIMEOUT_MS` | `piTimeoutMs` / `timeout` | 30min | 一轮的总静默预算（压缩的静默量的是这个） |
 | 忙碌策略 | `PI_BUSY_POLICY` | `piBusyPolicy` | `queue` | `queue` 排队 / `skip` 本轮不提交 / `fail` 直接失败 |
 | 会话滚存阈值 | `PI_SESSION_ROLLOVER_BYTES` | `piSessionRolloverBytes` | 262144（≈64K token） | 0 = 关 |
-| 滚存携带字符 | `PI_ROLLOVER_CARRY_CHARS` | `piRolloverCarryChars` | 1200 | 0 = 不带（断记忆） |
+| 滚存携带字符 | `PI_SESSION_ROLLOVER_CARRY_CHARS` | `piRolloverCarryChars` | 1200 | 0 = 不带（断记忆） |
 | 每任务新会话 | `PI_SESSION_PER_TASK=1` | `piSessionPerTask` | 关 | 每个任务都换新会话 |
 
 两个边界（`timeout-resolve.ts`）：写下来的值被夹进 **15s … 24h**，横幅里来源会写成
