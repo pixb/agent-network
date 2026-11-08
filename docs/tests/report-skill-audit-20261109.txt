@@ -1,0 +1,110 @@
+# Skill 全面审计：通用性 / 语言 / 正文预算 / Dashboard 显示
+
+日期：2026-11-09
+对象：`.agents/skills/agent-network-skill`（子模块，HEAD `a3a97aa`，v0.6.7）
+方法：factory 闸门 + 逐条 grep 取证 + hub 源码读实测边界 + dashboard 源码读渲染方式
+闸门（本机，`LD_LIBRARY_PATH=/home/pix/.pyenv/versions/3.12.13/lib`）：
+`skill_graph.py run`（删 `.skill-cache`）spec / security / pipeline / eval_schema **全 PASS**；
+`security_scan.py` **CLEAN**；`validate.py` **VALID**（2 条既有 WARN：SKILL.md 795 行、2 处脚本提及未说"运行"）；
+`run_evals.py --validate` **VALID**
+
+## 1. 安全审计四问（`--audit` 口径）
+
+| 问题 | 实测答案 |
+|---|---|
+| 它连到哪里 | 脚本只连 hub：`anet_manual_node.sh` / `anet_payload.sh` 的地址来自 `--hub` / `ANET_MANUAL_HUB` / `ANET_HUB` / 节点 `config.json`，**无硬编码主机**；扫描器把 scripts 里的端点与 frontmatter 声明的 `network` 逐条比对 ⇒ CLEAN。E2E 只连 `127.0.0.1:<测试端口>` 的临时 hub |
+| 它能读/写什么 | 读：`ANET_TOKEN` / `ANET_MANUAL_*` 环境变量、节点 `config.json`、payload 文件、状态文件。写：状态文件、`fetch --out` 指定路径（`0600`）、`compose --print-body` 的 stdout。`anet_payload.sh` 明确"writes nothing to the working tree"（代码里无对 `$FULL` 的写）。**不读** `~/.ssh` / `~/.aws` / `.env` 之类 |
+| 指令体是否试图操纵 agent | 扫描器 CLEAN（含隐藏 Unicode / 编码块 / override / concealment / exfiltration 短语）。一次真红是 v0.6.3 的三处措辞（"Upload: POST /api/upload (…, Bearer token)" 等），改措辞解决，扫描器规则未动 |
+| 代码与描述是否一致 | 抽查一致：`report_status(working)` 的 `to_name+content` 精确匹配、`result.slice(0,4000)`、`file_id` 服务端生成 + 剥 `path`、跨网络 404，都在 hub 源码里对得上（本文第 3 节 file:line）。**一处不符见第 2 节 F1：§7.6 讲的是本项目出图轮的规则，不是通用协议** |
+
+读取范围（不装作全量）：逐行读过 `SKILL.md` 的 §1.2/§4/§7/§7.6 与 Gotchas、`references/payload-files.md`、
+`references/manual-node.md` 的附件与指针段、`scripts/anet_payload.sh`（536 行）全文、`scripts/anet_manual_node.sh`
+的 init/working/reply/files/fetch 路径（1366 行，**未逐行读完**）、`tests/manual_node_e2e.sh`（417 行）全文、
+`tests/manual_node_scenario.sh`（801 行，读了指针与生命周期块）。`raw/`、`wiki/`、`VERIFICATION.md` 只做索引级查看。
+
+## 2. 通用性审计（用户口径：skill 只定规矩，不是单项目 skill）
+
+闸门量不出这条，靠 grep 取证。按严重度排序：
+
+**F1（高）§7.6 是单项目规则，且在 SKILL.md 里是中文**
+`SKILL.md:770-794`：出图轮的验收条款 —— `seed=<逐字> raw_sha12=<逐字> sha12=<图> commit=<hash>`、
+`assets/prompts/<本段>.txt`、"停止出图"、commit sha `cef15af` / `29552f5`、到货编号 029/077、
+并引用**另一个本项目 skill** `image-qa-loop-skill §2.18.42`。
+它编码的是"到货必须证明用的是派工指定那一版"这条**通用**道理，但载体是本项目词汇与真实提交号。
+⇒ 保留道理、剥掉载体：英文写通用条款（"delivery must name the revision fingerprints it used;
+stop when the local fingerprint ≠ the dispatched one"），出图轮的实例（seed/prompt txt/commit shas）
+移出 skill，归本项目文档。
+
+**F2（中）真实标识符被当例子写进协议正文**
+- 生产别名 `200-pix-auto-video-manual-doubao`：`SKILL.md:445`、`528`、`704`（三处，含"别名带机器+项目"的示范）
+- 生产网络 `net_b91c0d535346`：`SKILL.md:518`、`references/manual-node.md:358`、`references/ttl-and-expiry.md:5`、
+  `scripts/anet_manual_node.sh:1068`（注释）
+这些是**某一次实测**的对象，不是协议。做法：数字与结论留着，标识符换成形状
+（`<machine>-<project>-<runtime>` 之类），网络写成"one production network (id withheld)"。
+
+**F3（低）语言：主体英文，两处中文袋**
+CJK 行占比：`SKILL.md` 29/795（3%），`AGENTS.md` 2/99，`README.md` 1/112，
+`references/payload-files.md` 15/259，`references/manual-node.md` 11/510，
+**`references/ttl-and-expiry.md` 48/86（55%）**。
+frontmatter 的中文触发词该留（它服务激活匹配）；§7.6 与 ttl-and-expiry 的正文该转英文（F1 顺带解决前者）。
+
+**F4（低）示例里的本项目痕迹**
+`第7轮` 出现在 8 处示例正文（可接受，是中文示例正文）；`commhub_tasks/` 26 处（已注明"目录名只是示例"）。
+`0.9.0-preview` 版本号 2 处 —— 这是好事（实测口径要求标 hub 版本），保留。
+
+## 3. 正文预算：真实上限与结论
+
+hub 侧实测（file:line，全部读源码）：
+
+| 面 | hub 真实上限 | skill 现行预算 |
+|---|---|---|
+| `send_task.task` → `tasks.content` | **10 000**（`server/src/shared/task-content-limit.ts:18` `TASK_CONTENT_MAX = 10_000`） | ≤300 |
+| 节点卡预览 `sessions.task` | **200**，**盲切**（同文件 `:20` `SESSION_TASK_PREVIEW_MAX = 200`） | 要求第 1 行 ≤80 |
+| `report_completion.result` | 存**前 4000**字符：`result.slice(0, 4000)`（`server/src/tools.ts:1592`、`1605`） | ≤400 |
+| `send_reply.text` | zod **max(10000)**（`server/src/tools.ts:2485`），入库不截（`INSERT INTO inbox … content`，`:2799`） | 无明文（沿用 400 习惯） |
+
+结论（三条，不是一条）：
+
+1. **派工正文保持 ≤300，不建议扩大。** 卡脖子的不是 hub（10 000），是两件事：
+   `report_status(status="working")` 要求工人**逐字**回传正文（`to_name+content` 精确匹配，无 task_id 分支），
+   正文越长漂移概率越高，一漂就烂在 `acked`；预览只有 200 字符，第 3 行以后在节点卡上根本看不见。
+   实测：4 行指针 240–280 字符，第 1 行 + `file:`/`sha12:` 行落在前 95 字符 ⇒ 关键信息都在切点之前。
+2. **交付正文（`report_completion.result`）应从 ≤400 提到 ≤1200。** hub 存 4000 是实测，
+   今天的 400 是习惯性收紧，工人被迫把"跑了什么/怎么验的/长报告在哪"压成一行，
+   这是 Messages 页读到的东西不可读的直接原因之一。取 1200（不是 4000）：
+   Dashboard 任务详体的 result 框是 `max-h-64 overflow-y-auto`（16rem，text-xs）⇒ 1200 字符 ≈ 30 行，正好在滚得完的范围。
+3. **`send_reply` 的交付文本可放宽到 ≤1500**（hub 收 10 000），并要求第 1 行 ≤80 作为摘要 —— 人在线列表里只看得到前面。
+
+预算写进 skill 时要带上这两个数（10 000 / 4000），操作员就知道"skill 的数比 hub 的数小"是**纪律**不是限制。
+
+## 4. Dashboard 显示：现状是纯文本，markdown 会露原字符
+
+实测渲染方式（dashboard 仓 `/vol1/1000/docker/nec8-docker/agent-network-dashboard`）：
+
+- `app/components/TaskDetail.tsx:329` 显示 `task.content`、`:345` 显示 `task.result`，
+  两处 class 都是 `whitespace-pre-wrap break-words … font-sans` ⇒ **纯文本**，不解析 markdown。
+- Messages 页同样：`app/messages/page.tsx:443`、`:488`、`app/messages/inbox/page.tsx:187` 都是 `whitespace-pre-wrap`。
+- Dashboard **已有** markdown 组件 `app/components/CommentMarkdown.tsx`（react-markdown + remark-gfm，
+  逐元素给类，明确不用 `prose`：Tailwind v4 未装 typography 插件，`prose` 是空类）。
+  它的来历正是本项目的一次投诉：评论正文按纯文本显示，`## 归因更正`、`**错误**`、反引号**全露出原字符**（#1831）。
+
+⇒ 推论（这是本次审计最有用的那条）：**在 dashboard 改渲染之前，正文里写 markdown 会得到"更丑"的结果**
+（`##`、`**`、`|---|` 全部以原字符出现）。所以分两步：
+
+- **skill 侧（本仓可做，零依赖）**：定一套"**纯文本也干净、将来渲染 markdown 也不脏**"的版式：
+  第 1 行摘要 ≤80；块与块之间空行；列表用 `- `；字段用 `key: value`（`verdict:` / `tests:` / `report:` / `commit:`）；
+  **禁止**表格、`##` 标题、`**粗体**`、围栏代码块。理由逐条写进 skill 并标 file:line。
+- **dashboard 侧（独立仓，走 issue → PR → 审阅 → 上游，英文）**：把 `TaskDetail` 的 `task.content` /
+  `task.result` 换成现成的 `CommentMarkdown`（和 #1831 同一手法）。这一步做完，skill 才可能放开 markdown。
+
+## 5. 待批准的动作（一次窄变更）
+
+| # | 动作 | 位置 | 成本 |
+|---|---|---|---|
+| 1 | §7.6 通用化（英文），出图轮实例移出 skill | `SKILL.md:770-794` | 中 |
+| 2 | 真实标识符换成形状/去标识 | `SKILL.md:445,528,704,518`、`references/manual-node.md:358`、`references/ttl-and-expiry.md:5`、`scripts/anet_manual_node.sh:1068` | 低 |
+| 3 | 预算改版：task ≤300 保留（写明 10 000/200 的理由）、result ≤1200、`send_reply` ≤1500，全部标 hub 出处 | `SKILL.md` 预算段、§7、`AGENTS.md`、`README.md` | 中 |
+| 4 | 版式规则（纯文本/markdown 两可）+ 模板 | `SKILL.md` §1.2、`references/payload-files.md` | 中 |
+| 5 | 闸门锁住新预算（`guard --max 1200` 的越界必须拒；纯文本版式的形状判据） | eval spec 命令型判据 + e2e | 低 |
+| 6 | `references/ttl-and-expiry.md` 中文正文转英文 | 该文件 | 低 |
+| 7 | dashboard：英文 issue（`TaskDetail` 用 `CommentMarkdown` 渲染 content/result） | 独立仓 `pixb/agent-network-dashboard` | 低（只写 issue，不改码） |
