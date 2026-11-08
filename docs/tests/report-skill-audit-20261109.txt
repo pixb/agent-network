@@ -108,3 +108,28 @@ hub 侧实测（file:line，全部读源码）：
 | 5 | 闸门锁住新预算（`guard --max 1200` 的越界必须拒；纯文本版式的形状判据） | eval spec 命令型判据 + e2e | 低 |
 | 6 | `references/ttl-and-expiry.md` 中文正文转英文 | 该文件 | 低 |
 | 7 | dashboard：英文 issue（`TaskDetail` 用 `CommentMarkdown` 渲染 content/result） | 独立仓 `pixb/agent-network-dashboard` | 低（只写 issue，不改码） |
+
+## 6. Nodes 界面实测（2026-11-09 补，回答「Nodes 支持漂亮格式吗」）
+
+面板分两层，**一层渲染 markdown，一层是纯文本**：
+
+| 面 | 渲染方式 | 可见量 | file:line |
+|---|---|---|---|
+| 节点卡上的当前任务 | **纯文本** | `line-clamp-2` ⇒ 2 行 | `app/nodes/NodesView.tsx:803` |
+| 节点列表行 / 紧凑网格 | **纯文本** | `truncate` ⇒ 1 行（`title` 里是全文） | `NodesView.tsx:872`、`:927` |
+| 左侧节点轨 | **纯文本** | 1 行；草稿只取 **40 字符** | `app/components/NodeList.tsx:230`、`:225` |
+| 节点卡打开的**任务聊天面板** | **markdown 真渲染**：`react-markdown` + `remark-gfm`，逐元素给类，图片可放大 | `CollapsibleText` 折叠到 **300px ≈ 12 行**，可展开 | `TaskChatPanel.tsx:492-493`、`MarkdownContent :561`、`m.result :1725`、`m.content :1769`、`COLLAPSE_MAX_PX :601` |
+| Tasks 页任务详情 | 纯文本 `whitespace-pre-wrap` | `max-h-64` 滚动框 | `app/components/TaskDetail.tsx:329`、`:345` |
+| Messages 页 / 收件箱 | 纯文本 `whitespace-pre-wrap` | — | `app/messages/page.tsx:443`、`:488`、`app/messages/inbox/page.tsx:187` |
+
+卡面数据本身是 hub 的 **200 字符盲切**（`sessions.task`，`SESSION_TASK_PREVIEW_MAX=200`）。
+
+**答：支持漂亮格式的是聊天面板，不是卡面。** 由此得出写进 skill 的格式依据：
+
+1. **第 1 行必须自足**（列表行只有第 1 行；卡片 2 行；hub 只给 200 字符）⇒ ≤80，实践上 ≤60。
+2. **正文/交付只用 markdown 安全子集**：空行分块、`- ` 列表、`key: value` 字段
+   ⇒ 聊天面板渲染成列表/字段，纯文本面也不丑。
+3. **禁用**：表格（聊天面板能渲染，纯文本面就是 `|---|` 原字符）、`#` 标题、`**粗体**`、反引号
+   —— 纯文本面上这些就是露出的符号，`CommentMarkdown.tsx` 的来历正是这条投诉（#1831）。
+4. **交付正文 ≤1200 的排布约束**：聊天面板默认只露 ≈12 行 ⇒ 前 12 行必须含结论 + 证据行，长文放文件（git/附件）。
+5. 想让 markdown 在全界面生效 = Dashboard 侧把 `TaskDetail` / `Messages` 也换成现成的 `CommentMarkdown`（独立仓 issue，见第 4 节）。
