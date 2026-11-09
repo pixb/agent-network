@@ -1,0 +1,157 @@
+report-skill-budgets-single-source-20261109.txt
+
+主题：skill v0.7.3 —— 预算只有一份（scripts/budgets.json），两条纪律从「可选旗标」变成默认
+子模块：.agents/skills/agent-network-skill  main f13fdb7（父仓库指针已更新）
+日期：2026-11-09（UTC）
+起因：运营口径「派工正文太短、交付正文能不能放宽、格式能不能好看」。v0.7.0 放开了 brief body，
+      v0.7.2 修了通道事实；本轮把「数字」这件事本身修好——之前每个数字都写在用它的地方。
+
+────────────────────────────────────────────────────────────────────────
+1. 新预算（scripts/budgets.json 是唯一来源，guard/compose/场景脚本都从它读）
+────────────────────────────────────────────────────────────────────────
+  项                       旧            新            依据
+  pointer task body        ≤300 / 6 行   ≤360 / 8 行   hub 接受 10000；节点卡片只给 200 字符盲切；worker 要逐字节回显
+  brief task body          ≤1200         ≤1600         任务面板渲染 markdown，实测 117/277/484 字符正文都走完 delivered→running→replied
+  report_completion result ≤1200         ≤2400         hub 只存前 4000（tools.ts:1592,1605）⇒ 留 1600 字符余量
+  resend body              ≤340          ≤400          uuid4 任务 id 本身占 36 字符
+  message/broadcast/reply  ≤1500         ≤3000         hub 接受 10000（tools.ts:2485）
+  context                  ≤200          ≤400          理由改过：见 §3
+  line 1                   ≤80           ≤100          sessions.task 前 200 字符盲切
+  版式行长                 （无）        ≤120          纯文本面（节点卡/列表行/Tasks 详情/Messages）会不可预测地折行
+
+  实测正文长度（同一文件里，写预算时对照用）：
+    4 行中文指针                       227 字符
+    最坏现实指针（行内 3 条验收项）    242 字符
+    带任务 id + 4 条中文验收项的改派   248 字符
+  ⇒ 「300 不够用」这个前提不成立，360 是留余量，不是救火。
+
+────────────────────────────────────────────────────────────────────────
+2. 边界实测（同一程序里做算术，不用 locale/解码副作用）
+────────────────────────────────────────────────────────────────────────
+  guard --kind task    360 接受 / 361 拒绝
+  guard --kind brief   1600 接受 / 1601 拒绝
+  guard --kind result  2400 接受 / 2401 拒绝
+  guard --kind resend  400 接受 / 401 拒绝
+  compose --summary    100 字符接受 / 101 字符拒绝（场景脚本原来断言「81 必须被拒」，那是测试自己记的数，现在按 line1_max+1 现算）
+  compose --ttl 1800 --node-idle 1800  拒绝（ttl < 2×idle）
+  compose --ttl 7200 --node-idle 1800  接受
+  markup               默认拒绝；--allow-markup 接受；同一正文去掉旗标后再次被拒（两个方向都测）
+  layout               拒绝 '*'/'•' 项目符号、全角冒号字段、130 字符长行
+
+────────────────────────────────────────────────────────────────────────
+3. 三条理由被测量改掉（不是改口味）
+────────────────────────────────────────────────────────────────────────
+  a) context「≤200 因为预览切 200」是错的：Dashboard 不渲染 task.context
+     （TaskChatPanel.tsx / TaskDetail.tsx 从不读它），hub 接受 10000。
+     context 的真实成本是 worker 的上下文 ⇒ 400，一行写完。
+  b) 任务面板的 ≈12 行折叠（COLLAPSE_MAX_PX = 300，TaskChatPanel.tsx:601）是
+     「展开全文 ⌄」按钮后面的折叠，不是永久遮蔽（:634-637）。
+     ⇒ 交付正文的硬规矩是顺序：第 1 行结论、第 2–12 行证据、之后逐条验收、长报告落文件；
+       不是「1200 以内才看得见」。
+  c) 真正的悬崖是 hub 只存前 4000 字符（result/output 都是）。2400 是留余量，
+     任何 >4000 的交付会被静默截断，所以 4000 写进 budgets.json 的 hard_constraints。
+
+────────────────────────────────────────────────────────────────────────
+4. 被否掉的一条提案（写明理由，避免下次重提）
+────────────────────────────────────────────────────────────────────────
+  否：给 CJK 正文加 1.5–2× 字符系数（即中文正文按更宽的字符预算算）。
+  理由：hub 的 zod 上限与存储截断都按 JS 字符数计；预览也是盲切字符数；
+        CJK 约 1 token/字符，2× 字符数＝2× token 成本，且 Dashboard 拉丁宽度界面里中文是全宽。
+  做法：预算继续按字符计；guard 输出 cjk 占比与 est_tokens 估算，让写正文的人自己看见代价。
+  实测样例（本轮的演示正文）：575 字符，CJK 217（38%），est_tokens ≈ 306。
+
+────────────────────────────────────────────────────────────────────────
+5. 纪律变成默认（不再依赖人记得加旗标）
+────────────────────────────────────────────────────────────────────────
+  - 每个正文都必须带 accept: 要求行（原来只有 brief 与「引用任务 id 的改派」强制）；
+    引用任务 id 的 --kind task 正文会被点名是改派，要求改用 --kind resend 审。
+  - markup 默认拒绝（表格行 / # 标题 / **加粗** / 反引号）；--no-markup 退役为告警，
+    显式旗标改成 --allow-markup。
+  - brief/result 自动做版式检查：行长 ≤120、`- ` 项目符号、ASCII `key: value`、无制表符。
+  - compose 机检 ttl ≥ 2× 节点 idle 预算（hub 不检查这条：默认 3600，上限 86400）。
+
+────────────────────────────────────────────────────────────────────────
+6. 门（对着这棵树跑）
+────────────────────────────────────────────────────────────────────────
+  run_evals.py --validate                      VALID agent-network-skill.eval.md
+  run_evals.py --json --rollout --include-holdout  208 passed / 0 failed / 0 errored / 0 regressed
+  run_pipeline.py                              RESULT: PASS, rollout 208 passed / 0 failed / 0 errored / 0 regressed
+  tests/manual_node_e2e.sh (port 19803)       ALL E2E ASSERTIONS PASSED
+  skill_graph.py run                          spec / security / pipeline / eval_schema 全 PASS
+  security_scan.py                            Status: CLEAN
+  validate.py                                 Status: VALID（3 条既有措辞 WARN，行数 WARN 801）
+  wiki_maintenance.py validate                wiki: valid
+  VERIFICATION.md                             clean: true, version 0.7.3, rollout 192 passed / 0 failed
+
+  本轮新增门：
+    budgets-in-docs-match-the-script        —— 文档引的数字、脚本读 budgets.json 的键、正文表格三处必须一致
+    guard-enforces-the-pointer-body-budget  —— 360/361 边界 + 无 accept: 必须拒
+  本轮改写门：
+    guard-enforces-the-delivery-budget      2400/2401
+    guard-enforces-the-brief-body-budget    1600/1601
+    guard-refuses-markup-...                默认拒 + --allow-markup 放行 + 去旗标再拒（三向）
+  本轮修掉的测试自打脸：
+    场景脚本原来断言「compose 必须拒 81 字符摘要」；预算改成 100 后该断言必红。
+    现在探针按 line1_max+1 现算，且接受 line1_max 本身。
+    case-13 基线改为「钉 sha12、字符数归一」，预算挪动不再打红只关乎身份的基线。
+
+────────────────────────────────────────────────────────────────────────
+7. 提交
+────────────────────────────────────────────────────────────────────────
+  子模块 .agents/skills/agent-network-skill（main，已推 origin/main）
+    130b424 v0.7.3: the budgets live in one file, and two rules stop being optional
+    aaaef75 docs(v0.7.3): the protocol text quotes the budgets file, with the reason for each number
+    401b3f7 wiki(v0.7.3): a budget that lives in prose is a budget that drifts
+    8c14ace v0.7.3: version fields (the budgets file and the two defaults are the change)
+    f13fdb7 docs: verification evidence for v0.7.3 (budgets single source, markup default, accept: required)
+  wiki：wiki/patterns/budgets-live-in-one-file.md + 台账记录 budgets-single-source-v073
+        raw/2026-11-09T051712Z-24dd8fdada22.log（门日志）
+  父仓库：本报告 + 子模块指针
+
+────────────────────────────────────────────────────────────────────────
+8. 现场演示状态（写清楚，不假装跑过）
+────────────────────────────────────────────────────────────────────────
+  本项目临时节点 3-agent-network-pi（n_9d315ae5，runtime pi-cli）已从 hub 上消失：
+    GET /api/status?network_id=net_b91c0d535346 现在只返回 2 个会话
+    （200-pix-auto-video-manual-doubao / …-doubao2，均属 pix-auto-video 项目，不是本项目的节点）；
+    POST /api/task 对该 alias 返回 alias_not_found。
+  ⇒ v0.7.3 的「格式化派工正文」现场证据 = E2E 的 brief 区块（382 字符正文 acked→running→replied）
+     + v0.7.0 在现网 hub 上的 117 / 277 / 484 字符实测（report-skill-brief-body-20261109.txt）。
+  ⇒ 不在别人的手动节点上派活：那会给别的项目造真任务。
+  要在现网再跑一次真节点演示，需要先重建临时节点（anet node create --runtime pi-cli + daemon，
+  或 skill 的 scripts/anet_manual_node.sh init/start），等运营点头再做。
+  演示正文留在下面附录，重建节点后可直接用（guard --kind brief 已验过：575 字符、21 行、第 1 行 42 字符）。
+
+────────────────────────────────────────────────────────────────────────
+9. 下一步
+────────────────────────────────────────────────────────────────────────
+  - 需要现网真节点的 v0.7.3 演示：先重建临时节点（等确认，属现网写操作）。
+  - Dashboard 的 issue 已备好未提：docs/issues/dashboard-task-delivery-plain-text.md
+    （建议 task.content / task.result 用现成的 CommentMarkdown 渲染）。
+  - SKILL.md 801 行 > 500 的 WARN 未解（内容分层是下一件事，不动语义）。
+  - hub 侧缺 running_stale_* 巡检（只有 delivered_stale_30s/_60s，
+    server/src/task-lifecycle-watcher.ts:37,50）——可提 issue，未动代码。
+
+附录 A：本轮的格式化派工正文样例（guard --kind brief 通过：575 字符 / 21 行 / 第 1 行 42 字符 / CJK 217）
+────────────────────────────────────────────────────────────────────────
+任务：只读盘点本节点工作目录，产出一份能在 Dashboard 任务面板直接读的简报
+
+目标：验证「格式化派工正文」在真实节点上走得通，并给出这个仓库当前的状态快照。
+
+steps:
+- git rev-parse --abbrev-ref HEAD
+- git rev-parse --short HEAD
+- git status --porcelain 统计行数
+- git log --oneline -3 取最近三条提交
+- ls .agents/skills/agent-network-skill/scripts 列出协议脚本
+
+accept:
+- 第 1 行是一句话结论，含分支名与提交短 sha
+- 逐条列出你实际跑过的命令，命令名要与输出对得上
+- 工作区干净就说 clean，不干净给出变更条数与前 3 个路径
+- 明确说明本次只读：无写入、无提交、无网络调用
+- 结尾给出你读到的脚本文件名清单，逐个照抄，不要概括
+
+format: 空行分块，用 - 开头列条目，用 key: value 写字段，不要表格、#、加粗、反引号
+deliver: report_completion once, result <= 2400 chars, 第 1 行是结论
+context: 本地模型 swift-1.5-iq3_xxs，一轮完成
