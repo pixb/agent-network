@@ -155,3 +155,39 @@ accept:
 format: 空行分块，用 - 开头列条目，用 key: value 写字段，不要表格、#、加粗、反引号
 deliver: report_completion once, result <= 2400 chars, 第 1 行是结论
 context: 本地模型 swift-1.5-iq3_xxs，一轮完成
+
+────────────────────────────────────────────────────────────────────────
+10. 追加（同日）：指针正文 360 → 480（skill v0.7.4）
+────────────────────────────────────────────────────────────────────────
+  运营口径：指针正文可以扩容字数吗？当前 360。答复：可以，改一处（scripts/budgets.json），
+  门 budgets-in-docs-match-the-script 保证文档与脚本不漂移 ⇒ 已落 480。
+
+  为什么是 480，不是更多（三条墙，按测量排）：
+    1) 显示墙（Dashboard）：sessions.task 只留前 200 字符（盲切），节点卡片 line-clamp-2
+       ⇒ 指针的第 1 行 + 第 2 行前半可见；第 3 行起在派工人看的面上不可见。
+    2) 每轮成本墙：指针正文每派一次活就进一次 worker 上下文，480 字符 ≈ 480 token/轮/工人
+       （CJK 约 1 token/字符，guard 直接打印 est_tokens）。
+    3) 纪律墙：正文写长了，人就懒得落 payload 文件；不落文件就没有 sha12，
+       就没有「worker 干的是哪一版」的可验证性（sha12 的作用是防止干到旧版）。
+  不是墙的两件事（写明，避免下次又当成理由）：
+    - hub 上限：接受 10 000 字符，宽裕；
+    - 逐字节回显（report_status: working）：长度不破坏翻转，现网 484 字符正文实测走过
+      delivered→running→replied。
+  ⇒ 480 的依据是模板实测：4 行中文指针 213 字符，加一行 context 的最坏现实形状 271 字符，
+     480 留 209 字符富余；360 只留 89。再往上（>600）在派工人看的面上完全不可见，纯付 token。
+  需要同样的富余去写步骤 → 用 brief 正文（≤1600，任务面板渲染成列表）或落 payload 文件。
+
+  门（对着 480 这棵树重跑）：
+    run_evals --validate                    VALID
+    run_evals --json（静态）                 192 passed / 0 failed
+    run_evals --rollout --include-holdout   208 / 0 / 0 / 0
+    run_pipeline.py                         RESULT: PASS（208 / 0 / 0 / 0）
+    tests/manual_node_e2e.sh                ALL E2E ASSERTIONS PASSED（port 19807）
+    security_scan / validate / skill_graph  CLEAN / VALID / 全 PASS
+    guard --kind task                       480 接受 / 481 拒绝
+    compose 摘要                            100 接受 / 101 拒绝（探针按 line1_max+1 现算）
+
+  提交：
+    子模块 7bc0599 v0.7.4: the pointer budget moves 360 -> 480, and the headroom is written down
+    子模块 a7359db docs: verification evidence for v0.7.4 (pointer budget 360 -> 480)
+    已推 origin/main；父仓库指针随本报告更新。
