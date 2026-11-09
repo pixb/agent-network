@@ -92,3 +92,21 @@ Tasks 详情页（纯文本面）会露出 `|` 与反引号。**这正是 skill 
 - SKILL.md 已 828 行（WARN >500）：下轮把 §7 运维细节外移
 - Dashboard markdown issue 已备未提
 - `agentmemory` 本机不可达（`http://localhost:3111`）
+
+## 追加（同日）：SKILL.md 瘦身 v0.7.1（子模块 `fbe0263` 正文 + `7a941d6` 版本 + 证据 `bf6c954`，已 push）
+
+validate 连几个版本都在提同一条 WARN（正文 >500 行）。体积不是纪律问题，是**重复**：同一批实测事实既写在
+SKILL.md，又写在 references/，修一次要写两处，而人先读的是正文那份。
+
+逐字搬进 `references/manual-node.md` 的三块：
+- §7.3 的 hub 三事实表、「一节点一个任务槽」「online ≠ working」、卡住判据清单、巡逻日志名
+- §7.4 的连发禁令理由、「取回正文绝不重打」、整文件 vs 分段标定的实测例
+- §7.0 的消息落点表（case-9/10/11，与 reference 里原有的那张放在一起）
+
+修掉一个结构缺陷：SKILL.md 原本有**两个** `## Gotchas`（夹在 §7.3 与 §7.4 之间那个装着 TTL 与
+report_completion 不可见两条）。现在只剩一节，条目并入。事实零删除（去 references 里 grep 表格行与标定例）。
+
+行数：SKILL.md 860 → 794 行（validate 的 WARN 由 787 → 762，阈值 500，仍 WARN，如实记）。
+
+闸门：pipeline `RESULT: PASS`（rollout 143 passed / 0 failed / 0 regressed）；evals val 132 / 0；
+e2e `ALL E2E ASSERTIONS PASSED`；skill_graph 四项 PASS；`VERIFICATION.md` `clean: true`（132/0，版本 0.7.1）。
