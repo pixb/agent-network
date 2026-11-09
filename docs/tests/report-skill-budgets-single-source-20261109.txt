@@ -191,3 +191,58 @@ context: 本地模型 swift-1.5-iq3_xxs，一轮完成
     子模块 7bc0599 v0.7.4: the pointer budget moves 360 -> 480, and the headroom is written down
     子模块 a7359db docs: verification evidence for v0.7.4 (pointer budget 360 -> 480)
     已推 origin/main；父仓库指针随本报告更新。
+
+────────────────────────────────────────────────────────────────────────
+11. 追加（同日）：指针正文 800 + 「格式化派工正文」真正的形状（skill v0.7.5）
+────────────────────────────────────────────────────────────────────────
+  运营设计口径：派工时指针不要压得太短；它是**带 markdown 美化的摘要**（不是挤成一坨的纯文本），
+  **不要行数限制**；详细任务写在任务文件里。
+
+  改了什么（唯一来源 scripts/budgets.json，文档同口径）：
+    task_lines_max 8 → **0（不限行数）**
+    markdown 规则：全局禁 → **按行分级**
+      line 1 必须纯文本（预览只显示它：sessions.task 盲切前 200 字符、节点卡 2 行、列表行 1 行）
+      line 2 起放开 markdown（# 标题、**加粗**、- 项目符号、1. 编号、> 引用、行内代码）
+        —— 任务面板真渲染 markdown（TaskChatPanel.tsx:492-493, :561, :1725, :1769）
+      表格在任何行都拒（Tasks 详情与 Messages 是 plain，表格碎得最厉害）
+    task_max 保持 800；详情权威位置仍是 payload 文件（一任务一文件 + sha12 核版）
+  明码写出的代价：从第 2 行起，Tasks 详情页与 Messages 页会显示 markdown 的字面字符。
+
+  现场实测（现网 hub 192.168.1.3:9200，节点 3-agent-network-pi / n_bd528d0a，runtime pi-cli）：
+    08f07073-0f61-4b6c-8fc2-1760a0c2dba8   768 字符纯文本指针
+      delivered 05:54:35 → running 05:54:36 → replied 06:00:57，result 1643 字符
+    315d0f07-d2d5-4b22-8d72-bc9a01c8db89   677 字符指针（规格里那条边界命令修好后再测）
+      delivered 06:11:32 → running 06:11:32 → replied 06:17:01，result 1277 字符
+      工人回报：800 字符正文 exit=0，801 字符 exit=2 ⇒ 预算真按 task_max 生效
+    543e7620-76f7-4a58-80f0-8136f081c97c   664 字符 / 17 行 / 第 1 行 59 字符，正文含 # 标题、**加粗**、
+      - 项目符号、> 引用
+      delivered 06:54:26 → running 06:54:26 → runtime_submitted 06:54:48（逐字节回显在长 markdown 正文下仍成立）
+  ⇒ 结论：长正文与 markdown 美化都不破坏 report_status(working) 的逐字节匹配（节点回显 hub 存的正文）。
+
+  工人替我们抓出的三个真缺陷（都已修，写在这里免得再踩）：
+    1) 我写的验收规格里那条边界命令自己超了行数（70 字符单位填满 800 → 13 行 → 被拒的原因是行数不是字数），
+       负例 `${BODY}t` 在 shell 里被解成未赋值变量 ⇒ guard 收到空正文、exit=0 的假绿；
+       父仓库 024cf2a2e 改成正文 8 行、负例 `${BODY}t` 只多 1 字符（实测 800→0、801→2）。
+    2) 工人用 sha1sum / git hash-object 比指纹，把正确的指针判成「指纹不匹配」。
+       sha12 的定义是 sha256(去掉结尾换行的单位文本) 前 12 位，**只用脚本 verify 核**；
+       已在 references/payload-files.md 写进硬规矩（父仓库同一提交也写进规格）。
+    3) SKILL.md 表格写 800，上面那段散文还写 480 —— 表格锚点式门抓不到散文。
+       新增门 no-superseded-budget-number-in-the-docs：扫 SKILL.md/AGENTS.md/README.md/references 里
+       退役数字（≤300 / ≤340 / ≤480 / ≤1200 / ≤1500），命中即红。
+
+  门（对着 v0.7.5 这棵树）：
+    run_evals --validate                          VALID
+    run_evals 静态                                   204 passed / 0 failed
+    run_evals --rollout --include-holdout         221 / 0 / 0 / 0
+    run_pipeline.py                               RESULT: PASS（221 / 0 / 0 / 0）
+    tests/manual_node_e2e.sh (port 19813)          ALL E2E ASSERTIONS PASSED
+      新区块：formatted body(15 行) 接受；line 1 markdown 拒；表格拒；26 行接受（无行上限）；
+             该正文 acked -> running -> replied 逐字节回显
+    security_scan CLEAN · validate VALID · skill_graph 全 PASS · wiki valid
+
+  提交：
+    子模块 ce4be22 v0.7.5 行为（分级 markdown + 取消行数上限 + 散文对齐 + 新门 + sha12 只用脚本核）
+    子模块 fdf78dd wiki(v0.7.5)
+    子模块 87ce559 v0.7.5 版本字段
+    子模块 8b0370a 证据
+    已推 origin/main；父仓库 024cf2a2e（验收规格的边界命令修正）已推 origin/pixb
