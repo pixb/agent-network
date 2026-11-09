@@ -218,6 +218,20 @@ context: 本地模型 swift-1.5-iq3_xxs，一轮完成
       - 项目符号、> 引用
       delivered 06:54:26 → running 06:54:26 → runtime_submitted 06:54:48（逐字节回显在长 markdown 正文下仍成立）
   ⇒ 结论：长正文与 markdown 美化都不破坏 report_status(working) 的逐字节匹配（节点回显 hub 存的正文）。
+  543e7620 的交付（17 行 markdown 指针，最终 replied，result 1629 字符，completed 07:16:18）：
+    结论：格式化派工正文在真节点上走得通，800 这条预算也真按 800 生效 —— 800 字符 exit=0，801 字符 exit=2。
+    工人自审交付：对自己的 result 跑过 guard --kind result → body ok 1310 chars, 37 lines, 64 on line 1, exit=0
+    A1 task_max 800 / brief_max 1600 / result_max 2400 / line1_max 100
+    A2 SKILL.md 表格四个数与 A1 逐项相同，无漂移
+    A3 800 → exit=0；801（${BODY}t，只多 1 字符）→ exit=2，拒因是字数不是行数
+    A4 body ok: 800 chars, 8 lines, 100 on line 1（工人独立数过，逐字一致）
+    A5 「800 不是文档里的装饰数字：脚本真的在 800 放行、801 拒绝」
+  现场三发的时间轴（同一条 hub、同一节点）：
+    768 字符纯文本   05:54:35 delivered → 05:54:36 running → 06:00:57 replied（result 1643）
+    677 字符纯文本   06:11:32 delivered → 06:11:32 running → 06:17:01 replied（result 1277）
+    664 字符 markdown 06:54:26 delivered → 06:54:26 running → 07:16:18 replied（result 1629）
+    注：pi-cli 用本地模型 swift-1.5-iq3_xxs，收尾 19 分钟；ttl 7200 覆盖，无需重发。
+
 
   工人替我们抓出的三个真缺陷（都已修，写在这里免得再踩）：
     1) 我写的验收规格里那条边界命令自己超了行数（70 字符单位填满 800 → 13 行 → 被拒的原因是行数不是字数），
