@@ -18,15 +18,18 @@ brief 1600；交付 result 2400；改派 resend 400；message 3000；context 400
 1. 读 `.agents/skills/agent-network-skill/scripts/budgets.json`，取 `task_max`、
    `brief_max`、`result_max`、`line1_max` 四个值。
 2. 读 `.agents/skills/agent-network-skill/SKILL.md` 的预算表，取同一行里写的四个数字。
-3. 跑一次边界实测（两条命令都跑，记下退出码）：
+3. 跑一次边界实测（两条命令，正文必须落在 8 行以内，第二条只比第一条多 1 个字符）：
 
        export LD_LIBRARY_PATH=/home/pix/.pyenv/versions/3.12.13/lib:${LD_LIBRARY_PATH:-}
        S=.agents/skills/agent-network-skill/scripts/anet_payload.sh
-       BODY=$(python3 -c 'head="任务：只读验收预算";acc="accept: 见 payload 文件验收清单";unit="- evidence line with text to fill the budget out to a realistic length";N=800;b=head+chr(10)+acc
-       while len(b)+1+len(unit)<=N-1: b+=chr(10)+unit
-       print(b+chr(10)+"x"*(N-len(b)-1))')
+       BODY=$(python3 -c 'head="verdict: 3 tests green "+"h"*77;acc="accept: every item on the acceptance list";unit="- evidence line with text to fill the pointer budget out "+"e"*54;step=len(unit)+1;used=len(head)+1+len(acc);N=800;R=N-used;k=(R-2)//step;t=R-step*k-1;print(chr(10).join([head,acc]+[unit]*k+["t"*t]))')
        bash "$S" guard --body "$BODY" --kind task; echo "at800 exit=$?"
-       bash "$S" guard --body "$BODY x" --kind task; echo "at801 exit=$?"
+       bash "$S" guard --body "${BODY}t" --kind task; echo "at801 exit=$?"
+
+   指针预算是 800 字符 **且** ≤8 行、第 1 行 ≤100。上一版这条命令用 70 字符单位填满 800，产出 13 行，
+   被拒的原因是行数不是字数（实测 exit=2 报 `the body is 13 lines (budget 8)`）；第二条命令加的是 2 个
+   字符（实测 802）；写成 `$BODYt` 还会被 shell 解成未赋值的变量 BODYt（实测 guard 收到空正文，
+   exit=0 假绿）。现在写 `${BODY}t`：负例只多 1 个字符。
 
 4. 数一下这条正文的实际字符数、行数、第 1 行字符数（`guard` 的 `body ok` 那行就有）。
 
@@ -42,6 +45,8 @@ brief 1600；交付 result 2400；改派 resend 400；message 3000；context 400
 
 - 只读：不写文件、不 commit、不 push、不调 hub。
 - 不修改 `.agents/` 与 `docs/` 下任何文件。
+- 指纹只准用脚本核：`bash "$S" verify --file docs/specs/2026-11-skill-precision-round/budget-800-demo.md --sha12 <正文里那个>`。
+  `sha1sum` 的前 12 位与 `git hash-object` 不是同一个函数，不要拿它们当 sha12（上一轮工人就是这样误报「指针指纹对不上」的）。
 - 命令必须照抄上面给的形式；换别的写法要在结果里说明为什么等价。
 
 ## 交付格式
