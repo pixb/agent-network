@@ -1,0 +1,78 @@
+# 外部审核 → 必修四条已修（skill v0.7.2）
+
+日期：2026-11-09
+子模块：`.agents/skills/agent-network-skill` `bf6c954` → `914c1c4`（已 push 到 `origin/main`）
+主仓库：`AGENTS.md` 同口径修正 + 子模块指针
+前置：`docs/tests/report-skill-audit-20261109.txt`、`report-skill-brief-body-20261109.txt`
+
+## 审核来源与我的核验方法
+
+另一个 agent 交了一份审核（P0×4 / P1×5 / P2×4）。我**逐条对着 hub 与 dashboard 源码实测**再决定接受，
+不接受未经测量的断言。
+
+| 审核断言 | 我的实测 | 判定 |
+|---|---|---|
+| dm 事实有三份且互相打架 | `references/manual-node.md:364`（case-9 可读）vs 同文件 `:507`「没有读它的页面」；skill `AGENTS.md:106-107`「/dm does not exist」；主仓库 `AGENTS.md:146` 与 `:150` 互斥 | **成立** |
+| planner 只有发送端 | `SKILL.md:141-142` 工具清单无 `get_inbox`/`ack_inbox`；hub `server/src/inbox-caller.ts:38`（`user?.username === requested` → ok，`:43` owner/admin 网络内任意 alias） | **成立**（「send_reply 交付是死路」这个结论过强：行落 `inbox(session_name=派单人)`，REST 与 Messages 页都读得到） |
+| `failed` 无 worker 路径 | `report_completion` 永远置 `replied`（`server/src/tools.ts:1593`、`:1606`）；`send_reply.status` 枚举 `replied|failed|cancelled`（`:2487`）；`retry_task` 只收 `failed/expired/cancelled`（`:3038`） | **成立** |
+| §7.6 挂在 `## Gotchas` 下、ledger 未定义 | `## Gotchas` 在 `:710`，`### 7.6` 在 `:770`；「the ledger / `expired_task_ids`」在 `:692,697,698,702` 出现且全文无定义 | **成立** |
+| 示例带项目词汇（`exportRows()` 等） | `references/payload-files.md:126,153` 实测有 | 成立，列为 P1（未做） |
+| 口径重复 7 处 / 5 处 / 渲染表 4 份 | grep 实测存在 | 成立，列为 P1 |
+| 目录里 1.1 MB 维护产物、`.pyc` | 实测 `.skill-cache` 12K、`scripts/__pycache__` 28K（含 `success_ledger.cpython-312.pyc`）、`raw/` 268K、`wiki/` 64K | `.pyc`+ignore 接受；**删 `raw/`+`wiki/` 不接受**（那是证据链，项目规矩要求证据提交） |
+| README 宣称「15+ 平台」 | `grep -n "15" README.md` **无此句**，只列 `install.sh` 支持的平台名 | **前提不成立**；真缺口（已验证 runtime × 最低 hub 版本表）接受 |
+| §7 只占 176 行（23%） | 实测 **262 行 / 794 行 = 33%** | 方向成立，数字偏低 |
+| description 999/1024 贴顶 | 实测 **1002/1024** | 成立（未做，P2） |
+
+## 修了什么（四条，都有 hub 源码 file:line 依据）
+
+**C1 通道事实只留一处**（子模块 `a31c286`）
+- 删 `references/manual-node.md` 的旧行「私信在 Dashboard 看不到」，改为「读 `dm` 的面是 `/messages/inbox`（`?scope=user`，case-9）；在 Tasks 页之外真正看不见的是 `report_completion`」
+- 子模块 `AGENTS.md:106-109` 重写为同一口径
+- 主仓库 `AGENTS.md:150` 同步修正（本次主仓库提交里）
+- 新闸门 `docs-say-one-thing-about-the-dm-channel`：扫 `SKILL.md`+`AGENTS.md`+`README.md`+`references/*.md`，出现旧口径即红
+- 危害口径：旧说法让指挥室不看 `/messages/inbox` ⇒ 节点提问无人应；还把提问推进 terminal 通道（`send_reply` 置 `replied`，`retry_task` 不收 `replied`）⇒ 一个问题烧掉一轮
+
+**C2 planner 有接收端**（子模块 `2de09e9`）
+- §1 工具清单加 `get_inbox` `ack_inbox`；新增第 4 步：`get_inbox(alias=<自己用户名>)` → 下一轮 `ack_inbox(message_id)`，并给 REST 等价读法 `GET /api/messages?alias=<user>&network_id=<net>`
+- 依据 `inbox-caller.ts:38/:43`
+- 不修的代价（实测于 v0.6.4）：提问躺在 `user_inbox` 没人读 ⇒ 任务停在 `running`，而巡逻**只有** `delivered_stale_30s/_60s`（`task-lifecycle-watcher.ts:37,50`，**无 `running_stale`**）⇒ 一直安静到 TTL 扫走
+- 新闸门 `planner-names-its-receiving-step`
+
+**C3 worker 有可重派的失败路径**（同提交）
+- §2 新增第 7 步：做不成用 `send_reply(in_reply_to=<task_id>, text=…, status="failed")`；写清「`report_completion` 永远写 `replied` ⇒ 不可 `retry_task`，且被算成到货」
+- 状态机表新增一行 `any non-terminal → failed`
+- 修掉角色写反的句子（原文「让 dispatcher 用 `send_reply` **读**结果」；`send_reply` 是工人交付且是 terminal）
+- 手动节点侧脚本本来就走这条路（`scripts/anet_manual_node.sh:801` 把非 `replied` 结果交给 `send_reply`），所以文档与实现对齐
+- 新闸门 `worker-failure-path-is-retryable`
+
+**C4 章节顺序 + 去掉未定义物**（同提交）
+- `### 7.6` 移到 `## Gotchas` 之前 ⇒ §7.0…§7.6 连续，Gotchas 在文件末尾
+- §7.5 标题去掉「(operator order 2026-11-08)」日期（日期属于 wiki，不属于协议）
+- 「the ledger」改为**已定义**的通用说法：你项目的 **dispatch log**（记录每轮 task id、判定、到货的项目文档）；协议只要求「旧 id 与新 id 都要写下来」，`expired_task_ids` 降级为示例字段名
+- 事件叙事进 `wiki/patterns/receiving-end-and-retryable-failure.md`
+
+## 闸门（同一台机器同一套依赖）
+
+- `run_pipeline.py`：`RESULT: PASS`，`rollout: 182 passed / 0 failed / 0 errored / 0 regressed`（14 判据 × 13 scenario 含 holdout）
+- `run_evals.py --json --rollout`：**168 passed / 0 failed / 0 errored / 0 regressed**（14 判据 × 12 promoted scenario）
+- `tests/manual_node_e2e.sh`：`ALL E2E ASSERTIONS PASSED`
+- `skill_graph.py run`：spec / security / eval_schema PASS
+- `security_scan.py`：`Status: CLEAN`
+- `validate.py`：`Status: VALID`（3 条 WARN：正文 786 行 >500；脚本提及缺动词 3 处；references 提及缺动词 3 处）
+- `wiki_maintenance.py validate`：valid（新 pattern + 台账 1 条）
+- `VERIFICATION.md`：`clean: true`，`version: 0.7.2`，`Eval rollout: 168 passed / 0 failed`
+
+## 未做（审核者的 P1/P2，按性价比排序，都不是「必须」）
+
+1. 正文 786 行 >500：§7 262 行可再外移；顶部加 8 行「工具→角色→章节」路由 + 目录
+2. `description` 1002/1024：压到 400–600（保留中英触发词）
+3. 口径重复：one-call 规则 7 处、one-slot 5 处、渲染表 4 份 → 规范处写一次，其余引用
+4. 示例词汇统一（`exportRows()` → 中性示例）
+5. 打包清单（消费面 = `SKILL.md`+`references/`+`scripts/`）+ 删 `.pyc` + `.gitignore` 条目
+6. 「已验证 runtime × 最低 hub 版本」表（`0.9.0-preview.67` 现在埋在 §6）
+7. 拆成 `agent-network` + `agent-network-manual-node` 两个 skill：建议等第 1 条做完再判（瘦身后 §7 若仍 >80 行就拆）
+
+## 遗留事实
+
+- 巡逻无 `running_stale_*`（只有 `delivered_stale_30s/_60s`）⇒ 「卡在 running」在 Dashboard 上安静，这是 hub 侧可改进点（本仓库不动 hub）
+- `agentmemory` 本机不可达（`http://localhost:3111`），本轮记忆写入失败
