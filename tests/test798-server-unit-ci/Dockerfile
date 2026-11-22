@@ -21,6 +21,9 @@ RUN curl --fail --silent --show-error --location \
   && rm -f /tmp/bun-linux-x64.zip
 
 WORKDIR /workspace
+COPY contracts /workspace/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /workspace/server/src/contracts
 COPY server/package.json server/package-lock.json ./server/
 # 🔴 npm ci 而不是 npm install:ci 严格按 lockfile 装,install 会按 caret 解析
 # 「当下最新的兼容版本」。后者意味着同一个 commit 在不同时间构建出不同依赖图 ——
@@ -28,13 +31,17 @@ COPY server/package.json server/package-lock.json ./server/
 RUN cd server && npm ci
 
 COPY server ./server
-COPY contracts/side-thread/v1 ./contracts/side-thread/v1
 # RFC-026 G9 / RFC-028 P1 的漂移门比对 hub 与 daemon 的同名共享源码,
 # 要读同级 agent-node/src/shared。只带这个目录,不带整个包。
 # 若干 server 测试跨包 import agent-node 的源码(hub↔daemon 漂移门比对
 # shared/*.ts;peer-reply-atomic 用 reply-reliability;dashboard-slash-routing
 # 用 inbox-dispatch)。带整个 src,不带它的依赖 —— 这些是纯源码 import。
-COPY agent-node/package.json ./agent-node/package.json
+COPY agent-node/package.json agent-node/package-lock.json ./agent-node/
+# 2026-11-10 —— 源码 fork 链路测试（session-project-create-http、session-source-evidence）
+# 会在测试里 Bun.build 真的 agent-node CLI，并把 agent-node/node_modules 下的
+# @anthropic-ai / @openai / node-pty 软链进夹具包；没有依赖时构建报
+# 「Could not resolve: "zod"」，链路以 unknown_rotation_required 收场。按 lockfile 装。
+RUN cd agent-node && npm ci --ignore-scripts
 COPY agent-node/src ./agent-node/src
 COPY agent-network/package.json agent-network/package-lock.json ./agent-network/
 COPY agent-network/src ./agent-network/src
@@ -56,6 +63,11 @@ RUN cd agent-network && bun install --ignore-scripts \
 # scheduled-tasks-http.test.ts 起两个真 Hub 进程抢同一个 occurrence,
 # worker 脚本在 tests/test601-hub-scheduled-tasks 下,按仓根相对路径 import。
 COPY tests/test601-hub-scheduled-tasks ./tests/test601-hub-scheduled-tasks
+# Repo files that server tests read outside server/ (2026-11-10: both were ENOENT in this image):
+#   health-redaction #473 inventory -> docs/rest-route-table.json
+#   hub-catalog-read-http provider selection states -> prototype client api.ts
+COPY docs/rest-route-table.json ./docs/rest-route-table.json
+COPY prototype/anet-client-app/src/api.ts ./prototype/anet-client-app/src/api.ts
 # 2026-10-31 —— 失败分档（scripts/report-server-test-triage.py）在容器里跑，
 # 所以脚本本身必须进镜像。原来镜像里没有任何 scripts/ ⇒ 分档会「跳过」。
 COPY scripts/report-server-test-triage.py ./scripts/report-server-test-triage.py

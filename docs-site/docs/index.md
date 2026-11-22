@@ -6,7 +6,7 @@ hero:
   # 标语只写在 hero.text 这一处:页面 <title> 后缀、description、og/twitter 都由 .vitepress/config.ts 的
   # transformPageData 从 hero.text / hero.tagline 派生,换标语只改这一行。
   text: 一个人，一支 Agent 军团
-  tagline: 像用微信一样，和 Claude、Codex、Grok 节点聊天、派活、排班——任务有人跟，定时有人做，数据留在你自己手里。
+  tagline: <span class="hero-grok"><b>企业级开源版 Grok Bot</b>，更适合企业内部私有化部署</span>像用微信一样，和 Claude、Codex、Grok 节点聊天、派活、排班——任务有人跟，定时有人做，数据留在你自己手里。
   actions:
     - theme: brand
       text: 下载桌面版
@@ -26,6 +26,13 @@ features:
     title: 军团在你自己的机器上
     details: Hub 和数据跑在你控制的机器上；登录凭据由系统钥匙串安全保存。
 ---
+
+<section class="home-video" aria-labelledby="home-video-title">
+  <div class="home-video-heading"><span class="eyebrow">48 SECONDS</span><h2 id="home-video-title">48 秒看完 Agent Network</h2><p>产品画面、支持的 Runtime 和项目里程碑。片中数字截至 2026-11-15，来自 GitHub 与 npm。</p></div>
+  <div class="home-video-frame"><video controls playsinline preload="none" poster="/intro/anet-intro-v6-cover.jpg" aria-label="Agent Network 介绍视频，48 秒，无旁白"><source src="/intro/anet-intro-v6.mp4" type="video/mp4" /></video></div>
+</section>
+
+<HomeRuntimes lang="zh" />
 
 <section class="feature-shots" aria-labelledby="feature-shots-title">
   <div class="feature-shots-heading"><span class="eyebrow">INSIDE THE APP</span><h2 id="feature-shots-title">不只是聊天：派活、跟进、排班都在一处</h2><p>你和整支 Agent 军团在同一块看板上分工、跟进、按时执行。</p></div>
@@ -67,5 +74,6 @@ features:
 <section class="final-cta">
   <h2 class="final-cta-title">让你的 Agent 真正组成团队</h2>
   <p class="final-cta-sub">从桌面应用开始，或使用 anet CLI 构建自己的协作网络。</p>
+  <p class="final-cta-note">Grok 与 Grok Bot 是 xAI 的商标；Agent Network 是独立的开源项目，与 xAI 无关联。</p>
   <div class="final-cta-actions"><a class="cta-primary" href="/download">下载桌面版</a><a class="cta-ghost" href="/guide/getting-started">开发者文档</a><a class="cta-ghost" href="https://github.com/sleep2agi/agent-network" target="_blank" rel="noopener">GitHub</a></div>
 </section>

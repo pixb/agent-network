@@ -9,7 +9,7 @@
 // once they hit `anet node start`.
 
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { statSync, realpathSync, readFileSync, mkdirSync } from "node:fs";
+import { statSync, realpathSync, readFileSync, mkdirSync, openSync, closeSync, appendFileSync, copyFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { isReservedEnvKey } from "../shared/reserved-env.js";
@@ -18,7 +18,6 @@ import { childDirNameForCreate } from "./child-dir-name.js";
 import {
   atomicWriteJson,
   atomicWritePrivateText,
-  repairPrivateConfigPermissions,
   isValidTimeoutMs,
   TIMEOUT_MS_MIN,
   TIMEOUT_MS_MAX,
@@ -32,6 +31,8 @@ import {
 } from "./codex-copresence-yolo.js";
 import { prepareChildWorkdir, recordChildWorkdir, WorkdirError } from "./child-workdir.js";
 import { NODE_SECRETS_FILE_NAME } from "../node-secrets.js";
+import { daemonCliLaunch } from "./daemon-cli-launch.js";
+import { windowsRuntimeSupported } from "../shared/windows-runtime.js";
 import { writeCreatedOpencodeProfile } from "./opencode-create-profile.js";
 import {
   assertOpenCodeV2RequestedModel,
@@ -87,6 +88,45 @@ function quoteSh(s: string): string {
  *    第一反应是去建 /etc/anet-daemon/path.conf —— 而那次实际只要 chmod。
  *    **把"要 sudo 改系统"和"一行 chmod"盖成同一句话,会让人修错方向。**
  */
+/** vdev 2026-11-11 实测：挂共享 serve 的 OpenCode 节点从拉起到就绪要 35–60 秒
+ * （启动 ~7s + 等共享 serve 按文件监听重载工作区配置 3–10s + MCP 就绪），35 秒的旧上限
+ * 总在就绪前把它杀掉（launcher start_failed）。 */
+export const OPENCODE_START_TIMEOUT_MS = 90_000;
+
+/**
+ * #4495 —— 失败时把子进程的 spawn 日志带出去。
+ *
+ * 为什么需要：`anet node start` 的 stdout/stderr 原来直接丢弃，子进程 5 秒内退出的真实
+ * 原因无从查起（日志跟着 childDir 一起被 reap 收走）。这里做两件事：
+ *   ① 取 spawn.log 尾部（脱敏后）拼进 ack 的 error，让报错自己说清「为什么」；
+ *   ② 复制一份到 ~/.anet/failed-creates/<request_id>.log —— 越过 reap，事后仍可查。
+ * 只读 + 尽力而为：任何异常都不影响失败路径本身。
+ */
+export function preserveSpawnLogDiagnostics(opts: {
+  childDir: string;
+  requestId: string;
+  homeDir?: string;
+  maxChars?: number;
+}): string {
+  const maxChars = opts.maxChars ?? 1200;
+  const src = join(opts.childDir, "logs", "spawn.log");
+  let text = "";
+  try { text = readFileSync(src, "utf8"); } catch { return ""; }
+  // 脱敏：任何凭据形态都不许进 error / 落盘文件
+  const redacted = text.replace(/\b(ntok|utok|atok|tok)_[A-Za-z0-9_-]{6,}/g, "$1_[redacted]")
+    .replace(/\b(sk-|gsk_|ak-)[A-Za-z0-9_-]{6,}/g, "$1[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]{8,}/gi, "Bearer [redacted]");
+  const tail = redacted.length > maxChars ? redacted.slice(-maxChars) : redacted;
+  try {
+    const destDir = join(opts.homeDir ?? process.env.HOME ?? ".", ".anet", "failed-creates");
+    mkdirSync(destDir, { recursive: true });
+    const dest = join(destDir, `${opts.requestId.replace(/[^A-Za-z0-9._-]/g, "_")}.log`);
+    appendFileSync(dest, `--- ${new Date().toISOString()} ${opts.requestId}\n${redacted}\n`, "utf8");
+  } catch { /* 诊断落盘失败不影响 create 结果 */ }
+  return tail.trim();
+}
+
+
 export type AnetBinFailureCode =
   | "anet_bin_identity"
   | "anet_bin_source"
@@ -144,7 +184,7 @@ function verifyAnetBinIdentity(abs: string): void {
   // Source-tree/dev fallback: bin/anet.cjs is copied verbatim to dist/bin/anet.cjs
   // at build time, but package.json points at the dist path.
   const body = readFileSync(abs, "utf-8");
-  if (abs.endsWith("/anet.cjs") && body.includes("anet 的 bin 入口垫片") && body.includes("PARSE_FLOOR")) return;
+  if (/[\\/]anet\.cjs$/.test(abs) && body.includes("anet 的 bin 入口垫片") && body.includes("PARSE_FLOOR")) return;
 
   throw unsafePathHelp("anet_bin_identity", `not an anet package bin: package.json bin.anet does not point at ${abs}`, "unset ANET_BIN_ABS and re-run: anet daemon up");
 }
@@ -406,7 +446,7 @@ export function safePathFor(platform: NodeJS.Platform): string {
 // key we own — smuggling USERPROFILE on Windows would let an untrusted
 // caller point the child at a different home, so it's fixed there too.
 const FIXED_ENV_KEYS_POSIX = new Set(["PATH", "HOME", "LANG"]);
-const FIXED_ENV_KEYS_WIN32 = new Set(["PATH", "HOME", "LANG", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
+const FIXED_ENV_KEYS_WIN32 = new Set(["PATH", "HOME", "LANG", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP"]);
 function fixedEnvKeysFor(platform: NodeJS.Platform): ReadonlySet<string> {
   return platform === "win32" ? FIXED_ENV_KEYS_WIN32 : FIXED_ENV_KEYS_POSIX;
 }
@@ -433,8 +473,8 @@ const FIXED_ENV_KEYS = new Set([...FIXED_ENV_KEYS_POSIX, ...FIXED_ENV_KEYS_WIN32
  */
 export function resolveChildHome(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
   if (platform === "win32") {
-    const home = env.USERPROFILE
-      || env.HOME
+    const home = env.HOME
+      || env.USERPROFILE
       || (env.HOMEDRIVE && env.HOMEPATH ? env.HOMEDRIVE + env.HOMEPATH : "");
     if (!home) {
       throw new Error(
@@ -471,8 +511,12 @@ export function resolveChildHome(env: NodeJS.ProcessEnv, platform: NodeJS.Platfo
 export function computeChildPath(
   platform: NodeJS.Platform = process.platform,
   execPath: string = process.execPath,
+  systemRoot?: string,
 ): string {
-  const execDir = dirname(execPath);
+  const execDir = platform === "win32" ? win32.dirname(execPath) : dirname(execPath);
+  if (platform === "win32") return systemRoot && win32.isAbsolute(systemRoot)
+    ? [execDir, win32.join(systemRoot, "System32"), win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0")].join(";")
+    : execDir;
   const safe = safePathFor(platform);
   // Skip prepend if execDir is already a safe-PATH entry
   // (avoid duplicate path; canonical order wins).
@@ -484,7 +528,7 @@ export function computeChildPath(
 /** #648 — daemon 节点 config.json 的字段名。只接受绝对路径数组,不读 PATH,不猜目录。 */
 export const DAEMON_EXTRA_PATH_FIELD = "daemonExtraPath";
 
-/** 子进程 PATH 与 computeChildPath 一样用 `:`,含 win32。额外目录接在整段固定 PATH 之后。 */
+/** Extra directories follow the fixed PATH, using the platform delimiter. */
 let daemonExtraPathDirs: readonly string[] = [];
 /** 只给测试把「栽进去的 CLI」放到固定 PATH 之前。生产始终是空的:
  *  daemonExtraPath 仍然追加,配置项不能盖住 /usr/local/bin。 */
@@ -534,9 +578,10 @@ export function _resetDaemonExtraPathForTest(): void {
   childPathPrefixForTest = [];
 }
 
-function withChildPathTestPrefix(base: string): string {
+function withChildPathTestPrefix(base: string, platform: NodeJS.Platform = process.platform): string {
   if (childPathPrefixForTest.length === 0) return base;
-  return `${childPathPrefixForTest.join(":")}:${base}`;
+  const separator = platform === "win32" ? ";" : ":";
+  return `${childPathPrefixForTest.join(separator)}${separator}${base}`;
 }
 
 /** 追加到固定 PATH 之后,并去掉已经在固定 PATH 里的目录。 */
@@ -545,7 +590,8 @@ export function appendExtraPath(
   extras: readonly string[],
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const have = new Set(base.split(":").filter(Boolean));
+  const separator = platform === "win32" ? ";" : ":";
+  const have = new Set(base.split(separator).filter(Boolean));
   const add: string[] = [];
   for (const raw of extras) {
     const dir = canonicalExtraDir(raw, platform);
@@ -554,7 +600,7 @@ export function appendExtraPath(
     add.push(dir);
   }
   if (add.length === 0) return base;
-  return `${base}:${add.join(":")}`;
+  return `${base}${separator}${add.join(separator)}`;
 }
 
 export function missingCliCreateError(command: string): string {
@@ -585,6 +631,10 @@ export const DAEMON_CHILD_INHERITED_ENV_KEYS = [
   "all_proxy",
   "NO_PROXY",
   "no_proxy",
+  // Node's built-in fetch ignores the *_PROXY variables unless this is set, so a
+  // child forked by a daemon behind a proxy could not reach the Hub (2026-11-09:
+  // vdev fork child "fetch failed" → exit 1 while the daemon itself worked).
+  "NODE_USE_ENV_PROXY",
 ] as const;
 
 export function minimalEnv(
@@ -615,11 +665,15 @@ export function minimalEnv(
     // #648 — fixed prefix (computeChildPath, historically aS()) first, then
     // daemonExtraPath. Not process.env.PATH, and not guessed user dirs.
     // The test prefix is empty in production, so this string stays the same.
-    PATH: withChildPathTestPrefix(appendExtraPath(computeChildPath(platform), daemonExtraPathDirs, platform)),
+    PATH: withChildPathTestPrefix(appendExtraPath(computeChildPath(platform, process.execPath, parentEnv.SystemRoot || parentEnv.SYSTEMROOT), daemonExtraPathDirs, platform), platform),
     HOME: home,
     LANG: parentEnv.LANG || "C.UTF-8",
   };
   if (platform === "win32") {
+    // OS/SDK subprocesses need these; never accept them from Hub extra keys.
+    const systemRoot = parentEnv.SystemRoot || parentEnv.SYSTEMROOT;
+    if (systemRoot) base.SystemRoot = systemRoot;
+    for (const key of ["TEMP", "TMP"] as const) if (parentEnv[key]) base[key] = parentEnv[key];
     // #1490 — Windows-only. Node's os.homedir() and most tools read
     // USERPROFILE first; grok / claude / codex CLIs invoked as
     // grandchildren also need HOMEDRIVE+HOMEPATH to resolve %HOMEPATH%
@@ -630,14 +684,11 @@ export function minimalEnv(
       // C:\Users\alice → HOMEDRIVE=C: HOMEPATH=\Users\alice
       base.HOMEDRIVE = home.slice(0, 2);
       base.HOMEPATH = home.slice(2);
-    } else if (parentEnv.HOMEDRIVE && parentEnv.HOMEPATH) {
-      // Non-drive-letter home (UNC path, weird service context) — fall
-      // back to whatever the daemon inherited, on the assumption that
-      // if the daemon is running with those values the child needs the
-      // same. If neither branch fires the child just doesn't get
-      // HOMEDRIVE/HOMEPATH — tools that need them will fail loudly.
-      base.HOMEDRIVE = parentEnv.HOMEDRIVE;
-      base.HOMEPATH = parentEnv.HOMEPATH;
+    } else if (home.startsWith("\\\\")) {
+      // Never fall back to the OS account's unrelated cloud home.
+      const root = win32.parse(home).root;
+      base.HOMEDRIVE = root.replace(/[\\/]+$/, "");
+      base.HOMEPATH = "\\" + home.slice(root.length);
     }
   }
   return base;
@@ -672,6 +723,7 @@ const VALID_RUNTIMES = new Set([
   "grok-build-cli",
   "opencode-cli",
   "pi-cli", // RFC-043 — daemon create_node 集合,与 normalize-runtime SUPPORTED_RUNTIME_NAMES 对齐
+  "antigravity-acp",
 ]);
 /** 测试钩子 —— 让 runtime-set-parity.test.ts 能拿到这份副本做跨包等价断言。
  *  只读用途，不要在产品代码里用它绕过 VALID_RUNTIMES 本身的检查。 */
@@ -830,7 +882,14 @@ export function childConfigFieldsFromSpec(spec: Pick<DaemonNodeSpec, "runtime" |
   return { flags, ...codexExtras };
 }
 
+function hasSessionSourceReference(value: unknown): boolean {
+  return !!value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "source_ref");
+}
+
 export function buildAnetArgsDaemon(spec: DaemonNodeSpec): string[] {
+  if (hasSessionSourceReference(spec) || hasSessionSourceReference(spec.flags)) {
+    throw new Error("session_source_unsupported");
+  }
   for (const field of ["opencodeGeneration", "opencodeUnsafeTools", "opencodeNewServer"]) {
     if (Object.prototype.hasOwnProperty.call(spec, field)) throw new Error(`flag_location_invalid:${field}:use node_spec.flags`);
   }
@@ -1008,20 +1067,16 @@ export async function reconcilePendingCreateRequestsOnConnect(
   if (handled > 0) deps.log(`[create-node] pending reconcile handled ${handled} request(s)`);
 }
 
-/** §2.5 step 3 helper — ensure $HOME/.anet/config.json carries the
- *  daemon's hub URL so the spawned `anet node create + start` doesn't
- *  bail with `未找到 CommHub Server`. Idempotent. */
-export function ensureGlobalAnetConfig(home: string, hubUrl: string): void {
-  const dir = join(home, ".anet");
-  const path = join(dir, "config.json");
-  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* ok */ }
-  repairPrivateConfigPermissions(path);
-  let cur: Record<string, any> = {};
-  try { cur = JSON.parse(readFileSync(path, "utf-8")); } catch { /* fresh */ }
-  if (cur.hub !== hubUrl) {
-    cur.hub = hubUrl;
-    atomicWriteJson(path, cur);
-  }
+/** The daemon's Hub for a spawned `anet node start`. 2026-11-17: the child used
+ *  to find it through the user's own ~/.anet/config.json, which this daemon
+ *  rewrote on every create/clone (`ensureGlobalAnetConfig`). On a machine whose
+ *  CLI is logged into a different Hub — the desktop App's local daemon next to a
+ *  cloud login — that silently repointed the user's `anet` at the local Hub (and a
+ *  missing or unreadable file was replaced by `{hub}` alone). The child profile
+ *  already carries `hub`; the CLI also reads COMMHUB_URL before the global file,
+ *  so the daemon passes it in the child env and never writes the user's config. */
+export function daemonChildCliEnv(hubUrl: string, platform: NodeJS.Platform = process.platform, parentEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return minimalEnv(hubUrl ? { COMMHUB_URL: hubUrl } : {}, platform, parentEnv);
 }
 
 interface GetCreateRequestResult {
@@ -1070,8 +1125,23 @@ export async function handleCreateNodeDoorbell(
     return;
   }
 
+  // #4150: until authenticated source grants are wired, never reinterpret a
+  // source operation as ordinary creation, including null/empty placeholders.
+  // This precedes CLI probes, directory preparation, config writes and spawn.
+  if (hasSessionSourceReference(req) || hasSessionSourceReference(req.node_spec)
+    || hasSessionSourceReference(req.node_spec.flags)) {
+    await deps.callCommHub("ack_create_request", {
+      request_id, status: "rejected", error: "session_source_unsupported",
+    }).catch(() => {});
+    return;
+  }
+
   // §4.2 daemon-side runtime allowlist fallback (belt-and-suspenders;
   // hub already enforces, this catches hub-bypass / compromised-hub).
+  if (!windowsRuntimeSupported(req.node_spec.runtime)) {
+    await deps.callCommHub("ack_create_request", { request_id, status: "rejected", error: "runtime_unsupported_on_windows: choose claude-agent-sdk; terminal/co-presence runtimes are unavailable; ACP stdio runtimes (antigravity-acp) require ANET_ALLOW_ACP_WINDOWS=1 on the daemon" }).catch(() => {});
+    return;
+  }
   if (deps.allowedRuntimes && deps.allowedRuntimes.length > 0 &&
       !deps.allowedRuntimes.includes(req.node_spec.runtime)) {
     deps.warn(`[create-node] runtime '${req.node_spec.runtime}' not in daemon's allowed_runtimes: [${deps.allowedRuntimes.join(",")}]`);
@@ -1116,7 +1186,7 @@ export async function handleCreateNodeDoorbell(
     deps.warn("[create-node] ignoring invalid shared OpenCode registry for explicit new Server");
   }
   const childEnvForCli = withHostOpenCodeV2ClientPath(
-    minimalEnv() as Record<string, string | undefined>, sharedOpenCodeServerForCreate);
+    daemonChildCliEnv(deps.hubUrl) as Record<string, string | undefined>, sharedOpenCodeServerForCreate);
   const requestedOpenCodeGeneration = req.node_spec.flags?.opencodeGeneration;
   const cliStatus = await requiredCliStatus(
     req.node_spec.runtime,
@@ -1196,13 +1266,7 @@ export async function handleCreateNodeDoorbell(
     }
   }
 
-  // P1: ensure global ~/.anet/config.json has hub so `anet node start`
-  // can resolve the hub even when called from minimalEnv. Idempotent.
-  // #1490 — was `process.env.HOME!` which passed undefined on Windows and
-  // crashed the write with `undefined/.anet/config.json`. resolveChildHome
-  // reads Windows env cascade (USERPROFILE / HOMEDRIVE+HOMEPATH / HOME).
-  try { ensureGlobalAnetConfig(resolveChildHome(process.env, process.platform), deps.hubUrl); }
-  catch (e: any) { deps.warn(`[create-node] global config write failed (continuing): ${e?.message || e}`); }
+  // The child learns the Hub from its profile + COMMHUB_URL (daemonChildCliEnv); never from the user's ~/.anet/config.json.
 
   // V2 co-presence must use the OpenCode model and provider already configured
   // on this machine. #2567's format gate (exactly one slash) already ran in
@@ -1280,6 +1344,16 @@ export async function handleCreateNodeDoorbell(
   // symlinks inside writeCreatedOpencodeProfile, before any token is written.
   if (req.node_spec.runtime !== "opencode-cli") {
     try { mkdirSync(childDir, { recursive: true, mode: 0o700 }); } catch { /* ok */ }
+  }
+  // #5152 —— 新节点默认带浏览器能力：把 SKILL.md（.agents/skills + .claude/skills）与
+  // 不可绕过的 wrapper（.anet/bin/browser-use，平台参数已内置）铺进子节点的 workdir。
+  // best-effort：铺不上只 warn，不让建节点失败（这是默认能力，不是前置条件）。
+  try {
+    const { installBrowserUseSkill } = await import("./browser-use-skill.js");
+    installBrowserUseSkill(childWorkDir ?? childDir, { platform: process.platform });
+    deps.log(`[create-node] browser-use skill installed under ${childWorkDir ?? childDir}`);
+  } catch (e: any) {
+    deps.warn(`[create-node] browser-use skill skipped: ${e?.message ?? e}`);
   }
   const childCfgPath = join(childDir, "config.json");
   // #584 —— copresence 从 flags 里拆出来,变成 config 顶层的 codexCopresence。
@@ -1452,15 +1526,26 @@ export async function handleCreateNodeDoorbell(
   let launcher: SpawnedLauncher | null = null;
   const childNodeIdForMap = `node_${request_id.replace(/^cr_/, "")}`;
   try {
+    // #4495 —— 子进程的 stdout/stderr 原来是 ignore：它**为什么**在 5 秒内退出，事后无人可见，
+    // 只能靠猜（错误文案于是写了「likely missing runtime binary or auth」，把两次完全不同的
+    // 事故指向同一个方向）。这里落一份 spawn 日志：失败时把它带进 ack 的 error，并复制一份到
+    // ~/.anet/failed-creates/<request_id>.log —— reap 收走 childDir 之后仍然查得到。
+    const spawnLogPath = join(childDir, "logs", "spawn.log");
+    let spawnLogFd: number | null = null;
+    try {
+      mkdirSync(join(childDir, "logs"), { recursive: true });
+      spawnLogFd = openSync(spawnLogPath, "a");
+    } catch { spawnLogFd = null; }
     const launch = deps.spawnChild ?? ((bin: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) =>
       spawn(bin, args, {
         cwd: opts.cwd,
         env: opts.env,
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: spawnLogFd === null ? ["ignore", "ignore", "ignore"] : ["ignore", spawnLogFd, spawnLogFd],
         detached: true,
       }));
     // #652 — start by directory name: exact within this .anet root, and always ASCII.
-    const child = launch(anetBin, ["node", "start", childDirName], {
+    const plan = daemonCliLaunch(anetBin, ["node", "start", childDirName]);
+    const child = launch(plan.command, plan.args, {
       cwd: childWorkDir,
       env: childEnvForCli,
     });
@@ -1488,7 +1573,8 @@ export async function handleCreateNodeDoorbell(
     try { child.stdout?.destroy(); } catch { /* ok */ }
     try { child.stderr?.destroy(); } catch { /* ok */ }
     child.unref();
-    deps.log(`[create-node] spawned child '${req.node_spec.name}' pid=${childPid}`);
+    if (spawnLogFd !== null) { try { closeSync(spawnLogFd); } catch { /* ok */ } spawnLogFd = null; }
+    deps.log(`[create-node] spawned child '${req.node_spec.name}' pid=${childPid} (spawn log: ${spawnLogPath})`);
 
     if (childPid > 0) {
       try {
@@ -1566,7 +1652,7 @@ export async function handleCreateNodeDoorbell(
   await new Promise<void>(resolve => setTimeout(resolve, FAIL_FAST_MS));
   if (opencodeCopresence) {
     // A still-running launcher is not proof of runtime readiness.
-    const deadline = launchedAt + (deps.capabilityCheckMs === undefined ? 35_000 : FAIL_FAST_MS);
+    const deadline = launchedAt + (deps.capabilityCheckMs === undefined ? OPENCODE_START_TIMEOUT_MS : FAIL_FAST_MS);
     while (!launcherExit && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     const ex = launcherExit as { code: number | null; signal: NodeJS.Signals | null } | null;
     const health = successfulLauncherExit(ex)
@@ -1654,7 +1740,9 @@ export async function handleCreateNodeDoorbell(
         }).catch(() => {});
         return;
       }
-      const msg = `child died within ${FAIL_FAST_MS}ms post-spawn (likely missing runtime binary or auth for runtime='${req.node_spec.runtime}'): ${kerr?.message || kerr}`;
+      const spawnTail = preserveSpawnLogDiagnostics({ childDir, requestId: request_id });
+      const msg = `child died within ${FAIL_FAST_MS}ms post-spawn for runtime='${req.node_spec.runtime}': ${kerr?.message || kerr}`
+        + (spawnTail ? ` | spawn log tail: ${spawnTail}` : " | spawn log: (empty)");
       deps.warn(`[create-node] runtime_capability_check_failed: ${msg}`);
       // #1293:记录已经提前到 spawn 之后,这条失败路径必须把它撤掉,
       // 否则 map 里留一条指向已死 pid 的条目,stop doorbell 会去 signal 它。

@@ -45,6 +45,9 @@ import {
 } from "./outbound-attachments";
 import { attachLocalLinks } from "./reply-local-links";
 import { drainRulesFileRequests, handleRulesFileEvent } from "./node-server-rules-file";
+import { startRulesFilePolling } from "./rules-file";
+import cliPackage from "../package.json";
+import { drainNodeSecrets, handleNodeSecretsEvent, nodeSecretsReportFields, resolveNodeSecretScope } from "./node-server-secrets";
 import { installTeamSkills } from "./node-skills";
 import { sendChannelTaskWithTrace } from "./channel-task-trace";
 import { PEER_REPLY_TOOL_NAME, sendChannelPeerReply } from "./channel-peer-reply";
@@ -220,6 +223,9 @@ function nodeConfigPath(): string | undefined {
   }
 }
 const CONFIG_PATH = nodeConfigPath();
+// app#225 follow-up —— 独立节点密钥。目录/身份只从本节点 config.json 得出
+// (`dirname(CONFIG_PATH)`),hub 请求里没有路径;没有配置就不上报能力、不处理请求。
+const NODE_SECRET_SCOPE = resolveNodeSecretScope(CONFIG_PATH);
 // #171 —— claude-code 族在名册里 model 全空(在线 38/38):节点配置里 `anet node create --model X`
 // 写下的 `model` 从没被报给 hub。读一次配置,有就报;没有就照旧为空(不编一个默认值)。
 // node_id / node_name 同理:不报 node_id,hub 的 nodes 表就没有这个节点,定时任务选不到它
@@ -256,6 +262,17 @@ function log(msg: string) {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// app#225 follow-up —— 独立节点密钥门铃依赖。nodeDir/ids 已由 CONFIG_PATH 固定,
+// 每次重算能力上报字段(写后 keys 立即反映在下一跳心跳里)。
+function nodeSecretDoorbellDeps() {
+  return {
+    callCommHub,
+    scope: NODE_SECRET_SCOPE,
+    log,
+    warn: log,
+  };
 }
 
 log(`ENV: URL=${COMMHUB_URL} ALIAS=${ALIAS} RESUME_ID=${RESUME_ID.slice(0, 8)}... TMUX=${TMUX_NAME || "none"} CWD=${process.cwd()} PROJECT_ENV=${projectPath} MODE=${OUTBOUND_ONLY ? "outbound-only" : "channel"}`);
@@ -317,7 +334,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           attachments: ATTACHMENTS_SCHEMA,
         },
-        required: ["text"],
+        // #4827-followup —— status 必须显式给：缺省时工具只更新 session 状态、
+        // **不会投递一条对话消息**，但返回值看起来是成功的（历史上多次被当成「已回复」）。
+        // 进度更新应该走 commhub_report_status，不是 commhub_reply。
+        required: ["text", "status"],
       },
     },
     {
@@ -658,10 +678,13 @@ async function reregister(): Promise<void> {
       tmux_name: TMUX_NAME || undefined,
       // app#225 follow-up —— 本进程答 rules_file 门铃(node-server-rules-file.ts)。
       rules_file_capable: true,
+      version: cliPackage.version,
       // 同一门铃也答 skills_list / skill_read(node-skills.ts)。
       skills_capable: true,
       // 同一门铃也答 files_list / file_read(node-files.ts,项目文件夹只读查看)。
       files_capable: true,
+      // app#225 follow-up —— 独立节点密钥:能力 + 已加载的 key 名(值永不出节点)。
+      ...nodeSecretsReportFields(NODE_SECRET_SCOPE),
     });
     log(`re-registered as "${ALIAS}" after SSE reconnect`);
   } catch (e) {
@@ -748,12 +771,19 @@ async function handleSSEEvent(event: any) {
     // app#225 follow-up —— 断线/未连上期间桌面端可能已发起规则文件请求;连上后补拉一次
     // (没有就是一次空拉)。不 await:别让 SSE 读循环卡在一次 hub 往返上。
     void drainRulesFileRequests({ callCommHub, workDir: process.cwd(), log }, "connect catch-up");
+    // app#225 follow-up —— 独立节点密钥同理:断线期间的 nsk_* 请求仍 pending,连上后补拉。
+    void drainNodeSecrets(nodeSecretDoorbellDeps(), "connect catch-up");
     return;
   }
 
   // app#225 follow-up —— 规则文件(CLAUDE.md)远程读写门铃。文件名固定 CLAUDE.md、
   // 目录固定本进程 cwd,见 node-server-rules-file.ts。
   if (await handleRulesFileEvent(event, { callCommHub, workDir: process.cwd(), log })) return;
+
+  // app#225 follow-up —— 独立节点密钥门铃(node-server-secrets.ts):事件 type=node_secrets,
+  // 拉取走 pull_daemon_provider_snapshots{accept_node_secrets:true},ack 走
+  // ack_daemon_provider_snapshot(request_id 以 nsk_ 开头)。
+  if (await handleNodeSecretsEvent(event, nodeSecretDoorbellDeps())) return;
 
   if (event.type === "new_message") {
     log(`← message from ${event.from}: ${(event.message as string).slice(0, 60)}`);
@@ -841,6 +871,7 @@ const drainChannelInbox = createSingleFlight(async () => {
 });
 
 // ── Main ────────────────────────────────────────────
+let stopRulesFilePolling: (() => void) | undefined;
 async function main() {
   await installTeamSkills("claude", { workDir: process.cwd() }, { log, warn: log }).catch((err) => {
     log(`[skills] 团队技能安装失败：${err?.message || err}`);
@@ -855,6 +886,7 @@ async function main() {
   }
 
   log("starting SSE listener...");
+  stopRulesFilePolling = startRulesFilePolling({ callCommHub, runtime: "claude", workDir: process.cwd(), log, warn: log });
   connectSSE().catch((err) => log(`SSE fatal: ${err}`));
 
   // 兜底:任何一次漏推(hub 判错没人在听、事件类型没认)最多晚一个周期。
@@ -891,10 +923,13 @@ async function main() {
     tmux_name: TMUX_NAME || undefined,
     // app#225 follow-up —— 本进程答 rules_file 门铃(node-server-rules-file.ts)。
     rules_file_capable: true,
+    version: cliPackage.version,
     // 同一门铃也答 skills_list / skill_read(node-skills.ts)。
     skills_capable: true,
     // 同一门铃也答 files_list / file_read(node-files.ts,项目文件夹只读查看)。
     files_capable: true,
+    // app#225 follow-up —— 独立节点密钥:能力 + 已加载的 key 名(值永不出节点)。
+    ...nodeSecretsReportFields(NODE_SECRET_SCOPE),
   })
     .then(() => log(`registered as "${ALIAS}" (${RESUME_ID.slice(0, 8)})`))
     .catch((e) => log(`warning: could not register: ${e}`));
@@ -923,10 +958,13 @@ async function main() {
       tmux_name: TMUX_NAME || undefined,
       // app#225 follow-up —— 本进程答 rules_file 门铃(node-server-rules-file.ts)。
       rules_file_capable: true,
+      version: cliPackage.version,
       // 同一门铃也答 skills_list / skill_read(node-skills.ts)。
       skills_capable: true,
       // 同一门铃也答 files_list / file_read(node-files.ts,项目文件夹只读查看)。
       files_capable: true,
+      // app#225 follow-up —— 独立节点密钥:能力 + 已加载的 key 名(值永不出节点)。
+      ...nodeSecretsReportFields(NODE_SECRET_SCOPE),
     }).catch((e) => log(`heartbeat failed: ${e}`));
   }, 3 * 60 * 1000);
 
@@ -939,6 +977,7 @@ main().catch((err) => {
 });
 
 async function gracefulShutdown() {
+  stopRulesFilePolling?.();
   if (OUTBOUND_ONLY) {
     log("shutting down outbound-only MCP client");
   } else {

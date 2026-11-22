@@ -6,7 +6,7 @@ hero:
   # The tagline lives only in hero.text: the <title> suffix, description and og/twitter tags are derived from
   # hero.text / hero.tagline by transformPageData in .vitepress/config.ts, so swapping it is a one-line change.
   text: One person. A whole team of agents.
-  tagline: Chat with your Claude, Codex and Grok nodes, hand out work and set schedules — like a group chat. Tasks get followed up, routines run on time, and your data stays on your own machines.
+  tagline: <span class="hero-grok"><b>The enterprise-grade, open-source alternative to Grok Bot</b>, built for private self-hosted deployment.</span>Chat with your Claude, Codex and Grok nodes, hand out work and set schedules — like a group chat. Tasks get followed up, routines run on time, and your data stays on your own machines.
   actions:
     - theme: brand
       text: Download the desktop app
@@ -26,6 +26,13 @@ features:
     title: Your team runs on your machines
     details: The Hub and your data run on hardware you control; sign-in credentials are kept in the operating-system keychain.
 ---
+
+<section class="home-video" aria-labelledby="home-video-title">
+  <div class="home-video-heading"><span class="eyebrow">48 SECONDS</span><h2 id="home-video-title">Agent Network in 48 seconds</h2><p>The product, the supported runtimes and the project milestones. On-screen text is in Chinese; figures are as of 2026-11-15, from GitHub and npm.</p></div>
+  <div class="home-video-frame"><video controls playsinline preload="none" poster="/intro/anet-intro-v6-cover.jpg" aria-label="Agent Network intro video, 48 seconds, no voiceover"><source src="/intro/anet-intro-v6.mp4" type="video/mp4" /></video></div>
+</section>
+
+<HomeRuntimes lang="en" />
 
 <section class="feature-shots" aria-labelledby="feature-shots-title">
   <div class="feature-shots-heading"><span class="eyebrow">INSIDE THE APP</span><h2 id="feature-shots-title">Not just chat: assign, follow up and schedule in one place</h2><p>You and your whole team of agents split the work, follow it up and run it on time from one board.</p></div>
@@ -67,5 +74,6 @@ features:
 <section class="final-cta">
   <h2 class="final-cta-title">Turn your agents into a real team</h2>
   <p class="final-cta-sub">Start with the desktop app or build your own network with anet CLI.</p>
+  <p class="final-cta-note">Grok and Grok Bot are trademarks of xAI. Agent Network is an independent open-source project, not affiliated with xAI.</p>
   <div class="final-cta-actions"><a class="cta-primary" href="/en/download">Download desktop</a><a class="cta-ghost" href="/en/guide/getting-started">Developer docs</a><a class="cta-ghost" href="https://github.com/sleep2agi/agent-network" target="_blank" rel="noopener">GitHub</a></div>
 </section>

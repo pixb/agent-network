@@ -17,6 +17,8 @@
 //    handler's `switch (sub)` / `sub === "x"` and runs `--help` + `-h` for each.
 //    Adding a subcommand without an entry here turns that test red.
 
+import { NODE_PERM_USAGE } from "./node-perm";
+
 const NODE_REF = "<node-id|node-name>";
 
 export const NODE_DELETE_USAGE = `Usage: anet node delete ${NODE_REF} [--force]
@@ -54,6 +56,7 @@ Commands:
   ls                            List nodes in this directory
   codex <verb> <ref>            Codex TUI co-presence lifecycle
   secret <verb> <ref>          Manage <node>/secrets.env (list | set | unset)
+  perm <ref> [flags]            Show/set a node's permission mode, send-to and receive-from allowlists
   migrate-token-to-envref <n>   Move a node's token out of config.json into .env
 
 Run 'anet node <command> --help' for details.`,
@@ -64,7 +67,8 @@ Create a new agent node in ./.anet/nodes/<name>/ and register it on the Hub.
 Options:
   --runtime <id>         claude-agent-sdk (default) | claude-code-cli | codex-sdk |
                          codex-app-server | grok-build-acp | grok-build-cli | opencode-cli |
-                         pi-cli (aliases: grok = grok-build-acp, pi = pi-cli)
+                         pi-cli | antigravity-acp
+                         (aliases: grok = grok-build-acp, pi = pi-cli, antigravity/agy = antigravity-acp)
   --model <id>           Model for the runtime
   --tools <list>         Extra tools to enable (e.g. WebSearch)
   --copresence           Shared human + agent TUI (codex-app-server / opencode-cli / grok)
@@ -153,6 +157,7 @@ No secrets.env is a normal state (exit 0). A symlink, a non-regular file or an
 unreadable file is an error (exit 1) rather than an empty list; set/unset
 refuse to write through a symlink.
 `,
+  "node perm": NODE_PERM_USAGE,
   "node ls": `Usage: anet node ls [--verbose]
        anet node list
 
@@ -314,6 +319,13 @@ Import sessions from CommHub into local node configs.`,
   "doctor": `Usage: anet doctor [--fix]
 
 System diagnostic check (runtimes, Hub, config, permissions).`,
+  "pair": `Usage: anet pair [--json]
+
+Print the exact agent-network + agent-node pair this CLI was released with,
+and the one install command for it.
+
+Options:
+  --json   machine-readable output (cli, agentNode, install)`,
   "license": `Usage: anet license
 
 Show license status and limits.`,

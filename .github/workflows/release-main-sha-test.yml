@@ -9,8 +9,13 @@ on:
       - '.github/scripts/verify-npm-publish-visible.sh'
       - 'tests/release-publish-visible/**'
       - 'tests/release-publish-tlog-recover/**'
+      - '.github/scripts/verify-npm-release-landed.sh'
+      - 'tests/release-landed-gate/**'
       - '.github/scripts/publish-outcome.py'
       - '.github/scripts/publish-with-tlog-recover.sh'
+      - '.github/workflows/promote-latest.yml'
+      - '.github/scripts/check-full-qa-for-latest.sh'
+      - 'tests/release-latest-full-qa/**'
   push:
     branches: [main]
     paths:
@@ -21,8 +26,13 @@ on:
       - '.github/scripts/verify-npm-publish-visible.sh'
       - 'tests/release-publish-visible/**'
       - 'tests/release-publish-tlog-recover/**'
+      - '.github/scripts/verify-npm-release-landed.sh'
+      - 'tests/release-landed-gate/**'
       - '.github/scripts/publish-outcome.py'
       - '.github/scripts/publish-with-tlog-recover.sh'
+      - '.github/workflows/promote-latest.yml'
+      - '.github/scripts/check-full-qa-for-latest.sh'
+      - 'tests/release-latest-full-qa/**'
 permissions:
   contents: read
 # #2136 —— 同一 PR 重新 push 时**取消上一轮还在排队的运行**。
@@ -56,3 +66,20 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -f tests/release-publish-tlog-recover/Dockerfile -t release-publish-tlog-recover-test .
       - run: docker run --rm release-publish-tlog-recover-test
+  # run 42731348173:2.3.0-preview.225 的 publish 步骤 success、verdict success,
+  # 而 registry 上那个版本是 404 —— 「落地核实」脚本的三分判定(桩 curl,无网络)
+  landed-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f tests/release-landed-gate/Dockerfile -t release-landed-gate-test .
+      - run: docker run --rm release-landed-gate-test
+  # 测试分层:升 latest 前要求该版本源码在 main 上的全量 QA 是绿的(桩 curl + 桩 gh,真 git 历史,无网络)
+  latest-full-qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f tests/release-latest-full-qa/Dockerfile -t release-latest-full-qa-test .
+      - run: docker run --rm release-latest-full-qa-test

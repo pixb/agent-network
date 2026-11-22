@@ -108,11 +108,14 @@ import { buildOpencodeSmokeEnv } from "../src/opencode-smoke-env";
 import {
   OPENCODE_AGENT_NODE_SPEC,
   OPENCODE_AGENT_NODE_VERSION,
+  PAIRED_AGENT_NETWORK_VERSION,
   PAIRED_AGENT_NODE_SPEC,
   PAIRED_AGENT_NODE_VERSION,
   agentNodeHelpSupportsCodexAppServer,
   agentNodeHelpSupportsOpencode,
+  nodeEngineWarning,
   opencodeExactPairInstallCommand,
+  pairInfo,
   pairedAgentNodeResolution,
   pairedAgentNodeResolveTimeoutMs,
   pairedAgentNodeResolveError,
@@ -310,6 +313,7 @@ import {
   probeWindowsOwnedLoopbackConnection,
   readWindowsCopresenceRecord,
   orchestrateWindowsManagedStop,
+  orchestrateWindowsManagedStopAsync,
   settleWindowsManagedStop,
   taskkillWindowsProcessTree,
   windowsCopresenceLogPath,
@@ -2457,7 +2461,10 @@ async function startOpencodeCopresenceOrchestration(nodeId: string, hubOverride?
     "bash", "-lc", bridgeCommand,
   ], { stdio: "pipe" });
 
-  const deadline = Date.now() + 30_000;
+  // vdev 2026-11-11 实测：挂共享 serve 的 OpenCode 节点 33 秒才就绪，30 秒上限在就绪前一刻把它杀了。
+  // 与 daemon 侧 OPENCODE_START_TIMEOUT_MS 对齐为 90 秒。
+  const COPRESENCE_START_WAIT_S = 90;
+  const deadline = Date.now() + COPRESENCE_START_WAIT_S * 1_000;
   while (!existsSync(attachScript) && tmuxSessionRunning(bridgeSession) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -2476,7 +2483,7 @@ async function startOpencodeCopresenceOrchestration(nodeId: string, hubOverride?
     killTmuxSession(bridgeSession);
     for (const line of describeCopresenceStartupFailure({
       attachScript, bridgeLog, nodeLogDir, bridgeAlive,
-      waitedSeconds: 30, logTail, paneTail,
+      waitedSeconds: COPRESENCE_START_WAIT_S, logTail, paneTail,
     })) console.error(line);
     process.exit(1);
   }
@@ -2958,12 +2965,15 @@ import {
   type RuntimeName,
 } from "../src/normalize-runtime";
 import { describeStaleRuntimeSupport } from "../src/daemon-runtime-staleness";
+import { windowsRuntimeSupported } from "../src/windows-runtime";
+import { openWindowsSdkEvidenceSession } from "../src/windows-sdk-stop-evidence";
 import { findEnvironAliasMatches } from "../src/environ-alias";
 import { describeGrokBuildDrift, parseGrokBuildFromLog, parseGrokBuildFromVersionOutput } from "../src/grok-build-drift";
 import { clearLocalCredentials, describeRevokeOutcome, normalizeHubUrl, revokeCurrentLoginSession, sameHub } from "../src/cli-auth-session";
 import { finalExitCode, markFailed, markUsageError } from "../src/cli-exit";
 import { describeHubRemoval, removeNodeFromHub } from "../src/node-delete-hub";
 import { COMMAND_HELP, NODE_DELETE_USAGE, lookupCommandHelp } from "../src/cli-help";
+import { formatNodePerm, hasNodePermChange, NODE_PERM_USAGE, parseNodePermArgs, runNodePerm, type NodePermResult } from "../src/node-perm";
 import { nodeSecretFileModeWarning, nodeSecretFilePath, readNodeSecretKeys, removeNodeSecret, writeNodeSecret } from "../src/node-secret-file";
 import { errorText, formatTopLevelError, hubErrorText, nodeTokenReissueError, hubReachReason, isNetworkError, maskSecret, redactSecretFields, redactSecrets } from "../src/cli-errors";
 import { defaultHubStopProbes, resolveHubListener, stopHub, type HubPidRecord } from "../src/hub-stop";
@@ -3112,6 +3122,39 @@ KEY=VALUE per line; reserved keys like PATH/LD_* are ignored).
   }
   console.log(`[anet] ${display}: ${r.keys.length} 个 key（只有名字，值不显示）`);
   for (const k of r.keys) console.log(`  ${k}`);
+}
+
+// `anet node perm` —— 节点在 Hub 上的权限：模式 / 对端白名单（发给谁）/ 收件白名单（谁能发给它）。逻辑在 src/node-perm.ts。
+async function nodePermCommand(argv: string[]) {
+  if (!argv.length || argv[0] === "--help" || argv[0] === "-h") { console.log(NODE_PERM_USAGE); if (!argv.length) markUsageError(); return; }
+  const parsed = parseNodePermArgs(argv);
+  if (!parsed.ok) { console.error(`[anet] ${parsed.error}\n\n${NODE_PERM_USAGE}`); process.exit(2); }
+  const { args: permArgs } = parsed;
+  const gc = loadGlobal();
+  const local = resolveNodeRef(permArgs.ref);
+  const hub = permArgs.hub || gc.hub || local?.profile.hub || "";
+  if (!hub) { console.error("[anet] no Hub configured — run: anet login (or pass --hub <url>)"); process.exit(1); }
+  if (!gc.token) { console.error("[anet] not logged in — run: anet login (node permissions need your user login)"); process.exit(1); }
+  let result: NodePermResult;
+  try {
+    result = await runNodePerm({ hub, token: gc.token }, permArgs, local?.profile.node_id);
+  } catch (e) {
+    console.error(`[anet] cannot reach the Hub at ${hub}: ${errorText(e)}`);
+    process.exit(1);
+  }
+  if (permArgs.json) {
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exit(1);
+    return;
+  }
+  if (!result.ok) {
+    if (result.changed?.length) console.error(`[anet] changed before the failure: ${result.changed.join(", ")}`);
+    console.error(`[anet] ${result.error}`);
+    process.exit(1);
+  }
+  if (result.changed.length) console.log(`[anet] updated: ${result.changed.join(", ")}`);
+  else if (hasNodePermChange(permArgs)) console.log("[anet] already set — nothing changed");
+  for (const line of formatNodePerm(result.state)) console.log(line);
 }
 
 function resolveNodeRef(ref: string): { id: string; profile: Profile } | null {
@@ -3389,6 +3432,22 @@ function getAnetVersion(): string {
   if (embedded) return embedded;
   try { return JSON.parse(readFileSync(packageJsonPath(), "utf-8")).version || ""; }
   catch { return ""; }
+}
+
+// 2026-11-10 —— 让 agent-node 自报「起它的是哪个 anet CLI」用的环境变量片段。
+//
+// 为什么需要它：`config_snapshot.anet_version` 是静态占位值（写死 0.1.0），客户端因此
+// 给不出这台机器「该装哪一对包」，只能建议 `agent-node@preview` —— 装完很可能与本地
+// CLI 不成对，CLI 拒绝启动（`Incompatible agent-node for opencode-cli`），节点离线。
+//
+// 形状不认就返回**空对象**：宁可「没报」也不要报一个假版本（假版本正是上面那个 bug 的成因）。
+// 🔴 只用于**真正 spawn agent-node 子进程**的 env，不要塞进 `AgentNodeLaunchPlan.probeEnv` ——
+//    那个对象还要拿去跑 `agent-node --help` 探测，混入启动侧的东西会让探测环境与启动环境不一致。
+function launchedByCliVersionEnv(): Record<string, string> {
+  const v = getAnetVersion();
+  return /^[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?$/.test(v) && v.length <= 64
+    ? { ANET_LAUNCHED_BY_CLI_VERSION: v }
+    : {};
 }
 
 /** POST /api/auth/login|register 的 client_label:这条登录在 app「登录设备」里叫什么(见 src/login-client-label.ts)。 */
@@ -3858,6 +3917,9 @@ async function setupCommand() {
   if (runtimeSelections.includes("grok-build-acp") && !isInstalled(versions.agentNode) && !runtimeSelections.includes("grok-build-cli")) {
     addPackage("@sleep2agi/agent-node");
   }
+  if (runtimeSelections.includes("antigravity-acp") && !isInstalled(versions.agentNode) && !runtimeSelections.includes("grok-build-cli")) {
+    addPackage("@sleep2agi/agent-node");
+  }
   if (runtimeSelections.includes("grok-build-cli") && !isInstalled(versions.agentNode)) {
     addPackage("@sleep2agi/agent-node@preview");
   }
@@ -3897,7 +3959,7 @@ async function setupCommand() {
   if (runtimeSelections.includes("claude-code-cli")) {
     console.log(`  ${isInstalled(verified.claude) ? "✅" : "❌"} ${formatDetectedVersion(verified.claude)}`);
   }
-  if (runtimeSelections.includes("codex-sdk") || runtimeSelections.includes("claude-agent-sdk") || runtimeSelections.includes("grok-build-acp") || runtimeSelections.includes("grok-build-cli")) {
+  if (runtimeSelections.includes("codex-sdk") || runtimeSelections.includes("claude-agent-sdk") || runtimeSelections.includes("grok-build-acp") || runtimeSelections.includes("grok-build-cli") || runtimeSelections.includes("antigravity-acp")) {
     console.log(`  ${isInstalled(verified.agentNode) ? "✅" : "❌"} ${formatDetectedVersion(verified.agentNode)}`);
   }
   if (runtimeSelections.includes("codex-sdk")) {
@@ -3912,6 +3974,9 @@ async function setupCommand() {
   }
   if (runtimeSelections.includes("grok-build-acp") || runtimeSelections.includes("grok-build-cli")) {
     console.log(`  ⚠ grok 需要安装并登录: grok login 或 x.ai CLI 认证缓存`);
+  }
+  if (runtimeSelections.includes("antigravity-acp")) {
+    console.log(`  ⚠ agy 需要安装并登录 Google 账号: agy acp --login（版本钉在 1.5.13，不跟随自动升级）`);
   }
   if (runtimeSelections.includes("grok-build-cli")) {
     console.warn(`  ⚠ EXPERIMENTAL/DANGEROUS: 网络任务会驱动同一个 Grok TUI；审批归属未完成硬化。`);
@@ -4732,6 +4797,10 @@ function checkRuntimeDependency(runtime: RuntimeName, phase: "create" | "start")
     console.warn(`[anet] Warning: grok CLI not found in PATH.`);
     console.warn(`[anet] Install/login Grok Build first: https://x.ai/cli`);
   }
+  if (runtime === "antigravity-acp" && !commandExists("agy")) {
+    console.warn(`[anet] Warning: agy (Antigravity CLI) not found in PATH.`);
+    console.warn(`[anet] Install first: curl -fsSL https://antigravity.google/cli/install.sh | bash`);
+  }
   // RFC-030 — codex-app-server (codex TUI bridge) runs a standalone
   // `codex app-server`, so it needs the `codex` CLI on PATH (same binary
   // as codex-sdk, but the app-server subcommand). agent-node itself is
@@ -4916,6 +4985,7 @@ async function skillCommand() {
 function printHelp() {
   console.log(`
 anet — AI Agent Network CLI (V2)
+Capabilities: ANET_CAPABILITY_SOURCE_RESUME_V1
 
 Quick start:
   anet hub start             Start local hub
@@ -4943,6 +5013,7 @@ Node Management:
   anet node edit <n> --remote   Switch a node on another machine to --model <id>
   anet node codex <verb> <ref>  Codex TUI co-presence lifecycle: preflight|verify|canary|start|restart|resume|fork|account|rollback
   anet node secret <verb> <ref> Daemon-issued node secret: list|set|unset (owner/admin; the value never leaves the hub)
+  anet node perm <ref> [flags]  Show/set permission mode, send-to (--peers) and receive-from (--inbox) allowlists [--json]
   anet attach <name>            Attach the node's exact tmux TUI session
   anet info <name>              Detailed node info + server status
   anet status                   Network overview (agents + tasks)
@@ -6403,6 +6474,7 @@ function createRuntimeChoices() {
     { value: "codex-sdk", name: "codex-sdk — OpenAI Codex, 复用 `codex login` 登录态" },
     { value: "codex-app-server", name: "codex-cli — Codex 共存 TUI（人和 Agent 共用一个 thread）" },
     { value: "grok-build-acp", name: "grok-build-acp — Grok（推荐 / default：headless ACP）, 复用 `grok` CLI 登录态" },
+    { value: "antigravity-acp", name: "antigravity-acp — Google Antigravity（headless ACP）, 复用 `agy` 的 Google 登录态（版本钉 1.5.13）" },
     { value: "opencode-cli", name: "opencode-cli — 公版 OpenCode CLI, Anthropic/OpenAI preset (RFC-029)" },
     { value: "pi-cli", name: "pi-cli — pi coding agent (pi.dev), RPC mode, 自定义 provider（本地模型服务 / API key）(RFC-043)" },
     // Owner decision 2026-09-25: Grok co-presence is experimental — listed last,
@@ -6475,7 +6547,7 @@ async function createInteractiveCommand() {
 
 This wizard creates one agent node for this project:
   - node config: .anet/nodes/<node-name>/config.json
-  - runtime: claude-agent-sdk / claude-code-cli / codex-sdk / codex-app-server / grok-build-acp / grok-build-cli / opencode-cli / pi-cli
+  - runtime: claude-agent-sdk / claude-code-cli / codex-sdk / codex-app-server / grok-build-acp / grok-build-cli / opencode-cli / pi-cli / antigravity-acp
   - optional Telegram channel: text + images from an allowlist user
 `);
 
@@ -6525,6 +6597,9 @@ This wizard creates one agent node for this project:
     opts.runtime = pickedRuntime;
     console.log(`[anet] 请确保已安装并登录 Grok Build CLI: grok login`);
     if (pickedRuntime === "grok-build-cli") printGrokCopresenceWarning(id, undefined, "configured");
+  } else if (pickedRuntime === "antigravity-acp") {
+    opts.runtime = "antigravity-acp";
+    console.log(`[anet] 请确保已安装并登录 Antigravity CLI: agy acp --login（版本钉 1.5.13）`);
   } else if (pickedRuntime === "opencode-cli") {
     await configureOpencodeRuntime(opts, true);
   } else if (pickedRuntime === "pi-cli") {
@@ -6739,7 +6814,7 @@ async function createCommand(idOverride?: string) {
       console.error(`\n  ❌ --batch 与 --runtime 不能同用。`);
       console.error(`\n     --batch 多节点向导的运行时只能来自内置 vendor 预设`);
       console.error(`     (claude-agent-sdk / claude-code-cli / codex-sdk),它无法表达`);
-      console.error(`     opencode-cli、grok-build-acp、grok-build-cli、codex-app-server。`);
+      console.error(`     opencode-cli、grok-build-acp、grok-build-cli、codex-app-server、antigravity-acp。`);
       console.error(`\n     要指定这些运行时,去掉 --batch,按单节点创建:`);
       console.error(`       anet node create <name> --runtime <runtime>\n`);
       process.exit(1);
@@ -6751,7 +6826,7 @@ async function createCommand(idOverride?: string) {
   const id = idOverride || args[1];
   if (!id) return createInteractiveCommand();
   if (id.startsWith("--")) {
-    console.error("Usage: anet node create <node-name> [--runtime claude-agent-sdk|claude-code-cli|codex-sdk|codex-app-server|grok-build-acp|grok-build-cli|opencode-cli] [--model ...] [--tools ...]");
+    console.error("Usage: anet node create <node-name> [--runtime claude-agent-sdk|claude-code-cli|codex-sdk|codex-app-server|grok-build-acp|grok-build-cli|opencode-cli|antigravity-acp] [--model ...] [--tools ...]");
     console.error("Or run fully interactive: anet node create");
     process.exit(1);
   }
@@ -6848,6 +6923,8 @@ async function createCommand(idOverride?: string) {
       const requestedTools = opts.tools ? parseAndValidateTools(opts.tools, "grok-build-cli") : undefined;
       printGrokCopresenceWarning(id, requestedTools, "configured");
     }
+  } else if (opts.runtime === "antigravity-acp") {
+    console.log("[anet] 请确保已安装并登录 Antigravity CLI: agy acp --login（版本钉 1.5.13，不跟随自动升级）");
   } else if (opts.runtime === "opencode-cli") {
     await configureOpencodeRuntime(opts, Boolean(process.stdin.isTTY));
   } else if (opts.runtime === "pi-cli") {
@@ -7821,6 +7898,15 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
     // `anet init project` can write non-JSON-RPC bytes to stdout, surfacing
     // as Grok's `serde error expected value at line 1 column 2`. Cheap
     // (read+write a few KB) and only fires for these three runtimes.
+    //
+    // 2026-11-20 (通信欧 review on #3677) — antigravity-acp 复用 grok-build-acp
+    // 的 ACP 回合实现，但**不需要**这条刷新：agent-node/src/runtime/grok-build-acp/
+    // runtime.ts 里 preview.6 起首选 Http 变体（正是为了躲开 bun/node-server.js/
+    // framing 这串坑），运行期根本不 spawn 这个文件；agy 走同一套。这条历史防御
+    // 只对应「命令行走 stdio 的旧 grok 配置」。加了也只是多写一份没人读的文件，
+    // 反而让人以为它被用到。往后新增的 runtime 别再按名字往这里加——这个"按
+    // runtime 名列举"的模式本身就是这次漏项的根源，更准确的判据应该是"这个节点
+    // 的 channels 配置是否真的走 stdio"，不是"runtime 叫什么名字"（见 #3677 讨论）。
     if (runtime === "grok-build-acp") {
       try {
         const anetDir = join(process.cwd(), ".anet");
@@ -7961,7 +8047,9 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
       cmd = process.execPath;
       commandArgs = [sibling.entrypoint, ...agentArgs];
       console.log(`[anet] using the agent-node installed beside anet (${sibling.version ?? "version unknown"}): ${sibling.entrypoint}`);
-    } else try { execSync(process.platform === "win32" ? "where agent-node" : "which agent-node", { stdio: "pipe" }); } catch {
+    } else if (process.platform === "win32") {
+      throw new Error("Native Windows SDK nodes require the paired agent-node installed beside anet; PATH shims and automatic npx installation are not used.");
+    } else try { execSync("which agent-node", { stdio: "pipe" }); } catch {
       cmd = "npx";
       commandArgs = ["-y", "@sleep2agi/agent-node@preview", ...agentArgs];
     }
@@ -7994,6 +8082,10 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
       childEnv.ANET_CONFIG_UPDATE_CAPABLE = "0";
     }
 
+    // 2026-11-10 —— 让子进程如实知道「起它的是哪个 anet CLI」（见 launchedByCliVersionEnv）。
+    // 只写在这里（childEnv = 真实启动环境），不写进 AgentNodeLaunchPlan.probeEnv。
+    Object.assign(childEnv, launchedByCliVersionEnv());
+
     // #1353 —— 把 daemon 的 anet 二进制 pin 传给子进程。
     //
     // 🔴 这是我 #1299 那次改动的一个错误假设的修正。当时我在 `prepareDaemonAnetBin()`
@@ -8025,23 +8117,30 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
     let activeAgentChild: ReturnType<typeof spawn> | null = null;
     let parentShuttingDown = false;
     let childKillTimer: ReturnType<typeof setTimeout> | null = null;
+    const ownsAgentChild = runtime === "opencode-cli" || process.platform === "win32";
 
-    // The foreground anet process owns the supervised OpenCode child. Keep
-    // this handler OpenCode-only: generic Windows runtimes launch through a
-    // cmd.exe wrapper (`shell:true`) and must retain main's already-vetted
-    // process lifecycle until a process-tree-aware Windows gate exists.
+    // The foreground wrapper owns the supervised OpenCode/Windows SDK child.
+    // Windows SDK now launches private Node directly, not a shell wrapper.
+    // Other POSIX runtimes retain their existing supervision behavior.
     const forwardAgentSignal = (signal: NodeJS.Signals) => {
       if (parentShuttingDown) return;
       parentShuttingDown = true;
-      try { activeAgentChild?.kill(signal); } catch {}
+      try {
+        if (process.platform === "win32") {
+          if (activeAgentChild?.pid) taskkillWindowsProcessTree(activeAgentChild.pid);
+        } else activeAgentChild?.kill(signal);
+      } catch {}
       childKillTimer = setTimeout(() => {
-        try { activeAgentChild?.kill("SIGKILL"); } catch {}
+        try {
+          if (process.platform === "win32") activeAgentChild?.kill();
+          else activeAgentChild?.kill("SIGKILL");
+        } catch {}
       }, 5_000);
       childKillTimer.unref?.();
     };
     const onAgentSigint = () => forwardAgentSignal("SIGINT");
     const onAgentSigterm = () => forwardAgentSignal("SIGTERM");
-    if (runtime === "opencode-cli") {
+    if (ownsAgentChild) {
       process.once("SIGINT", onAgentSigint);
       process.once("SIGTERM", onAgentSigterm);
     }
@@ -8080,9 +8179,9 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
         const child = await spawnOwnedNodeChild(nodeId, launchGeneration, () => spawn(runCommand, runCommandArgs, {
           env: childEnv,
           stdio: "inherit",
-          shell: standaloneNow() ? false : runtime === "opencode-cli" ? false : process.platform === "win32",
+          shell: standaloneNow() || runCommand === process.execPath || runtime === "opencode-cli" ? false : process.platform === "win32",
         }));
-        if (runtime === "opencode-cli") activeAgentChild = child;
+        if (ownsAgentChild) activeAgentChild = child;
         if (child.pid) writeFileSync(pidFile, String(child.pid));
         if (expectedCodexHome && child.pid) {
           const verdict = verifyProcessTreeCodexHome({ rootPid: child.pid, expected: expectedCodexHome, label: "agent-node" });
@@ -8113,7 +8212,7 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
           },
         );
         clearTimeout(stableTimer);
-        if (runtime === "opencode-cli" && activeAgentChild === child) {
+        if (ownsAgentChild && activeAgentChild === child) {
           activeAgentChild = null;
         }
 
@@ -8140,7 +8239,7 @@ async function launchAgent(id: string, forceNewSession = false, hubOverride?: st
       },
     });
     if (childKillTimer) clearTimeout(childKillTimer);
-    if (runtime === "opencode-cli") {
+    if (ownsAgentChild) {
       process.off("SIGINT", onAgentSigint);
       process.off("SIGTERM", onAgentSigterm);
     }
@@ -8569,7 +8668,7 @@ async function spawnOwnedNodeChild<T extends ReturnType<typeof spawn>>(nodeId: s
     let birth = processBirth(child.pid);
     for (let i = 0; !birth && i < 10; i++) { await new Promise(r => setTimeout(r, 10)); birth = processBirth(child.pid); }
     if (!birth) {
-      try { child.kill("SIGKILL"); } catch {}
+      try { child.kill(process.platform === "win32" ? undefined : "SIGKILL"); } catch {}
       throw new Error(`NODE_CHILD_BIRTH_UNAVAILABLE: pid=${child.pid}`);
     }
     writeLifecycleOwner(nodeId, { ...owner, processes: [...(owner.processes || []), { pid: child.pid, birth, role: "agent" }] });
@@ -8948,9 +9047,70 @@ async function startCommand() {
   // already use. Resolve first so the profile can answer the question too.
   const copresenceFlagPassed = opts.copresence === "true";
   const resolvedForCopresence = resolveNodeRef(id);
+  if (process.platform === "win32" && resolvedForCopresence && (
+    !windowsRuntimeSupported(resolvedForCopresence.profile.runtime || "claude-agent-sdk") ||
+    opts.tmux === "true" || opts["accept-dev-channels"] === "true" || copresenceFlagPassed ||
+    resolvedForCopresence.profile.codexCopresence === true || resolvedForCopresence.profile.grokCopresence === true
+  )) {
+    throw new Error("Native Windows supports claude-agent-sdk by default; terminal, tmux and co-presence runtimes are unavailable. ACP stdio runtimes (antigravity-acp) can be enabled for evaluation with ANET_ALLOW_ACP_WINDOWS=1 (Windows-native first-reply + stop not yet verified).");
+  }
+  // #1353: pin before ANY spawn below (incl. the source-resume branch), since children copy process.env at spawn.
+  if (resolvedForCopresence) pinDaemonAnetBinForNodeStart(id, (resolvedForCopresence.profile as any)?.role);
+  // Private source delivery never enters ordinary orchestration (which replaces
+  // alias tmux sessions) or the restart supervisor. No public dispatch enables it.
+  if ((resolvedForCopresence?.profile as any)?.sourceDelivery !== undefined) {
+    const configPath = join(nodesDir(), resolvedForCopresence!.id, "config.json");
+    // A profile that requests source delivery always has a private config.json;
+    // a missing file is a refusal for this route, never a fallback to defaults.
+    const rawProfile = readOpencodePrivateProfileFile(dirname(configPath), "config.json");
+    if (rawProfile === undefined) throw Error("source_resume_cli_refused");
+    const p = JSON.parse(rawProfile);
+    const nonce = process.env.ANET_SOURCE_RESUME_NONCE;
+    // Route only: profile data is NOT authority. The source launcher and actual
+    // runtime independently re-read operator policy/registry + OS/native identity.
+    const sharedTest = p.sourceDelivery?.expected_version === "2.0.22-anet-test.29040e2" && !!p.sharedVariantAuthority;
+    if (process.env.ANET_SOURCE_RESUME_CONFIG !== configPath || !nonce || !/^[a-f0-9-]{36}$/.test(nonce)
+      || Object.keys(opts).some(k => k !== "_channels" && k !== "_envs") || opts._channels.length || opts._envs.length
+      || forceNewSession || p.runtime !== "opencode-cli" || p.opencodeGeneration !== "v2"
+      || p.sourceDelivery?.resume_only !== true || (p.sourceDelivery.expected_version !== "2.0.22" && !sharedTest)
+      || Date.now() >= p.sourceDelivery.expires_at || !/^ses_[A-Za-z0-9]+$/.test(p.sessionId)
+      || liveNodePidFromPidfile(resolvedForCopresence!.id) !== null) throw Error("source_resume_cli_refused");
+    checkRuntimeDependency("opencode-cli", "start");
+    if (p.flags?.opencodeUnsafeTools !== true) throw Error("source_resume_existing_policy_opt_in_required");
+    const checked = sharedTest ? (() => {
+      const binary = "/tmp/opencode/anet-4099-test-only-29040e2/cli/cli-linux-x64/bin/opencode";
+      if (process.platform !== "linux" || realpathSync(binary) !== binary
+        || createHash("sha256").update(readFileSync(binary)).digest("hex") !== "1cf5fcccf345438316db82d4c63c5df5f5010cc94a8465e1a119f9639c53c786"
+        || !/^(?:opencode v)?2\.0\.22-anet-test\.29040e2$/.test(execFileSync(binary, ["--version"], { encoding: "utf8", timeout: 5000 }).trim())) throw Error("source_resume_cli_version_refused");
+      return { ok: true, binary, version: "2.0.22-anet-test.29040e2" };
+    })() : checkOpencodeGenerationBinary("v2");
+    if (!checked.ok || checked.version !== p.sourceDelivery.expected_version) throw Error("source_resume_cli_version_refused");
+    opencodeLaunchIdentity = { binary: checked.binary, version: checked.version };
+    const plan = resolveOpencodeAgentNodeLaunchPlan();
+    const sourceHelp = execFileSync(plan.command, [...plan.argsPrefix, "--help"], {
+      env: plan.probeEnv, timeout: 5000, maxBuffer: 131072, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (!sourceHelp.includes("ANET_CAPABILITY_SOURCE_RESUME_V1")) throw Error("source_resume_runtime_capability_required");
+    const env = { ...hardenOpencodeAgentNodeEnv(process.env, process.env.PATH),
+      ANET_OPENCODE_BIN: opencodeLaunchIdentity.binary, ANET_OPENCODE_VERSION: checked.version,
+      ANET_OPENCODE_MODE: "copresence", ANET_CONFIG_UPDATE_CAPABLE: "0",
+      ...launchedByCliVersionEnv(), // 2026-11-10 —— 这条私有 route 也是 CLI 起 agent-node
+      ANET_SOURCE_RESUME_NONCE: nonce, ANET_SOURCE_RESUME_CONFIG: configPath };
+    const child = spawn(plan.command, [...plan.argsPrefix, "--config", configPath,
+      "--alias", p.alias, "--runtime", "opencode-cli", "--session", p.sessionId],
+      { cwd: process.cwd(), env, stdio: "inherit", shell: false });
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const stop = () => { child.kill("SIGTERM"); killTimer ??= setTimeout(() => child.kill("SIGKILL"), 1000); };
+    process.on("SIGTERM", stop); process.on("SIGINT", stop);
+    const code = await new Promise<number>(resolve => {
+      child.once("error", () => resolve(1)); child.once("exit", code => resolve(code ?? 1));
+    });
+    process.removeListener("SIGTERM", stop); process.removeListener("SIGINT", stop);
+    if (killTimer) clearTimeout(killTimer);
+    process.exit(code); // one generation only, including exit 75
+  }
   // #1353 —— daemon 被 `node start` / `project up`(开机 sweep)/ `node restart` 拉起时,
   //         pin 与 `anet daemon start` 同源同规则,不再在这些起法下丢失。
-  if (resolvedForCopresence) pinDaemonAnetBinForNodeStart(id, (resolvedForCopresence.profile as any)?.role);
   // #630 — external app-server codex node (three tmux sessions on the URL in config.json).
   {
     const rc = await maybeExternalAppserverLifecycle("start");
@@ -11538,11 +11698,6 @@ const DAEMON_DEFAULT_NAME = "daemon";
 let daemonAnetBinPrepared = false;
 
 function prepareDaemonAnetBin(): void {
-  if (process.platform === "win32") {
-    console.error("[anet daemon] Windows is not supported for host_supervisor daemon mode yet.");
-    console.error("[anet daemon] The daemon binary safety checks and child process model are POSIX-only; run this on Linux/macOS or WSL.");
-    process.exit(1);
-  }
   // #1353 —— 解析与校验搬到 src/daemon-anet-bin.ts,`anet node start <daemon>` 共用同一份。
   const check = checkDaemonAnetBin({ envBin: process.env.ANET_BIN_ABS, argv1: process.argv[1] });
   if (!check.ok) {
@@ -11563,7 +11718,6 @@ function prepareDaemonAnetBin(): void {
  *  由 agent-node 把 can_create_nodes=false 报给 hub(#1371/#1510),这里只给一行修法。 */
 function pinDaemonAnetBinForNodeStart(alias: string, role: string | undefined): void {
   if (!shouldPinDaemonOnNodeStart({ role, alreadyPrepared: daemonAnetBinPrepared })) return;
-  if (process.platform === "win32") return;
   const check = checkDaemonAnetBin({ envBin: process.env.ANET_BIN_ABS, argv1: process.argv[1] });
   if (!check.ok) {
     console.error(`[anet daemon] #1353 "${alias}" is a daemon but its anet binary pin did not verify; starting it anyway — it will report "cannot create nodes" to the hub until fixed:`);
@@ -11768,7 +11922,7 @@ async function daemonInitCommand() {
     // #1298 — 引用 canonical 集合，不再手写。这里曾经是硬编码的三元组，
     // 于是 grok-build-cli / codex-app-server / opencode-cli 三个共存 runtime
     // 永远不会出现在 daemon 的能力声明里，hub 据此把 create_node 拒掉。
-    runtimes_supported: [...SUPPORTED_RUNTIME_NAMES],
+    runtimes_supported: SUPPORTED_RUNTIME_NAMES.filter(runtime => windowsRuntimeSupported(runtime)),
     allowed_secret_keys: allowedSecretKeys,
     max_concurrent_children: 20,
     channels: [],
@@ -13352,6 +13506,8 @@ Stop a running agent node.
  * proven stopped is never deleted.
  */
 async function stopResolvedNode(resolved: { id: string; profile: Profile }, stopInvokedAt: number = Date.now()) {
+  const windowsSdkStop = process.platform === "win32" && resolved.profile.runtime === "claude-agent-sdk";
+  if (windowsSdkStop) console.log("[anet] Windows SDK stop: acquiring lifecycle lock");
   const displayName = nodeDisplayName(resolved.id, resolved.profile);
   const borrowedHostSelected = hasBorrowedV1Intent(join(nodesDir(),resolved.id),resolved.profile);
   let stopGeneration = "";
@@ -13359,8 +13515,12 @@ async function stopResolvedNode(resolved: { id: string; profile: Profile }, stop
   try {
     await withLifecycleLock(resolved.id, () => {
       const prior = readLifecycleOwner(resolved.id);
+      if (windowsSdkStop) console.log(`[anet] Windows SDK stop: receipt=${prior ? prior.state : "missing"}, identities=${prior?.processes?.length ?? 0}`);
       stopGeneration = prior?.generation || randomUUID();
       let roots = prior?.processes || [];
+      if (process.platform === "win32" && resolved.profile.runtime === "claude-agent-sdk" && !prior) {
+        throw new Error("WINDOWS_SDK_OWNER_RECEIPT_REQUIRED; refusing alias/PID-only discovery");
+      }
       // 🔴 这一条与下面 alias-fallback 支里的 NODE_OWNER_BIRTH_UNAVAILABLE 是**两件事**,
       // 原先共用同一句错误 —— 于是 CI 上只看错误文本分不出是哪一种,#1422 的定位
       // 因此走过弯路。两者的成因完全不同:
@@ -13377,25 +13537,21 @@ async function stopResolvedNode(resolved: { id: string; profile: Profile }, stop
       // while holding stop-intent, then freeze exact identities. Reaping never
       // rescans by alias, so a later same-name generation cannot be adopted.
       if (roots.length === 0) {
-        if (borrowedHostSelected) throw new Error("BORROWED_V1_STOP_OWNER_UNAVAILABLE; no alias or Host/TUI adoption");
-        // #1438 — findNodeStopCandidates captures (pid, discoveredBirth) in
-        // ONE `ps` snapshot; the (pid, birth) pair has no TOCTOU window
-        // between the two fields. resolveOwnedRoots then verifies via
-        // currentBirthSignature that the pid we're about to freeze still
-        // belongs to the SAME incarnation — if it was recycled to another
-        // process B between discovery and here, the mismatch check rejects
-        // pid so reap does not kill B.
-        const legacy = findNodeStopCandidates(displayName);
-        if (legacy === null) throw new Error("NODE_PROCESS_TABLE_UNAVAILABLE");
-        // #1422 (window with /proc read collapsing to no-op) is orthogonal:
-        // if pid vanished cleanly between discovery and here, that's the
-        // stop-outcome we wanted. probes.vanished (ESRCH-based) still
-        // handles that path.
-        roots = resolveOwnedRoots(legacy, {
-          birth: processBirth,
-          vanished: (pid) => processVanished(pid),
-          currentBirthSignature: probeCurrentBirthSignature,
-        });
+        if (process.platform === "win32" && resolved.profile.runtime === "claude-agent-sdk") {
+          if (prior?.state !== "stopped") throw new Error("WINDOWS_SDK_OWNER_IDENTITIES_REQUIRED");
+        } else {
+          if (borrowedHostSelected) throw new Error("BORROWED_V1_STOP_OWNER_UNAVAILABLE; no alias or Host/TUI adoption");
+          // #1438 — capture pid + birth together; revalidate the incarnation
+          // before authorizing any termination. Never discover Windows SDK
+          // nodes by alias, even if the persisted receipt is missing.
+          const legacy = findNodeStopCandidates(displayName);
+          if (legacy === null) throw new Error("NODE_PROCESS_TABLE_UNAVAILABLE");
+          roots = resolveOwnedRoots(legacy, {
+            birth: processBirth,
+            vanished: (pid) => processVanished(pid),
+            currentBirthSignature: probeCurrentBirthSignature,
+          });
+        }
       }
       stopProcesses = snapshotOwnedProcessTree(roots);
       writeLifecycleOwner(resolved.id, {
@@ -13410,6 +13566,30 @@ async function stopResolvedNode(resolved: { id: string; profile: Profile }, stop
     process.exit(1);
   }
   if (process.platform === "win32") {
+    if (resolved.profile.runtime === "claude-agent-sdk") {
+      console.log(`[anet] Windows SDK stop: native tree verification begins (roots=${stopProcesses.length})`);
+      const onProgress = (stage: string) => console.log(`[anet] Windows SDK stop: ${stage}`);
+      const session = await openWindowsSdkEvidenceSession({ onProgress });
+      let stop;
+      try {
+        stop = await orchestrateWindowsManagedStopAsync(stopProcesses.map(identity => ({
+          role: identity.role, pid: identity.pid, creationDate: identity.birth,
+        })), { ...session.deps, onProgress });
+      } finally { session.close(); }
+      for (const diagnostic of stop.verdict.retainedDiagnostics) console.warn(`[anet] ${diagnostic}`);
+      if (stop.verdict.kind !== "stopped") {
+        console.error(`[anet] WINDOWS_SDK_STOP_UNPROVEN: ${stop.verdict.kind}; lifecycle receipt kept, hub not notified offline`);
+        process.exit(1);
+      }
+      await withLifecycleLock(resolved.id, () => writeLifecycleOwner(resolved.id, {
+        ...(readLifecycleOwner(resolved.id) || { schema: 1 }), schema: 1, state: "stopped", stopInvokedAt,
+        processes: [],
+      }));
+      rmSync(join(nodesDir(), resolved.id, ".pid"), { force: true });
+      await notifyServerOffline(resolved.profile, resolved.id);
+      console.log(`[anet] Stopped "${displayName}" (Windows SDK owned process tree)`);
+      return;
+    }
     let record;
     try { record = readWindowsCopresenceRecord(nodesDir(), resolved.id); }
     catch (e) {
@@ -15038,7 +15218,8 @@ async function opencodeBorrowedAttachCommand(ref?: string) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("borrowed V1 TUI requires an interactive terminal");
   const child=spawn(plan.command,[...plan.argsPrefix,"--opencode-borrowed-attach",cfg],{
     cwd:process.cwd(),stdio:"inherit",env:{...hardenOpencodeAgentNodeEnv(process.env,process.env.PATH),
-      ANET_OPENCODE_BIN:opencodeLaunchIdentity!.binary,ANET_OPENCODE_VERSION:opencodeLaunchIdentity!.version},
+      ANET_OPENCODE_BIN:opencodeLaunchIdentity!.binary,ANET_OPENCODE_VERSION:opencodeLaunchIdentity!.version,
+      ...launchedByCliVersionEnv()}, // 2026-11-10 —— 这条 attach 也是 CLI 起 agent-node
   });
   const stop=()=>{try{child.kill("SIGTERM");}catch{}};
   const signals=["SIGINT","SIGTERM","SIGHUP"] as const;
@@ -15496,6 +15677,31 @@ async function smokeOpencodeAcp(
     };
   }
   return result;
+}
+
+/**
+ * `anet pair` —— 精确配对的唯一答案。
+ *
+ * opencode-cli 这条路径**禁用了自动 npx**，目标机上必须有精确版本的全局 agent-node；
+ * 而两个包的 preview tag 是**先后**移动的（node 先发、声明它的 CLI 后发），
+ * 所以 `@preview` 在窗口期里不自洽。把本包里的常量打印出来，是唯一不用猜的答案 ——
+ * 客户端和文档都应当显示这条命令，而不是自己拼版本号。
+ */
+function pairCommand(): void {
+  // 2026-11-22（负责人）—— npm 的 EBADENGINE 是裸警告，用户看不懂后果；
+  // 这里补一行说人话的提示，**不阻断**任何操作。
+  const nodeWarning = nodeEngineWarning();
+  if (process.argv.includes("--json")) {
+    console.log(JSON.stringify({
+      cli: `@sleep2agi/agent-network@${PAIRED_AGENT_NETWORK_VERSION}`,
+      agentNode: `@sleep2agi/agent-node@${PAIRED_AGENT_NODE_VERSION}`,
+      install: opencodeExactPairInstallCommand(),
+      nodeEngineWarning: nodeWarning,
+    }, null, 2));
+    return;
+  }
+  // 警告由 anet.cjs 启动层统一打印（避免同一条提示出现两次）；--json 仍带字段。
+  console.log(pairInfo());
 }
 
 async function upgradeCommand() {
@@ -20172,6 +20378,7 @@ switch (command) {
       case "edit": args.splice(0, 1); await nodeEditCommand(); break;
       case "loop": args.splice(0, 1); await nodeLoopCommand(); break;
       case "secret": await nodeSecretCommand(args.slice(2)); break;
+      case "perm": await nodePermCommand(args.slice(2)); break;
       case "ls": case "list": await lsCommand(); break;
       case "restart": {
         // #173 / F7-03 — node restart = stop + start, alias for symmetry
@@ -20196,7 +20403,7 @@ switch (command) {
       case "codex": args.splice(0, 1); await codexLifecycleCommand(); break; // #1856 —— Codex TUI 共存节点生命周期控制器
       default: {
         const sub = args[1];
-        const nodeUsage = `Usage: anet node <create|clone|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|secret|migrate-token-to-envref> [name]`;
+        const nodeUsage = `Usage: anet node <create|clone|start|stop|restart|resume|delete|ls|rename|edit|loop|codex|secret|perm|migrate-token-to-envref> [name]`;
         // #561 — bare `anet node`: a menu for every runtime (TTY) / table + cheat sheet + usage (piped). src/node-menu.ts
         if (!sub) process.exit(await runNodeMenu(listProfileIds().map((id) => { const p = loadProfile(id); return { id, alias: nodeDisplayName(id, p), profile: p as Record<string, any> | null }; }), { nodesDir: nodesDir(), home, usageLine: nodeUsage }));
         if (sub) {
@@ -20204,7 +20411,7 @@ switch (command) {
           const redirect = nodeSubcommandRedirect(sub, args[2]);
           if (redirect) { for (const line of redirect) console.log(line); }
           else {
-            const suggestion = suggestSimilar(sub, ["create", "clone", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop", "codex", "secret"]);
+            const suggestion = suggestSimilar(sub, ["create", "clone", "start", "stop", "restart", "resume", "delete", "ls", "rename", "edit", "loop", "codex", "secret", "perm"]);
             if (suggestion) console.log(`Unknown node subcommand "${sub}". Did you mean: anet node ${suggestion}?`);
           }
         }
@@ -20227,6 +20434,7 @@ switch (command) {
   case "channel": await channelCommand(); break;
   case "setup": await setupCommand(); break;
   case "upgrade": await upgradeCommand(); break;
+  case "pair": pairCommand(); break; // 精确配对的唯一答案：打印本包常量生成的安装命令
   case "session": sessionCommand(); break;
   case "skill": await skillCommand(); break;
   case "ls": case "list": await lsCommand(); break;
@@ -20282,7 +20490,7 @@ switch (command) {
         "activate", "passwd", "token", "demo", "batch", "logs", "info", "config",
         "login", "register", "logout", "whoami", "network", "run", "version", "help",
         // 这四个是后加的顶层命令,曾长期漏在本名单外 —— 见 top-commands-coverage.test.ts。
-        "daemon", "grok", "opencode", "quickstart",
+        "daemon", "grok", "opencode", "quickstart", "pair",
       ];
       const suggestion = suggestSimilar(command, TOP_COMMANDS);
       if (suggestion) console.error(`Unknown command "${command}". Did you mean: anet ${suggestion}?`);

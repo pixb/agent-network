@@ -6,10 +6,12 @@ import { sessionTaskOnDispatch } from "./session-task-on-dispatch.js";
 import { TASK_CONTENT_MAX, sessionTaskPreview } from "./shared/task-content-limit.js";
 import { assertNodeActive } from "./lifecycle-guard.js";
 import { assertNodeHealthy } from "./node-health-guard.js";
+import { neverConsumeGate, neverConsumedExpiryCounters, persistentNeverConsumedExpiries } from "./expiry-counters.js";
+import { db as hubDb } from "./db.js";
 import { nodeCanAcceptDispatch } from "./node-serviceability.js";
 import { addNetworkScope, canRestWriteNetwork, singleNetworkId, type RestNetworkScope } from "./network-scope.js";
 import { canMessageAgent, type AgentRef } from "./agent-access.js";
-import { dispatchVerdict } from "./node-permissions.js";
+import { dispatchVerdict, inboxDenied, type InboxSender } from "./node-permissions.js";
 import { hasSubscribers, pushEvent, pushNetworkObserverEvent } from "./push.js";
 import { SCHEDULED_TASK_STORAGE_SELECT } from "./rest-projections.js";
 import { blockerTimedOut, blockerTimeoutClock, expireStuckBlocker, sendStuckNotice, skipsBlockedBy, stuckNoticeSkips, stuckTimeoutMs, type StuckNotice } from "./scheduled-stuck.js";
@@ -263,6 +265,15 @@ export function insertSchedule(networkId: string, createdBy: string | null, crea
 }
 
 /** Idempotent cancel (shared by REST DELETE / POST cancel and MCP schedule_cancel). */
+/** 真删一条已停下的计划（见 purge 路由）。三张表一个事务。 */
+export function purgeSchedule(scheduleId: string): void {
+  db.transaction(() => {
+    db.run("DELETE FROM scheduled_task_watchers WHERE schedule_id = ?1", [scheduleId]);
+    db.run("DELETE FROM scheduled_task_runs WHERE schedule_id = ?1", [scheduleId]);
+    db.run("DELETE FROM scheduled_tasks WHERE schedule_id = ?1", [scheduleId]);
+  });
+}
+
 export function cancelSchedule(row: ScheduledRow): void {
   if (row.status === "cancelled") return;
   db.run("UPDATE scheduled_tasks SET status = 'cancelled', next_run_at = NULL, backoff_streak = 0, backoff_effective_seconds = NULL, backoff_last_run_id = NULL, revision = revision + 1, updated_at = datetime('now') WHERE schedule_id = ?1", [row.schedule_id]);
@@ -401,6 +412,22 @@ function agentCreatorDenial(row: ScheduledRow, target: AgentRef): { code: string
   }, target);
   if (verdict) return { code: "creator_access_revoked", message: `The node that created this schedule may not send_task to this agent now (${verdict.reason})` };
   return null;
+}
+
+/** 目标节点的收件白名单每次触发都按「建排程的人 / 节点」现判一次（名单可能在排程建好之后才设）。 */
+function creatorInboxDenial(row: ScheduledRow, target: AgentRef): { code: string; message: string } | null {
+  let sender: InboxSender;
+  if (row.created_by_node_id) {
+    const alias = db.get<{ alias: string | null }>("SELECT alias FROM nodes WHERE node_id = ?1 AND network_id = ?2", row.created_by_node_id, row.network_id)?.alias;
+    sender = { kind: "node", nodeId: row.created_by_node_id, aliases: alias ? [alias] : [] };
+  } else if (row.created_by) {
+    const user = db.get<{ username: string | null; role: string | null }>("SELECT username, role FROM users WHERE user_id = ?1", row.created_by);
+    sender = { kind: "user", userId: row.created_by, username: user?.username ?? null, isHubAdmin: user?.role === "admin" };
+  } else {
+    sender = { kind: "legacy" };
+  }
+  const denial = inboxDenied(row.network_id, target, sender, "schedule:dispatch");
+  return denial ? { code: "sender_not_allowed", message: `The target agent's inbox allowlist does not accept the schedule creator (${denial.sender})` } : null;
 }
 
 type DispatchEvent = { alias: string; networkId: string; taskId: string; priority: string; state: "delivered" | "queued" };
@@ -574,11 +601,11 @@ export function dispatchScheduledOccurrence(row: ScheduledRow, scheduledFor: str
     // 给目标 Agent 发任务时,不再代他派发(否则受限前建的排程会永远绕过授权)。
     // Board #733 — an Agent-created schedule is that node's standing send_task: every run re-evaluates the
     // creating node as it is NOW (exists, not read-only, current owner) with send_task's own dispatchVerdict.
-    const creatorDenial = row.created_by_node_id
+    const creatorDenial = (row.created_by_node_id
       ? agentCreatorDenial(row, { alias: node.alias, nodeId: node.node_id })
       : row.created_by && !canMessageAgent(row.created_by, row.network_id, { alias: node.alias, nodeId: node.node_id })
         ? { code: "creator_access_revoked", message: "The schedule creator is no longer allowed to message this agent" }
-        : null;
+        : null) ?? creatorInboxDenial(row, { alias: node.alias, nodeId: node.node_id });
     if (creatorDenial) {
       finalStatus = "failed";
       db.run(
@@ -631,6 +658,29 @@ export function dispatchScheduledOccurrence(row: ScheduledRow, scheduledFor: str
       );
       if (advanceSchedule) advance(row, scheduledFor, advanceAfter);
       return;
+    }
+
+    // #4307/#4315 —— **排程派单也必须过这道闸**。
+    // 不然「某节点长期不消费」会被排程一遍遍喂任务：每一条都过期成 expired，
+    // 反过来把 never-consume 的计数顶得更高（实测 TMW微软欧 144/145 条 expired 全是
+    // 从未 consume 的排程任务）。REST 与 MCP 两个派单面本来就要同形，这里是第三个面。
+    // 判据完全相同：只看「最后一次成功回复之后」的过期；命中就 skip，不写任务行。
+    {
+      const gate = neverConsumeGate({
+        alias: node.alias,
+        counters: neverConsumedExpiryCounters(),
+        force: false,
+        forceAllowed: false,
+        persistent: persistentNeverConsumedExpiries(hubDb, node.alias, row.network_id),
+      });
+      if (!gate.ok) {
+        db.run(
+          "UPDATE scheduled_task_runs SET status = 'skipped', error_code = 'target_never_consumes', error_message = ?1, completed_at = datetime('now') WHERE run_id = ?2",
+          [gate.message.slice(0, 500), runId],
+        );
+        if (advanceSchedule) advance(row, scheduledFor, advanceAfter);
+        return;
+      }
     }
 
     const taskId = crypto.randomUUID();
@@ -904,7 +954,7 @@ export async function handleScheduledTaskRequest(ctx: ScheduledRequestContext): 
     }
   }
 
-  const match = url.pathname.match(/^\/api\/scheduled-tasks\/([^/]+)(?:\/(runs|run-now|cancel))?$/);
+  const match = url.pathname.match(/^\/api\/scheduled-tasks\/([^/]+)(?:\/(runs|run-now|cancel|purge))?$/);
   if (!match) return jsonError("not_found", 404);
   const scheduleId = decodeURIComponent(match[1]);
   const sub = match[2] || null;
@@ -919,7 +969,7 @@ export async function handleScheduledTaskRequest(ctx: ScheduledRequestContext): 
   const watcher = watchingSchedule(row.schedule_id, ctx.auth?.userId ?? null);
   const writer = writeAllowed(ctx, row.network_id);
   if (!writer && !watcher) return jsonError("permission_denied", 403);
-  if (!writer && (sub === "cancel" || (!sub && req.method === "DELETE"))) return jsonError("watcher_cannot_cancel", 403);
+  if (!writer && (sub === "cancel" || sub === "purge" || (!sub && req.method === "DELETE"))) return jsonError("watcher_cannot_cancel", 403);
   if (!writer && sub === "run-now") return jsonError("watcher_cannot_run", 403);
 
   if (sub === "run-now" && req.method === "POST") {
@@ -945,6 +995,16 @@ export async function handleScheduledTaskRequest(ctx: ScheduledRequestContext): 
   if ((!sub && req.method === "DELETE") || (sub === "cancel" && req.method === "POST")) {
     cancelSchedule(row);
     return Response.json({ ok: true, status: "cancelled" });
+  }
+
+  // Purge（admin 2026-11-11「没有删除定时任务的功能」）—— 真删：计划行 + 执行记录 + 关注人一起删掉，
+  // 列表里不再出现。只删已经停下的计划（cancelled / completed）；还在跑的先 cancel 再 purge，
+  // 避免一次误点把正在派发的计划连同历史一起抹掉。已派出去的 task 行不动（那是节点收件箱的历史）。
+  // 不存在 = 404（上面 scopedSchedule 已判）；重复 purge 的第二次也就是 404。
+  if (sub === "purge" && (req.method === "POST" || req.method === "DELETE")) {
+    if (row.status !== "cancelled" && row.status !== "completed") return jsonError("schedule_not_stopped", 409, { status: row.status });
+    purgeSchedule(row.schedule_id);
+    return Response.json({ ok: true, status: "purged", schedule_id: row.schedule_id });
   }
 
   if (!sub && req.method === "PATCH") {

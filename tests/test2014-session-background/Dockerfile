@@ -3,6 +3,9 @@ FROM oven/bun:1.3.14
 # 少这一行会让 ENV 展开成空串，fail-closed 断言就会误伤每一次构建。
 ARG TEST2014_SOURCE_COMMIT=dev
 WORKDIR /app
+COPY contracts /contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts //server/src/contracts
 COPY agent-node/src ./src
 COPY agent-node/package.json ./package.json
 RUN bun build ./src/runtime/opencode-copresence/v2-session.ts --target=node --packages=external --outdir /tmp/check-build

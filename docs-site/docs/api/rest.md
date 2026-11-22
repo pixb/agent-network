@@ -1,3 +1,7 @@
+---
+pageClass: api-reference
+---
+
 <script setup>
 // Old deep links (/api/rest#<anchor>) whose section moved to a sub-page when the
 // REST reference was split (docs slimming, 2026-09-25): forward them.
@@ -118,6 +122,12 @@ curl http://localhost:9200/health
 > [源码 ↗](https://github.com/sleep2agi/agent-network/blob/main/server/src/server.ts)
 
 注册新用户。第一个注册的用户自动成为管理员。
+
+Hub 设置 `COMMHUB_REGISTRATION=closed` 后不再接受新注册，返回 403 `registration_closed`；库里还没有用户时（装机注册第一个管理员）不受影响。不设则保持开放。
+
+注册和登录的按 IP 限速默认读 `X-Forwarded-For` 的最后一跳。Hub 前面有反向代理时，设置 `COMMHUB_TRUSTED_PROXY_IPS=<代理 IP,…>`：只有从这些地址连进来的请求，才采用它们带的转发头；直连 Hub 端口的请求按对端地址限速，伪造转发头绕不过限速。
+
+Hub 端口直接暴露在公网、又改不了云安全组时，可以设置 `COMMHUB_ALLOWED_PEER_IPS=<IP,…>`：只接受这些对端和本机回环（127.0.0.0/8、::1）的连接，其它来源一律返回 403 `peer_not_allowed`。不设则不限制。
 
 ```bash
 # v0.8+：注册不需要 master token，公开端点

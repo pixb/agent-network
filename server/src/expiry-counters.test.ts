@@ -69,7 +69,7 @@ describe("#3271 从未取走过的过期计数", () => {
 });
 
 // ---- 派单侧硬闸（#3271）----
-import { neverConsumeGate, NEVER_CONSUME_LIMIT, NEVER_CONSUME_STALE_MS } from "./expiry-counters.js";
+import { neverConsumeGate, NEVER_CONSUME_LIMIT, NEVER_CONSUME_STALE_MS, parseHubTime } from "./expiry-counters.js";
 
 describe("#3271 派单侧硬闸：从未取走过的目标", () => {
   const NOW = Date.parse("2026-10-31T10:00:00.000Z");
@@ -183,5 +183,105 @@ describe("#3271 硬闸的时效：只数不衰减会把恢复了的节点永久�
     const c = neverConsumedExpiryCounters();
     expect(c.last_at["ghost"]).toBe(new Date(NOW).toISOString());
     expect(c.by_node["ghost"]).toBe(1);
+  });
+});
+
+describe("2026-11-13 内存计数也以「最后一次回复」为界（恢复了的节点不该等 Hub 重启）", () => {
+  const NOW = Date.parse("2026-11-13T12:00:00.000Z");
+  const sqlite = (ms: number) => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+  const mem = (n: number, lastAtMs: number) => ({
+    since: "2026-11-13T00:00:00.000Z", total: n, by_node: { ghost: n }, last_at: { ghost: new Date(lastAtMs).toISOString() },
+  });
+
+  test("🔴 内存 5 次过期（20 分钟前），之后节点回复过（5 分钟前）⇒ 放行", () => {
+    const r = neverConsumeGate({
+      alias: "ghost", counters: mem(5, NOW - 20 * 60_000), force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 0, last_at: null, last_reply_at: sqlite(NOW - 5 * 60_000) },
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test("负数用例：回复早于最近一次内存过期 ⇒ 仍然拒（它恢复前那一下不算恢复）", () => {
+    const r = neverConsumeGate({
+      alias: "ghost", counters: mem(5, NOW - 5 * 60_000), force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 0, last_at: null, last_reply_at: sqlite(NOW - 20 * 60_000) },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("负数用例：从来没回复过 ⇒ 内存计数照常生效", () => {
+    const r = neverConsumeGate({
+      alias: "ghost", counters: mem(5, NOW - 5 * 60_000), force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 0, last_at: null, last_reply_at: null },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("回复之后 DB 里又攒了 ≥3 条过期 ⇒ 仍然拒（DB 证据自带边界，不受这条修正影响）", () => {
+    const r = neverConsumeGate({
+      alias: "ghost", counters: mem(5, NOW - 20 * 60_000), force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 3, last_at: sqlite(NOW - 60_000), last_reply_at: sqlite(NOW - 5 * 60_000) },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("parseHubTime：SQLite 时间按 UTC 解析，不随宿主时区漂 8 小时", () => {
+    expect(parseHubTime("2026-11-13 12:00:00")).toBe(NOW);
+    expect(parseHubTime("2026-11-13T12:00:00")).toBe(NOW);
+    expect(parseHubTime("2026-11-13T12:00:00.000Z")).toBe(NOW);
+    expect(parseHubTime("2026-11-13T20:00:00+08:00")).toBe(NOW);
+    expect(parseHubTime(null)).toBeNull();
+    expect(parseHubTime("garbage")).toBeNull();
+  });
+});
+
+describe("2026-11-16 内存计数只数「最后一次回复之后」的那几条（admin：TMA客户端欧 内存 4、回复后实际 2，仍被拒）", () => {
+  const NOW = Date.parse("2026-11-16T03:00:00.000Z");
+  const sqlite = (ms: number) => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const memAt = (times: number[]) => ({
+    since: "2026-11-15T13:17:00.000Z", total: times.length, by_node: { tma: times.length },
+    last_at: { tma: iso(times[times.length - 1]) }, recent_at: { tma: times.map(iso) },
+  });
+
+  test("🔴 回复前 3 次 + 回复后 1 次 ⇒ 只算 1 次，放行", () => {
+    const h = 60 * 60_000;
+    const r = neverConsumeGate({
+      alias: "tma", counters: memAt([NOW - 13 * h, NOW - 12 * h, NOW - 11 * h, NOW - 1 * h]), force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 1, last_at: sqlite(NOW - h), last_reply_at: sqlite(NOW - 2 * h) },
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test("负数用例：回复后又过期 3 次 ⇒ 仍然拒，拒绝体带 last_reply_at", () => {
+    const m = 60_000;
+    const r = neverConsumeGate({
+      alias: "tma", counters: memAt([NOW - 90 * m, NOW - 30 * m, NOW - 20 * m, NOW - 10 * m]), force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 0, last_at: null, last_reply_at: sqlite(NOW - 60 * m) },
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.expiries).toBe(3);
+      expect(r.last_reply_at).toBe(sqlite(NOW - 60 * m));
+    }
+  });
+
+  test("没有 recent_at（旧快照）⇒ 退回原来的整桶计数", () => {
+    const m = 60_000;
+    const r = neverConsumeGate({
+      alias: "tma", counters: { since: "x", total: 4, by_node: { tma: 4 }, last_at: { tma: iso(NOW - 10 * m) } }, force: false, forceAllowed: true, now: NOW,
+      persistent: { expiries: 0, last_at: null, last_reply_at: sqlite(NOW - 60 * m) },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("noteNeverConsumedExpiry 记下逐条时刻，最多 16 条", () => {
+    resetNeverConsumedExpiryCountersForTest(new Date(NOW));
+    for (let i = 0; i < 20; i++) noteNeverConsumedExpiry("tma", NOW + i * 1000);
+    const c = neverConsumedExpiryCounters();
+    expect(c.by_node.tma).toBe(20);
+    expect(c.recent_at?.tma.length).toBe(16);
+    expect(c.recent_at?.tma[15]).toBe(iso(NOW + 19 * 1000));
+    expect(c.last_at.tma).toBe(iso(NOW + 19 * 1000));
   });
 });

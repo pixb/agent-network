@@ -324,22 +324,23 @@ describe("validateRuntime — 报错要可操作", () => {
 
 // #1298 —— daemon 远程创建放开到 7 个 runtime（Vincent 2026-08-28 定，
 // 理由是兜底排错：节点不动了，人要能进去跟 Codex / Claude Code 对话）。
-// RFC-043 之后是 8 个（第 8 个是 pi-cli）。
-describe("#1298 RUNTIMES —— 八个都放行，且与 CLI 侧一致", () => {
+// RFC-043 加了第 8 个（pi-cli），上游又加了第 9 个（antigravity-acp）。
+describe("#1298 RUNTIMES —— 九个都放行，且与 CLI 侧一致", () => {
   test("三个共存 runtime 不再被拒", () => {
     for (const r of ["codex-app-server", "grok-build-cli", "opencode-cli"]) {
       expect(() => validateRuntime(r)).not.toThrow();
     }
   });
-  test("原有四个仍然放行（放开不该顺手改坏别的）", () => {
-    for (const r of ["claude-agent-sdk", "claude-code-cli", "codex-sdk", "grok-build-acp"]) {
+  test("原有五个仍然放行（放开不该顺手改坏别的）", () => {
+    for (const r of ["claude-agent-sdk", "claude-code-cli", "codex-sdk", "grok-build-acp", "antigravity-acp"]) {
       expect(() => validateRuntime(r)).not.toThrow();
     }
   });
-  test("🔴 恰好八个 —— 多一个少一个都要有人解释", () => {
-    // RFC-043 加了第 8 个 runtime `pi-cli`；八个之外再来一个必须有理由。
-    expect(RUNTIMES.length).toBe(8);
+  test("🔴 恰好九个 —— 多一个少一个都要有人解释", () => {
+    // RFC-043 加了第 8 个 runtime `pi-cli`；上游加了第 9 个 `antigravity-acp`。
+    expect(RUNTIMES.length).toBe(9);
     expect(RUNTIMES).toContain("pi-cli");
+    expect(RUNTIMES).toContain("antigravity-acp");
     // 正控：不在名单里的仍然被拒，证明上面不是"什么都放行"
     expect(() => validateRuntime("definitely-not-a-runtime")).toThrow();
     expect(() => validateRuntime("")).toThrow();

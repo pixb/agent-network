@@ -34,6 +34,10 @@
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { publishLaunchHealth, publishSharedLaunchHealth } from "./launcher-health";
+import { waitUntilIdle } from "../idle-wait";
+import { QUEUED_VARIANT_TTL_MS, shouldApplyQueuedVariant } from "./queued-variant";
+import { OPENCODE_V2_PIN } from "../opencode-versions";
+import { queueMissVerdict } from "./queue-miss-error";
 import { rmSync } from "fs";
 import { join } from "path";
 import {
@@ -55,6 +59,11 @@ import {
 } from "./runtime";
 import { unverifiedOwnerError } from "./reply-ownership";
 import { fetchOpenCodeSessionControlJson } from "./http";
+import { catalogAllowsSelection, catalogSupportsVariants, isWithinWorkspace, createV2SelectionController, equalV2ModelSelection, isV2SessionScope, readV2ModelSelection } from "./v2-model-selection";
+import { isOwnedTestBuild, observeSharedTestBuild, sharedVariantAuthorized } from "./v2-test-build-identity";
+import { forkV2Session } from "./v2-fork";
+import { resumeV2Session } from "./v2-resume";
+import { claimSharedSessionBridge } from "../source-resume-launcher";
 import { OpenCodeProviderError, openCodeTurnError } from "../opencode-provider-error";
 import {
   CAPACITY_RETRY_EXHAUSTED_TEXT,
@@ -75,6 +84,21 @@ const USERNAME = "opencode";
 const HISTORY_PAGE_LIMIT = 200;
 const HISTORY_MAX_PAGES = 25;
 const POLL_INTERVAL_MS = 250;
+/**
+ * History read timeout. `opencode serve` is single-threaded: while a turn runs a
+ * model/tool step, `GET …/message?limit=200` can take >10 s. The former fixed
+ * 10 s abort meant the bridge never saw the turn finish and the node stayed
+ * "working" with an empty output (TMA客户端欧 / TM测试基建欧, 2026-11-09).
+ * ANET_OPENCODE_HISTORY_TIMEOUT_MS overrides; clamped to 1 s–10 min.
+ */
+export function historyReadTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.ANET_OPENCODE_HISTORY_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 1_000 && raw <= 600_000 ? Math.trunc(raw) : 60_000;
+}
+/** Poll delay after `failures` consecutive history read failures: 250 ms, doubling, capped at 2 s. */
+export function historyPollDelayMs(failures: number): number {
+  return failures <= 0 ? POLL_INTERVAL_MS : Math.min(POLL_INTERVAL_MS * 2 ** Math.min(failures, 8), 2_000);
+}
 
 /**
  * #3071 —— 超时不等于结果丢失。
@@ -152,7 +176,25 @@ type LateReplyWatcherDeps = {
   log?: (message: string) => void;
   /** 测试缝：把「这一轮好了没」的判据换掉，避免测试去造真实的 history 形状。 */
   evaluate?: (after: OpenCodeV2Entry[]) => LateReplyVerdict;
+  /**
+   * Wedge breaker. When the window closes, our turn is still the live one and
+   * its history has not changed for `stallMs`, interrupt the session. Without
+   * it a tool call that never returns keeps the shared session "busy" forever
+   * and every later task times out behind it (seen on 通信欧: 11 h). Only our
+   * own, provably still-live turn qualifies: a pending verdict means no `idle`
+   * or later `user` entry closed it.
+   */
+  interruptStalled?: () => Promise<boolean>;
+  stallMs?: number;
+  now?: () => number;
 };
+
+/** A turn whose history has not moved for this long at window close is treated as wedged. */
+export const LATE_REPLY_STALL_MS = 30 * 60_000;
+
+function entriesSignature(after: readonly OpenCodeV2Entry[]): string {
+  return JSON.stringify(after.map((e: any) => [e?.id, e?.type, e?.finish, e?.outcome, JSON.stringify(e?.content ?? null).length]));
+}
 
 function evaluateLateReply(after: OpenCodeV2Entry[], turnId: string): LateReplyVerdict {
   const verdict = openCodeV2TurnVerdict(after);
@@ -166,15 +208,19 @@ function evaluateLateReply(after: OpenCodeV2Entry[], turnId: string): LateReplyV
 
 /** 超时之后继续盯着这一轮；结束时把结果交出去。返回一个可 await 的 promise（测试用）。 */
 export function watchLateReply(deps: LateReplyWatcherDeps): Promise<void> {
+  const now = deps.now ?? Date.now;
   const capMs = deps.capMs ?? LATE_REPLY_CAP_MS;
-  const deadline = Date.now() + capMs;
+  const stallMs = deps.stallMs ?? LATE_REPLY_STALL_MS;
+  const deadline = now() + capMs;
   let settled = false;
+  let lastSig: string | null = null;
+  let lastChangeAt = now();
   return (async () => {
     try { deps.onArmed?.(); } catch { /* 记录失败不影响观察 */ }
-    while (!settled && Date.now() < deadline) {
+    while (!settled && now() < deadline) {
       if (!deps.isRunning()) return;
       await (deps.sleep ? deps.sleep(POLL_INTERVAL_MS) : new Promise((r) => setTimeout(r, POLL_INTERVAL_MS)));
-      if (!deps.isRunning() || Date.now() >= deadline) break;
+      if (!deps.isRunning() || now() >= deadline) break;
       let after: OpenCodeV2Entry[] | null = null;
       try {
         after = await deps.readEntries();
@@ -183,6 +229,8 @@ export function watchLateReply(deps: LateReplyWatcherDeps): Promise<void> {
         continue;
       }
       if (!after) continue;
+      const sig = entriesSignature(after);
+      if (sig !== lastSig) { lastSig = sig; lastChangeAt = now(); }
       const verdict = (deps.evaluate ?? ((entries) => evaluateLateReply(entries, deps.turnId)))(after);
       if (verdict.state === "pending") continue;
       settled = true;
@@ -198,7 +246,15 @@ export function watchLateReply(deps: LateReplyWatcherDeps): Promise<void> {
       }
       return;
     }
-    if (!settled) deps.log?.(`[opencode-copresence] late-reply window closed (${Math.round(capMs / 60000)} min) without a result`);
+    if (settled) return;
+    deps.log?.(`[opencode-copresence] late-reply window closed (${Math.round(capMs / 60000)} min) without a result`);
+    // History never read ⇒ we cannot prove the live turn is ours: leave it.
+    if (!deps.interruptStalled || lastSig === null || !deps.isRunning()) return;
+    const stalledFor = now() - lastChangeAt;
+    if (stalledFor < stallMs) return;
+    let interrupted = false;
+    try { interrupted = await deps.interruptStalled(); } catch { interrupted = false; }
+    deps.log?.(`[opencode-copresence] our turn ${deps.turnId} made no progress for ${Math.round(stalledFor / 60000)} min after the late-reply window; session interrupt ${interrupted ? "succeeded" : "FAILED"}`);
   })();
 }
 
@@ -403,7 +459,7 @@ async function readEntriesAfter(
   const newerFirst: OpenCodeV2Entry[] = [];
   let path = `/api/session/${sessionId}/message?order=desc&limit=${HISTORY_PAGE_LIMIT}`;
   for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
-    const body = await fetchOpenCodeJson(url, password, path, {}, 10_000);
+    const body = await fetchOpenCodeJson(url, password, path, {}, historyReadTimeoutMs());
     const data: OpenCodeV2Entry[] = Array.isArray(body?.data) ? body.data : [];
     for (const entry of data) {
       if (entry?.id === messageId) return newerFirst.reverse();
@@ -469,22 +525,48 @@ export async function openVettedOpenCodeV2Copresence(
   let attachScriptWritten = false;
   let catalogEndpointWritten = false;
   let clearLaunchHealth = () => {};
+  let bridgeClaim: ReturnType<typeof claimSharedSessionBridge> | undefined;
   const clearCatalogEndpoint = () => {
     try { removeOpenCodeV2CatalogEndpoint(opts.workDir); } catch { /* already gone */ }
   };
   try {
     const { version, pid: serverPid } = await waitForV2Health(child, url, password, opts.startupTimeoutMs ?? 20_000);
-    if (!backend.isSupportedVersion(version) || (opts.expectedVersion && version !== opts.expectedVersion)) {
-      throw new Error(`OpenCode v2 server version ${version} does not match the accepted version`);
+    const ownedTestBuild = opts.env.ANET_VARIANT_TEST_ONLY === "1" && await isOwnedTestBuild({ version, serverPid, childPid: child?.pid });
+    const profile = opts.env.ANET_SHARED_VARIANT_PROFILE;
+    const sharedAuthorized = () => !!shared && typeof profile === "string" && profile === join(opts.workDir, "config.json")
+      && opts.env.ANET_VARIANT_TEST_ONLY === "1" && typeof opts.resumeSessionId === "string"
+      && sharedVariantAuthorized(profile, resolve(opts.cwd), url, password, opts.resumeSessionId, serverPid);
+    const sharedEvidence = sharedAuthorized() ? await observeSharedTestBuild(url, version) : undefined;
+    const sharedTestBuild = !!sharedEvidence && sharedEvidence.pid === serverPid;
+    const variantTestBuild = ownedTestBuild || sharedTestBuild;
+    const testIdentityCurrent = async () => {
+      try {
+        if (ownedTestBuild) return await isOwnedTestBuild({ version, serverPid, childPid: child?.pid });
+        if (!sharedTestBuild || !sharedAuthorized()) return false;
+        const info = await fetchOpenCodeJson(url, password, "/api/info", { redirect: "error" }, 3000);
+        if (info?.version !== version || info.pid !== serverPid) return false;
+        const current = await observeSharedTestBuild(url, version, sharedEvidence);
+        return !!current && JSON.stringify(current) === JSON.stringify(sharedEvidence);
+      } catch { return false; }
+    };
+    if ((!backend.isSupportedVersion(version) && !variantTestBuild) || (opts.expectedVersion && version !== opts.expectedVersion)) {
+      throw new Error(`OpenCode v2 server version ${version} does not match the accepted version ${opts.expectedVersion ?? OPENCODE_V2_PIN}; refusing model/depth fallback (do not replace a shared server automatically)`);
     }
+    if (sharedTestBuild && opts.reconcileResumedModel) throw Error("shared_variant_reconcile_refused");
     if (shared && opts.sharedMcpUrl) {
-      const sources = await fetchOpenCodeJson(url, password, "/api/config", {
-        headers: { "x-opencode-directory": resolve(opts.cwd) },
-      });
-      const project = Array.isArray(sources) ? sources.find((source) =>
-        source?.type === "document" && source.path === join(resolve(opts.cwd), "opencode.json")) : undefined;
-      if (project?.info?.mcp?.servers?.commhub?.url !== opts.sharedMcpUrl) {
-        throw new Error("OpenCode v2 shared server did not load this workspace's CommHub MCP");
+      // 共享 serve 对**见过的**目录按文件监听重载配置，有 3–10 秒延迟（vdev 2026-11-11 实测：
+      // 写完 opencode.json 立刻读仍是旧内容，10 秒后才出现）。每次启动 MCP 代理端口都会换，
+      // 所以同一目录第二次起节点时，一次性检查必然撞上旧端口 —— 改成在启动时限内轮询。
+      const deadline = Date.now() + (opts.startupTimeoutMs ?? 20_000);
+      for (;;) {
+        const sources = await fetchOpenCodeJson(url, password, "/api/config", {
+          headers: { "x-opencode-directory": resolve(opts.cwd) },
+        }).catch(() => undefined);
+        const project = Array.isArray(sources) ? sources.find((source) =>
+          source?.type === "document" && source.path === join(resolve(opts.cwd), "opencode.json")) : undefined;
+        if (project?.info?.mcp?.servers?.commhub?.url === opts.sharedMcpUrl) break;
+        if (Date.now() >= deadline) throw new Error("OpenCode v2 shared server did not load this workspace's CommHub MCP");
+        await new Promise((r) => setTimeout(r, 500));
       }
     }
     if (shared && opts.sharedMcpUrl) {
@@ -494,10 +576,14 @@ export async function openVettedOpenCodeV2Copresence(
         () => !child || (child.exitCode === null && child.signalCode === null));
     }
     let created: any;
-    if (shared && opts.resumeSessionId) {
-      if (!/^ses_[A-Za-z0-9]+$/.test(opts.resumeSessionId)) throw new Error("Invalid OpenCode v2 session id to resume");
+    const requestedResume = shared ? opts.resumeSessionId : undefined;
+    if (requestedResume !== undefined) {
+      if (!/^ses_[A-Za-z0-9]+$/.test(requestedResume)) throw new Error("Invalid OpenCode v2 session id to resume");
+      bridgeClaim = claimSharedSessionBridge({ project: resolve(opts.cwd), url, serverPid,
+        sessionId: requestedResume, workDir: opts.workDir, consume: true });
       try {
-        created = await fetchOpenCodeJson(url, password, `/api/session/${opts.resumeSessionId}`);
+        created = await resumeV2Session({ sessionId: requestedResume, directory: resolve(opts.cwd),
+          request: path => fetchOpenCodeJson(url, password, path) });
       } catch (error: any) {
         if (/returned HTTP 404$/.test(error?.message ?? "")) {
           throw new Error("OpenCode v2 session to resume was not found on the shared server; refusing to create a new session", { cause: error });
@@ -505,7 +591,7 @@ export async function openVettedOpenCodeV2Copresence(
         throw error;
       }
     }
-    if (!created) {
+    if (!created && requestedResume === undefined) {
       created = await fetchOpenCodeJson(url, password, "/api/session", {
         method: "POST",
         body: JSON.stringify({
@@ -517,9 +603,12 @@ export async function openVettedOpenCodeV2Copresence(
     }
     const sessionId = created?.data?.id;
     if (typeof sessionId !== "string" || !/^ses_[A-Za-z0-9]+$/.test(sessionId)) {
-      throw new Error("OpenCode v2 POST /api/session returned an invalid session id");
+      throw new Error(`OpenCode v2 ${requestedResume === undefined ? "POST /api/session" : "session resume response"} returned an invalid session id`);
     }
-    if (created?.data?.location?.directory !== resolve(opts.cwd)) {
+    if (requestedResume !== undefined && sessionId !== requestedResume) {
+      throw new Error("OpenCode v2 resumed session id does not match the requested session");
+    }
+    if (!isWithinWorkspace(created?.data?.location?.directory, resolve(opts.cwd))) {
       throw new Error("OpenCode v2 session directory does not match the node workspace");
     }
     const resumedModelDiffers = shared && opts.resumeSessionId &&
@@ -555,10 +644,119 @@ export async function openVettedOpenCodeV2Copresence(
     log(`[opencode-copresence] v2 ${shared ? "shared" : "private"} ready version=${version} session=${sessionId.slice(0, 12)} attach=${attachScriptPath}`);
     relaunchPreviousAttach(opts.workDir, attachScriptPath, { log, warn, respawn: opts.tmuxRespawn, tmux: opts.tmuxRunner });
 
+    const directory = resolve(opts.cwd);
+    const scopedRequest = (path: string, init: RequestInit = {}) => fetchOpenCodeJson(url, password, path, {
+      ...init, redirect: "error", headers: { "x-opencode-directory": directory },
+    }, 5_000);
+    // Neither the profile nor a cached capability is process attestation. Check
+    // the independent local policy + exact native/OS instance around each access.
+    const variantRequest = async (path: string, init: RequestInit = {}) => {
+      if (!session.isRunning || !await testIdentityCurrent()) throw Error("shared_variant_identity_refused");
+      if (sharedTestBuild && init.method === "POST") {
+        const before = await scopedRequest(`/api/session/${sessionId}`);
+        if (!isV2SessionScope(before, sessionId, directory) || !await testIdentityCurrent()) throw Error("shared_variant_session_refused");
+      }
+      const result = await scopedRequest(path, init);
+      if (!session.isRunning || !await testIdentityCurrent()) throw Error("shared_variant_identity_refused");
+      return result;
+    };
+    const readVariantSelection = async () => {
+      // `variantRequest` pins the TEST-BUILD identity (it throws on a stock server),
+      // so the capability readback must use the plain scoped request there. Without
+      // this split a stock node reports opencode_variant_config_capable=false even
+      // when the catalog exposes variants for the current model.
+      const read = variantTestBuild ? variantRequest : scopedRequest;
+      const body = await read(`/api/session/${sessionId}`);
+      if (!isV2SessionScope(body, sessionId, directory)) return undefined;
+      const explicit = readV2ModelSelection(body);
+      if (explicit) return explicit;
+      // An empty newly-created native Session legitimately has no model yet.
+      // Resolve ONLY the native directory default, never the profile hint, a
+      // guessed first catalog row or a startup reconciliation/model mutation.
+      if (!sharedTestBuild || body.data.model !== undefined) return undefined;
+      const fallback = await scopedRequest("/api/model/default");
+      if (fallback?.location?.directory !== directory) return undefined;
+      const selected = readV2ModelSelection({ data: { model: fallback.data } });
+      return selected ? { ...selected, variant: selected.variant ?? "default" } : undefined;
+    };
+    const selectSessionModel = createV2SelectionController(directory, {
+      isCurrent: () => session.isRunning,
+      // V2 has no proven atomic gate shared with the human TUI. Never replace
+      // this with a GET /active snapshot: it races the next provider turn.
+      acquireIdleLease: async () => variantTestBuild && session.isRunning && await testIdentityCurrent()
+        ? { release() {} } : "unsupported" as const,
+      nativeDefaultReadback: variantTestBuild,
+      readCatalog: () => variantRequest("/api/model"),
+      readSession: async () => {
+        const result = await variantRequest(`/api/session/${sessionId}`);
+        if (!isV2SessionScope(result, sessionId, directory)) throw new Error("OpenCode v2 session scope mismatch");
+        return result;
+      },
+      switchModel: async model => {
+        try { await variantRequest(`/api/session/${sessionId}/model`, { method: "POST", body: JSON.stringify({ model }) }); }
+        catch (error: any) { if (error?.status === 409) return "busy" as const; throw error; }
+      },
+    });
+    let agentSwitching = false;
+    // Turns accepted but not yet settled. A variant applies to the NEXT turn, so writing
+    // it while a turn of ours is queued/running would silently change that turn.
+    let inFlight = 0;
+    let variantSwitching = false;
+    /** 客户端 MODEL_SWITCH_DEADLINE_MS=45s；等待留给写入 + 回读 10s 余量。 */
+    // 🔴 外层 withDeadlineMs 是 45s。如果内部等满 35s、SSE 下发又花了 10s 以上，
+    //    外层会先判 timeout/unknown —— 那时连 rejected/busy 都发不出去（#4415 实测踩到）。
+    //    所以内部预算必须明显小于外层：25s，留 20s 给写入 + 回读 + ack。
+    const VARIANT_IDLE_WAIT_MS = 25_000;
+    // #4415 —— 排队状态。原来这段代码**只引用不声明**（tsc TS2304），
+    // 后果不是「日志少一行」而是走到忙路径时抛 ReferenceError。
+    // undefined = 没有排队意图；null = 排队「清空档位」；字符串 = 排队某个档位。
+    let queuedVariant: string | null | undefined;
+    /** 排队写入的时间戳，给 TTL 判定用（0 = 没有排队）。 */
+    let queuedVariantAt = 0;
+    /** 本轮开始时间，只用于日志里的 turn_age_ms；没有轮次时为 null。 */
+    let turnStartedAt: number | null = null;
+
+    /** 轮询等待空闲：有上界、可被会话停止打断。返回 true 表示等到了。 */
+    const waitUntilIdle = async (o: { isBusy: () => boolean; budgetMs: number }): Promise<boolean> => {
+      const deadline = Date.now() + o.budgetMs;
+      const step = 250;
+      while (Date.now() < deadline) {
+        if (!o.isBusy()) return true;
+        await new Promise((r) => setTimeout(r, Math.min(step, Math.max(0, deadline - Date.now()))));
+      }
+      return !o.isBusy();
+    };
     const session: OpenCodeCopresenceSession = {
       url,
       sessionId,
+      ...(shared ? { async forkSession(sourceSessionId: string): Promise<import("./v2-fork").V2ForkResult> {
+        // Runtime guard only, not authorization or atomic Server generation pinning.
+        if (!shared || !session.isRunning || sourceSessionId !== sessionId) {
+          return { status: "rejected", reason: "scope" };
+        }
+        const result = await forkV2Session({ sourceSessionId, expectedDirectory: resolve(opts.cwd), request: (path, init = {}) =>
+          fetchOpenCodeJson(url, password, path, { ...init, redirect: "error", headers: { "x-opencode-directory": resolve(opts.cwd) } }, 5_000) });
+        return session.isRunning ? result : { status: "unknown", reason: "verification_failed" };
+      } } : {}),
       attachScriptPath,
+      get variantConfigCapable() { return session.isRunning; },
+      // Historical interface name: identified TEST-ONLY build, NOT Server ownership.
+      get variantConfigTestOwned() { return variantTestBuild; },
+      async variantConfigReadback() {
+        if (!session.isRunning) return undefined;
+        if (variantTestBuild && !await testIdentityCurrent()) return undefined;
+        try {
+          const selected = await readVariantSelection();
+          if (!selected) return undefined;
+          const start = performance.now();
+          const catalog = await scopedRequest("/api/model");
+          const age = performance.now() - start;
+          if (!session.isRunning || !Number.isFinite(age) || age < 0 || age > 5000 || !catalogSupportsVariants(catalog, directory, selected)) return undefined;
+          const final = await readVariantSelection();
+          if (!session.isRunning || !equalV2ModelSelection(final, selected)) return undefined;
+          return selected;
+        } catch { return undefined; }
+      },
       get isRunning() {
         return openCodeV2SessionAlive({
           closed,
@@ -593,6 +791,51 @@ export async function openVettedOpenCodeV2Copresence(
         const body = await fetchOpenCodeJson(url, password, `/api/session/${sessionId}`, {}, 2_000);
         return openCodeV2SessionModelRef(body);
       },
+      async selectedSessionModel(targetSessionId) {
+        if (!session.isRunning || targetSessionId !== sessionId) return undefined;
+        if (variantTestBuild) return readVariantSelection();
+        const body = await scopedRequest(`/api/session/${sessionId}`);
+        if (!session.isRunning || !isV2SessionScope(body, sessionId, directory)) return undefined;
+        return readV2ModelSelection(body);
+      },
+      selectSessionModel(targetSessionId, model) {
+        if (targetSessionId !== sessionId) return Promise.resolve({ status: "rejected", reason: "scope" });
+        return selectSessionModel(model);
+      },
+      // Agent（Build）选择：POST /api/session/<ses_>/agent 实测 204，且 GET 回读
+      // 真的变成新值。代价是这里必须自己回读——204 本身不代表任何事
+      // （PATCH /api/session/{id} 也对未知字段回 204 却什么都不做）。
+      async selectedSessionAgent(targetSessionId) {
+        if (!session.isRunning || targetSessionId !== sessionId) return undefined;
+        const body = await scopedRequest(`/api/session/${sessionId}`);
+        if (!session.isRunning || !isV2SessionScope(body, sessionId, directory)) return undefined;
+        const data = (body as any)?.data ?? body;
+        const agent = (data as any)?.agent;
+        return typeof agent === "string" && agent.length > 0 ? agent : undefined;
+      },
+      async selectSessionAgent(targetSessionId, agent) {
+        if (targetSessionId !== sessionId || !session.isRunning) return { status: "rejected", reason: "scope" } as const;
+        if (typeof agent !== "string" || agent.length === 0) return { status: "rejected", reason: "invalid" } as const;
+        if (agentSwitching) return { status: "rejected", reason: "concurrent" } as const;
+        agentSwitching = true;
+        try {
+          try {
+            await scopedRequest(`/api/session/${sessionId}/agent`, {
+              method: "POST",
+              body: JSON.stringify({ agent }),
+            });
+          } catch (error: any) {
+            if (error?.status === 409) return { status: "rejected", reason: "busy" } as const;
+            throw error;
+          }
+          const after = await scopedRequest(`/api/session/${sessionId}`);
+          if (!session.isRunning || !isV2SessionScope(after, sessionId, directory)) return { status: "unknown" } as const;
+          const data = (after as any)?.data ?? after;
+          return data?.agent === agent ? { status: "applied", agent } as const : { status: "unknown" } as const;
+        } finally {
+          agentSwitching = false;
+        }
+      },
       // #3952 —— 会话用量（**累计值**）。调用方负责转成增量：同一份数据每轮都读，
       // 直接把绝对值报上去会把历史总量重复几十次。
       // 字段形状：{ input, output, reasoning, cache: { read, write } }（opencode v2 实测）。
@@ -603,11 +846,86 @@ export async function openVettedOpenCodeV2Copresence(
         const tokens = (data as any)?.tokens;
         return tokens && typeof tokens === "object" ? tokens : undefined;
       },
+      /** Thinking-level write for stock (non-test) builds.
+       *
+       * Narrower than the test-build controller on purpose: it refuses while any of OUR
+       * turns is queued/running (the variant would apply to that turn), writes the whole
+       * model ref because the server replaces it, and always reads back — a mismatch
+       * throws instead of acking success.
+       *
+       * Known limit (documented, not hidden): OpenCode exposes no session busy flag, so a
+       * human turn started in the TUI at the same moment is not detectable here. The write
+       * is therefore best-effort, not a proven-atomic switch.
+       */
+      async setSelectedModelAndVariant(modelRef: string, variant: string | null) {
+        return session.setSelectedVariant!(variant, modelRef);
+      },
+      async setSelectedVariant(variant: string | null, modelRef?: string) {
+        if (!session.isRunning) throw new Error("OpenCode copresence server is not running");
+        if (variantSwitching) throw new Error("variant_busy (concurrent selection)");
+        const target = modelRef === undefined ? undefined : parseModelRef(modelRef);
+        if (modelRef !== undefined && (!target || modelRef !== `${target.providerID}/${target.modelID}` || modelRef.includes("#"))) throw new Error("variant_invalid model reference");
+        if (variant !== null && (typeof variant !== "string" || !/^[A-Za-z0-9._-]{1,40}$/.test(variant))) throw new Error("variant_invalid depth");
+        variantSwitching = true;
+        try {
+          if (inFlight > 0) {
+            // #4415: bounded wait within the client's 45s deadline. A depth-only
+            // request may queue after timeout, but its ack must still say busy.
+            const idle = await waitUntilIdle({
+              isBusy: () => inFlight > 0 || !session.isRunning,
+              budgetMs: VARIANT_IDLE_WAIT_MS,
+            });
+            if (!idle) {
+              // Never queue just the depth of a combined request: that would apply
+              // it to the old model. The caller receives busy, not false success.
+              if (modelRef !== undefined) throw new Error(`variant_busy (combined selection, in_flight=${inFlight})`);
+              queuedVariant = variant === "default" ? null : variant;
+              queuedVariantAt = Date.now();
+              log(`[variant] queued ${JSON.stringify(queuedVariant)} (in_flight=${inFlight}, turn_age_ms=${turnStartedAt ? Date.now() - turnStartedAt : -1})`);
+              // Preserve the rejection evidence in the Hub ack, not only logs.
+              throw new Error(`variant_busy (in_flight=${inFlight}, turn_age_ms=${turnStartedAt ? Date.now() - turnStartedAt : -1})`);
+            }
+          }
+          const body = await scopedRequest(`/api/session/${sessionId}`);
+          if (!session.isRunning || !isV2SessionScope(body, sessionId, directory)) throw new Error("OpenCode v2 session scope unavailable");
+          const current = readV2ModelSelection(body);
+          if (!current) throw new Error("OpenCode v2 session scope unavailable");
+          const model = { providerID: target?.providerID ?? current.providerID, id: target?.modelID ?? current.id,
+            ...(variant === null || variant === "default" ? {} : { variant }) };
+          if (modelRef !== undefined) {
+            const catalog = await scopedRequest("/api/model");
+            if (!catalogAllowsSelection(catalog, directory, model)) throw new Error("variant_catalog selection not listed");
+            if (!session.isRunning || inFlight > 0) throw new Error("variant_busy (turn started during validation)");
+            // Supersede an older queued depth only after this combined request is
+            // admitted; otherwise it could undo the selection after the next turn.
+            queuedVariant = undefined;
+            queuedVariantAt = 0;
+          }
+          await fetchOpenCodeJson(url, password, `/api/session/${sessionId}/model`, {
+            method: "POST", body: JSON.stringify({ model }),
+          }, 10_000);
+          const updated = await scopedRequest(`/api/session/${sessionId}`);
+          const after = readV2ModelSelection(updated);
+          const wanted = model.variant ?? "default";
+          if (!session.isRunning || !isV2SessionScope(updated, sessionId, directory) || !after || after.providerID !== model.providerID || after.id !== model.id) throw new Error("OpenCode v2 session model/variant outcome unknown");
+          if ((after.variant ?? "default") !== wanted) throw new Error("model_applied_variant_readback_mismatch");
+          return after;
+        } finally { variantSwitching = false; }
+      },
       async setSelectedModel(modelRef: string) {
         if (!session.isRunning) throw new Error("OpenCode copresence server is not running");
         const parsed = parseModelRef(modelRef);
         if (!parsed || modelRef !== `${parsed.providerID}/${parsed.modelID}`) {
           throw new Error("OpenCode model must use provider/model form");
+        }
+        if (variantTestBuild) {
+          const current = await session.selectedSessionModel!(sessionId);
+          if (!current) throw new Error("OpenCode v2 session scope unavailable");
+          const target = { providerID: parsed.providerID, id: parsed.modelID,
+            ...(current.variant === undefined || current.variant === "default" ? {} : { variant: current.variant }) };
+          const outcome = await selectSessionModel(target);
+          if (outcome.status !== "applied") throw new Error(`OpenCode v2 scoped model switch ${outcome.status}`);
+          return;
         }
         await fetchOpenCodeJson(url, password, `/api/session/${sessionId}/model`, {
           method: "POST",
@@ -653,14 +971,25 @@ export async function openVettedOpenCodeV2Copresence(
           }
           evidence?.onSubmitted?.();
           let delivered = false;
+          // #4481 —— 记下「见过什么」，三种原因才分得开：
+          //   见过在队列里 → 后来不见了 = 真没跑；从没见过 = 提交就没落到队列；
+          //   见过在历史里 = 其实跑过（只是 correlator 的分页窗口没找到）。
+          let everQueued = false;
           let misses = 0;
+          let readFailures = 0;
+          const submittedAt = Date.now();
           while (Date.now() < deadline) {
             if (!session.isRunning) throw new Error("OpenCode v2 serve exited while the network turn was pending");
             let after: OpenCodeV2Entry[] | null = null;
             try {
               after = await readEntriesAfter(url, password, sessionId, messageId);
+              readFailures = 0;
             } catch (error: any) {
-              warn(`[opencode-copresence] v2 history read failed (will retry): ${error?.message ?? error}`);
+              readFailures += 1;
+              // A busy serve fails every read; one line per failure flooded the log every ~10 s.
+              if (readFailures === 1 || readFailures % 10 === 0) {
+                warn(`[opencode-copresence] v2 history read failed (will retry, #${readFailures}): ${error?.message ?? error}`);
+              }
             }
             if (after) {
               misses = 0;
@@ -713,21 +1042,31 @@ export async function openVettedOpenCodeV2Copresence(
               }
             } else if (!delivered) {
               let queued = true;
+              let known = false;
               try {
                 queued = await inboxHas(url, password, sessionId, messageId);
+                known = true;
               } catch {}
+              // 只有**确认读到**才算「见过」；读失败仍然保守当作还在队列（不改原有行为）。
+              if (known && queued) everQueued = true;
               if (!queued) {
                 // Delivered between the two reads, or removed. Two misses in
                 // a row (a full poll apart) means it left the queue unrun.
                 misses += 1;
                 if (misses >= 2) {
-                  throw new Error("OpenCode v2 network turn left the queue without running (removed in the TUI?)");
+                  // #4481 —— 文案不再把原因单向猜成「被 TUI 移除」：
+                  // 判据 + 会话/消息 id 一起带出去，Hub 的 last_update 上能直接分流。
+                  throw new Error(queueMissVerdict({
+                    sessionId, messageId, misses,
+                    waitedMs: Date.now() - submittedAt,
+                    everDelivered: delivered, everQueued,
+                  }).message);
                 }
               } else {
                 misses = 0;
               }
             }
-            await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+            await new Promise((r) => setTimeout(r, historyPollDelayMs(readFailures)));
           }
           if (!delivered) {
             // Still queued behind a (human) turn: withdraw it so it can never
@@ -751,6 +1090,11 @@ export async function openVettedOpenCodeV2Copresence(
                 : undefined,
               readEntries: () => readEntriesAfter(url, password, sessionId, messageId).catch(() => null),
               isRunning: () => session.isRunning,
+              // OpenCode 2.x: POST /api/session/:id/interrupt → {interrupted:true}
+              // (the V1 /session/:id/abort route does not exist on V2).
+              interruptStalled: () => fetchOpenCodeJson(url, password, `/api/session/${sessionId}/interrupt`, {
+                method: "POST", body: "{}",
+              }, 5_000).then((r: any) => r?.interrupted === true, () => false),
               onLateReply: evidence.onLateReply,
               log: warn,
             });
@@ -758,6 +1102,8 @@ export async function openVettedOpenCodeV2Copresence(
           throw new OpenCodeCopresenceTimeoutError("reply", budgetMs);
           }
         });
+        inFlight += 1;
+        if (turnStartedAt === null) turnStartedAt = Date.now();
         const observed = operation.catch((error: any) => {
           if (shared && /ECONNREFUSED|ECONNRESET|UND_ERR_SOCKET|EPIPE/.test(error?.message ?? "")) {
             sharedDisconnectedAt = Date.now();
@@ -765,6 +1111,34 @@ export async function openVettedOpenCodeV2Copresence(
           throw error;
         });
         queue = observed.then(() => undefined, () => undefined);
+        void observed.finally(() => {
+          inFlight = Math.max(0, inFlight - 1);
+          // 这一轮结束了：如果期间用户点过档位，就在这里应用一次；只在**恰好归零**时做。
+          if (inFlight === 0) turnStartedAt = null;
+          if (inFlight === 0 && queuedVariant !== undefined) {
+            const pending = queuedVariant;
+            const queuedAt = queuedVariantAt;
+            queuedVariant = undefined;
+            // 判据抽在 queued-variant.ts（纯函数、有单测）：这一轮**恰好归零**且未过期才应用。
+            if (shouldApplyQueuedVariant({ hasQueued: true, inFlight, queuedAt, now: Date.now() })) {
+              log(`[variant] applying queued ${JSON.stringify(pending)} after ${Math.round((Date.now() - queuedAt) / 1000)}s`);
+              // setSelectedVariant 在接口上是可选的（并非每个运行时都提供写入器）。
+              // 直接调用会得到 TS2722，而且真到这一步会抛 TypeError —— 排队了却崩在应用处，
+              // 比不排队更糟：用户以为切了。所以先确认存在，不存在就如实降级。
+              const applyVariant = session.setSelectedVariant?.bind(session);
+              if (!applyVariant) {
+                warn('[variant] queued apply skipped: this runtime exposes no variant writer');
+              } else {
+                void applyVariant(pending).then(
+                  (applied) => log(`[variant] queued applied -> ${JSON.stringify(applied)}`),
+                  (error) => warn(`[variant] queued apply failed: ${String((error as any)?.message ?? error)}`),
+                );
+              }
+            } else {
+              warn(`[variant] queued apply dropped after ${Math.round((Date.now() - queuedAt) / 1000)}s (ttl ${QUEUED_VARIANT_TTL_MS / 60000}min)`);
+            }
+          }
+        }).catch(() => {});
         return observed;
       },
       async close(mode?: { restart?: boolean }) {
@@ -772,6 +1146,7 @@ export async function openVettedOpenCodeV2Copresence(
         closed = true;
         clearLaunchHealth();
         clearCatalogEndpoint();
+        bridgeClaim?.release();
         stopRecordedAttach(opts.workDir, { restart: mode?.restart === true, log, warn, tmux: opts.tmuxRunner });
         rmSync(attachScriptPath, { force: true });
         if (identity) await stopProcessGroup(child as any, identity);

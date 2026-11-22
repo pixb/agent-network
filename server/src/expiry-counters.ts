@@ -25,9 +25,17 @@ export type NeverConsumedExpiryCounters = {
   by_node: Record<string, number>;
   /** 每个节点最近一次「从未取走」的时刻（ISO）。**光有计数会永久拉黑一台恢复了的节点。** */
   last_at: Record<string, string>;
+  /**
+   * 2026-11-16 —— 每个节点最近几次「从未取走」的时刻（ISO，旧→新，最多 RECENT_CAP 条）。
+   * 闸要数的是「最后一次回复**之后**」的过期；只有 count + lastAt 时，回复之前攒下的过期
+   * 会和回复之后的一条一起被算进去（现场：TMA客户端欧 内存 4、库里回复之后只有 2，仍被拒）。
+   */
+  recent_at?: Record<string, string[]>;
 };
 
-type Bucket = { count: number; lastAt: number };
+/** 每个节点保留的最近过期时刻条数（够判阈值 3，键有限、不随请求膨胀）。 */
+const RECENT_CAP = 16;
+type Bucket = { count: number; lastAt: number; recent: number[] };
 const counters = new Map<string, Bucket>();
 let since = new Date().toISOString();
 
@@ -35,19 +43,22 @@ let since = new Date().toISOString();
 export function noteNeverConsumedExpiry(node: string, now = Date.now()): void {
   const key = node || "(unknown)";
   const prev = counters.get(key);
-  counters.set(key, { count: (prev?.count ?? 0) + 1, lastAt: now });
+  const recent = [...(prev?.recent ?? []), now].slice(-RECENT_CAP);
+  counters.set(key, { count: (prev?.count ?? 0) + 1, lastAt: now, recent });
 }
 
 export function neverConsumedExpiryCounters(): NeverConsumedExpiryCounters {
   let total = 0;
   const by_node: Record<string, number> = {};
   const last_at: Record<string, string> = {};
+  const recent_at: Record<string, string[]> = {};
   for (const [k, v] of [...counters.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     by_node[k] = v.count;
     last_at[k] = new Date(v.lastAt).toISOString();
+    recent_at[k] = v.recent.map(t => new Date(t).toISOString());
     total += v.count;
   }
-  return { since, total, by_node, last_at };
+  return { since, total, by_node, last_at, recent_at };
 }
 
 /** 仅测试用：清零并重置窗口。 */
@@ -166,7 +177,7 @@ export function persistentNeverConsumedExpiries(
 
 export type NeverConsumeGate =
   | { ok: true }
-  | { ok: false; error: "target_never_consumes"; alias: string; expiries: number; window_since: string; message: string };
+  | { ok: false; error: "target_never_consumes"; alias: string; expiries: number; window_since: string; last_reply_at: string | null; message: string };
 
 export function neverConsumeGate(input: {
   alias: string;
@@ -182,7 +193,21 @@ export function neverConsumeGate(input: {
   persistent?: PersistentExpiryEvidence;
 }): NeverConsumeGate {
   const limit = input.limit ?? NEVER_CONSUME_LIMIT;
-  const fromMemory = input.counters.by_node[input.alias] ?? 0;
+  // 2026-11-13 —— **内存计数也要以「最后一次回复」为界**（与 DB 证据同一条判据）。
+  // 现场：TMA客户端欧 卡住期间攒了 ≥3 次内存过期，之后它恢复并正常回复了，DB 证据随即归零，
+  // 但内存桶只有 count + lastAt，没有回复边界 ⇒ 闸继续拒发直到 2 小时 TTL 或 Hub 重启。
+  // 有人为此重启了 Hub。回复本身就是「它活着」的证据：最后一次回复晚于内存里最近一次过期
+  // ⇒ 那些内存计数全部发生在恢复之前，不再算数。
+  const memLastAt = parseHubTime(input.counters.last_at?.[input.alias]);
+  const lastReplyAt = parseHubTime(input.persistent?.last_reply_at ?? undefined);
+  const memorySupersededByReply = memLastAt !== null && lastReplyAt !== null && lastReplyAt >= memLastAt;
+  // 2026-11-16 —— 只比「最近一次」不够：回复之后哪怕再过期一条，回复之前攒的也会全部复活。
+  // 有逐条时刻时，只数**晚于最后一次回复**的那几条（与 DB 证据同一条边界）。
+  const recent = input.counters.recent_at?.[input.alias];
+  const fromMemory = memorySupersededByReply ? 0
+    : recent && lastReplyAt !== null
+      ? recent.map(parseHubTime).filter((t): t is number => t !== null && t > lastReplyAt).length
+      : (input.counters.by_node[input.alias] ?? 0);
   const fromDb = input.persistent?.expiries ?? 0;
   const expiries = Math.max(fromMemory, fromDb);
   if (expiries < limit) return { ok: true };
@@ -196,22 +221,26 @@ export function neverConsumeGate(input: {
       alias: input.alias,
       expiries,
       window_since: input.counters.since,
+      last_reply_at: input.persistent?.last_reply_at ?? null,
       message:
         `this target has ${fromDb} expired task(s) with no reply since its last reply`
         + `${input.persistent?.last_reply_at ? ` (${input.persistent.last_reply_at})` : " (it has never replied)"}; `
-        + `nothing will queue correctly here until it replies again — pass force:true (user tokens) if you know it recovered`,
+        + `nothing will queue correctly here until it replies again — pass force:true (user tokens) if you know it recovered, `
+        + `or as a user token cancel the expired rows (cancel_task accepts expired for user tokens) to clear this gate`,
     };
   }
   // 2026-10-31 —— **只数不衰减会把恢复了的节点永久拉黑**。
   // 实测的教训来自另一台机（TM中转运维）：连「抑制了多少」这个数本身都在被环缓冲淘汰，
   // 所以任何「累计」都只在它的窗口内可引用；这里把窗口写进判据：最近一次过期超过 TTL ⇒ 放行。
-  const lastAt = [input.counters.last_at?.[input.alias], input.persistent?.last_at ?? undefined]
-    .filter((x): x is string => typeof x === "string")
-    .sort()
-    .pop();
-  if (lastAt) {
-    const age = (input.now ?? Date.now()) - Date.parse(lastAt);
-    if (Number.isFinite(age) && age > (input.staleAfterMs ?? NEVER_CONSUME_STALE_MS)) return { ok: true };
+  // 两个来源的时间格式不同（内存是 ISO，tasks 表是 SQLite 的 "YYYY-MM-DD HH:MM:SS" UTC），
+  // 原来按字符串排序再 Date.parse —— 后者会把 SQLite 时间当成**本地时间**解析（Hub 机是 UTC+8）。
+  const lastAtMs = [input.counters.last_at?.[input.alias], input.persistent?.last_at ?? undefined]
+    .map(parseHubTime)
+    .filter((x): x is number => x !== null)
+    .reduce<number | null>((a, b) => (a === null || b > a ? b : a), null);
+  if (lastAtMs !== null) {
+    const age = (input.now ?? Date.now()) - lastAtMs;
+    if (age > (input.staleAfterMs ?? NEVER_CONSUME_STALE_MS)) return { ok: true };
   }
   if (input.force && input.forceAllowed) return { ok: true };
   return {
@@ -220,8 +249,20 @@ export function neverConsumeGate(input: {
     alias: input.alias,
     expiries,
     window_since: input.counters.since,
+    last_reply_at: input.persistent?.last_reply_at ?? null,
     message:
       `this target has expired ${expiries} task(s) without ever taking one (window since ${input.counters.since}); `
       + `nothing will queue correctly here until it consumes again — pass force:true (user tokens) if you know it recovered`,
   };
+}
+
+/**
+ * 解析 Hub 里出现的两种时间：ISO（带 Z / 偏移）和 SQLite `datetime('now')` 的
+ * "YYYY-MM-DD HH:MM:SS"（UTC、无时区标记）。后者必须按 UTC 解析，不能交给 Date.parse 当本地时间。
+ */
+export function parseHubTime(v: string | null | undefined): number | null {
+  if (typeof v !== "string" || !v) return null;
+  const sqlite = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(v);
+  const ms = Date.parse(sqlite ? `${sqlite[1]}T${sqlite[2]}Z` : v);
+  return Number.isFinite(ms) ? ms : null;
 }

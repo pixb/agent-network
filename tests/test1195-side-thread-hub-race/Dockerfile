@@ -7,8 +7,9 @@ COPY server/src/db-adapter.ts /app/server/src/db-adapter.ts
 COPY server/src/side-thread.ts /app/server/src/side-thread.ts
 COPY server/src/side-thread-http.ts /app/server/src/side-thread-http.ts
 COPY server/src/side-thread.test.ts /app/server/src/side-thread.test.ts
-COPY contracts/side-thread/v1/golden.json /app/contracts/side-thread/v1/golden.json
-COPY contracts/side-thread/v1/schema.json /app/contracts/side-thread/v1/schema.json
+COPY contracts /app/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /app/server/src/contracts
 COPY tests/test1195-side-thread-hub-race/run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 

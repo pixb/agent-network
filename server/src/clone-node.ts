@@ -208,8 +208,12 @@ export function factsFromRows(input: {
   const snapFlags = snap.flags && typeof snap.flags === "object" && !Array.isArray(snap.flags)
     ? snap.flags as Record<string, unknown>
     : {};
-  const runtime = (typeof snap.runtime === "string" && snap.runtime) ? snap.runtime
+  const reported = (typeof snap.runtime === "string" && snap.runtime) ? snap.runtime
     : (input.node.runtime || input.createRow?.runtime || null);
+  // nodes.runtime 是运行中节点自报的**标签**：OpenCode 节点报 "opencode-sdk" / "opencode"，
+  // 而 daemon 能创建的 runtime 只有 "opencode-cli"（daemon 实际照磁盘上源节点 config 的 runtime 写）。
+  // 不归一就会把收编来的 OpenCode 节点一律拒成 runtime_invalid（vdev 2026-11-11 实测）。
+  const runtime = reported === "opencode-sdk" || reported === "opencode" ? "opencode-cli" : reported;
   const model = (typeof snap.model === "string" || snap.model === null) ? (snap.model as string | null)
     : (input.node.model ?? input.createRow?.model ?? null);
   const channels = Array.isArray(snap.channels) ? snap.channels
@@ -288,9 +292,57 @@ export function decideClone(source: CloneSourceFacts, ask: CloneAsk): CloneDecis
 }
 
 export function parseWorkdirPolicy(raw: unknown): CloneWorkdirPolicy {
-  if (raw === undefined || raw === null || raw === "") return "new_empty";
+  // #4826 spec（负责人 2026-11-19）：默认**共用源目录**（同路径、不复制文件），
+  // 因为 fork 的语义是「同一份代码，另一个 agent」；创建页必须提示两个 agent 会同目录。
+  // 想要干净目录的调用方显式传 new_empty。
+  if (raw === undefined || raw === null || raw === "") return "share_source";
   if (raw === "new_empty" || raw === "share_source") return raw;
   throw new ValidationError("workdir_policy_invalid", { value: typeof raw === "string" ? raw.slice(0, 40) : typeof raw, allowed: [...CLONE_WORKDIR_POLICIES] });
 }
 
 export { ValidationError };
+
+/**
+ * fork 时改写收件白名单里的「源节点自己的 alias」。
+ *
+ * 负责人 2026-11-19 定：白名单原样复制，但其中若有**源节点自己的 alias**，必须替换成**新节点的 alias**；
+ * 否则新节点收不到自己转出去的消息（它会把消息按旧名字发给别人，回程却找不到收件人）。
+ * 去重保持首次出现顺序；空值/空白项丢弃。
+ */
+export function rewriteCloneChannels(channels: readonly string[], sourceAlias: string, newAlias: string): string[] {
+  const src = (sourceAlias ?? "").trim();
+  const dst = (newAlias ?? "").trim();
+  const out: string[] = [];
+  for (const raw of channels ?? []) {
+    const c = typeof raw === "string" ? raw.trim() : "";
+    if (!c) continue;
+    const v = src && c === src && dst ? dst : c;
+    if (!out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * fork 的部门归属判定（#4826，负责人 2026-11-19）。
+ *
+ * 默认跟随源节点部门；但「操作者在这个部门没有建节点权限」时**不能静默**：
+ * 落 null，并把原因说人话（部门名，查不到名字才退回 id）。
+ * `managesSourceDept`：操作者是否是源部门（含子部门）的负责人。
+ * owner/admin 视为任何部门都可。
+ */
+export function decideCloneDepartment(input: {
+  srcDept: string | null;
+  srcDeptName: string | null;
+  role: string | null;
+  managesSourceDept: boolean;
+}): { department: string | null; notice: string | null } {
+  const { srcDept, srcDeptName, role, managesSourceDept } = input;
+  if (!srcDept) return { department: null, notice: null };
+  const allowed = role === "owner" || role === "admin" || managesSourceDept;
+  if (allowed) return { department: srcDept, notice: null };
+  const shown = srcDeptName || srcDept;
+  return {
+    department: null,
+    notice: `源节点部门「${shown}」不在你的建节点权限内，新节点未设部门（创建后可调整）`,
+  };
+}

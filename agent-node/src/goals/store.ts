@@ -94,7 +94,17 @@ const PI_RUNTIME_NAMES = new Set([
   "pi-cli",
 ]);
 
-export type RuntimeBucket = "claude" | "codex" | "grok" | "opencode" | "pi" | "unknown";
+// 2026-11-20 — Antigravity CLI（agy）。镜像 cli.ts RUNTIME_MAP 里新加的那组别名；
+// 这个 set 当时漏加，节点启动日志里报 "goals scheduler: skipped — unknown runtime
+// bucket"（#3677 真机实测抓到：任何 antigravity-acp 节点的 /aloop 调度器都起不来）。
+const ANTIGRAVITY_RUNTIME_NAMES = new Set([
+  "antigravity",
+  "antigravity-acp",
+  "antigravity-cli",
+  "agy",
+]);
+
+export type RuntimeBucket = "claude" | "codex" | "grok" | "opencode" | "pi" | "antigravity" | "unknown";
 
 /** Map any user-facing runtime name to its canonical bucket (mirrors cli.ts RUNTIME_MAP). */
 export function runtimeBucket(rt: string | undefined | null): RuntimeBucket {
@@ -104,6 +114,7 @@ export function runtimeBucket(rt: string | undefined | null): RuntimeBucket {
   if (GROK_RUNTIME_NAMES.has(rt)) return "grok";
   if (OPENCODE_RUNTIME_NAMES.has(rt)) return "opencode";
   if (PI_RUNTIME_NAMES.has(rt)) return "pi";
+  if (ANTIGRAVITY_RUNTIME_NAMES.has(rt)) return "antigravity";
   return "unknown";
 }
 

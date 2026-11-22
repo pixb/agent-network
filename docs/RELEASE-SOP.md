@@ -371,6 +371,40 @@ scripts/verify-hub-release.sh 0.9.0-preview.146 --tag latest
 技能一句话：**探针错了和包坏了，输出长得一模一样**；所以探针要么盯"这个动作能不能
 被调到"，要么盯"这段行为在不在"，别盯文件名。
 
+### Step 5.6：`gate 4` 要求文档**先**断言你要发的那个版本
+
+`gate 4 — 上手指南里的版本断言` 把「正在发的版本」和 `getting-started` 里的
+`version-claim` 注释比对。所以顺序是：
+
+```text
+写 release notes（gate 3）
+        ↓
+改 docs-site/docs/guide/getting-started.md 与 en/ 的 version-claim **和正文**（gate 4）
+        ↓
+才 workflow_dispatch 发版
+```
+
+2026-11-10 实测两次踩它（`.230`）：
+
+```text
+::error::正在发 agent-network@2.3.0-preview.230(preview 通道),
+         而文档仍然断言 preview=2.3.0-preview.229
+🔴 不要只改戳 —— 戳和正文不一致时这道门也会红(那正是它的第二条判据)。
+```
+
+我在拿到这条错误之前，假设的是「包先发出去，文档随后补」——**反了**。
+补发时还遇到过另一个坑：文档 PR 已提但**未合并**就重新 dispatch，仍然红；
+必须等它进 main 之后再派发。
+
+本地先自查（不发版、不碰 npm）：
+
+```bash
+python3 scripts/check-doc-version-claims.py \
+  --package agent-network --version 2.3.0-preview.230
+```
+
+判据两条都要满足：**戳指向该版本**、**正文写的是该版本的实际变化**（不是只改数字）。
+
 ### Step 6：publish preview —— 走 GitHub Actions，**不在本机发**
 
 🔴 **本机不发包。** 这是 Vincent 2026-08-27 定的规则：发版一律走 GitHub Actions，
@@ -488,6 +522,22 @@ tarball，不是已签名的原生客户端。Daemon 使用版本源中的精确
 - 30 分钟内发现 bug：发新 preview 覆盖，不要急着 dist-tag latest
 
 只 publish 不升 latest 也是合法终态——很多 preview 永远停在 preview 也 OK。
+
+#### 测试分层：preview 快，全量矩阵只挡 latest（2026-11-10 Vincent 定）
+
+| 通道 | 测试 | 在哪 |
+|---|---|---|
+| preview | PR 快速层（三套 unit + doc claims/pins）+ `release.yml` 四道门（install smoke / pin audit / release notes / doc claims，合计约 1–2 分钟） | `qa.yml`（PR）、`release.yml` |
+| latest | 上面全部 + **该版本源码在 main 上的全量 QA 矩阵为绿** | `promote-latest.yml` 闸 5（`.github/scripts/check-full-qa-for-latest.sh`） |
+
+闸 5 的判据：源 commit 取自 npm 上该版本的 SLSA provenance；在 `qa.yml` 的 main
+全量运行（schedule / workflow_dispatch）里取**最早**一个包含该 commit 的运行，它必须是 success。
+没有覆盖时先在 Actions 里对 main 手动跑一次 `anet QA (v0)`，或等夜间那次；
+flaky 的红就 re-run 那次运行。
+
+preview 发布剩下的耗时不在测试：`@sleep2agi/agent-network` 被 npm 接受后通常要
+**约 20 分钟**才在 registry 上可见（agent-node / commhub-server 约 2 分钟），这是
+「发后核实」那一步在等（§6.2）。
 
 ### Step 8：升 latest（owner ACK 之后）
 
@@ -899,3 +949,154 @@ curl -sL "$(npm view <pkg>@<ver> dist.tarball)" | tar tzf - | grep -c '^package/
 ```bash
 npm view <pkg>@<version> version      # 出现 = 可见；npm error 404 = 还没到
 ```
+
+## 8. 2026-11-10 桌面发版踩出来的四条（护栏都已落地，别再手工记）
+
+### 8.1 「构建全绿」不等于「发布对」：按 **tag** 核资产
+
+0.2.503 实测：所有 job 绿、版本号也发了，但用户按 tag 打开的是**0 资产的空壳**，真正的资产落在另一个 `untagged-<sha>` 的 release 上。
+
+护栏（`release-desktop-auto-update.yml` 的 verify-draft）：
+
+```text
+Assert the verified release is the one users will open
+  1  release.tag_name == desktop-v<version>      ← 校验对象 = 用户打开的对象
+  2  assets >= 6
+  3  不存在 untagged-* / draft=false / target_commitish == 本次 commit 的 release
+```
+
+🔴 写这条断言时**别用 `GET /releases/tags/<tag>`**：它在发布前跑，而草稿不可用 tag 端点检索
+（实测直接 404）。要用 prepare-release 已经产出的 `release_id`，再断言它的 `tag_name`。
+
+后果不止 GitHub 发布页：镜像同步按 tag 找资产，空壳会让国内镜像停在上一版（0.2.503 就是这样）。
+
+### 8.2 每次发版都在重编 Rust：**别给 cache key 加版本相关哈希**
+
+`swatinem/rust-cache` 默认把 `Cargo.toml/Cargo.lock` 的哈希算进 key，而每次 bump 都会改这两个文件里的 `version`
+⇒ 每版都是全新 key ⇒ Rust 全量重编。同一次发版的冷/热对照：
+
+```text
+冷   rust-cache 1s    Check Rust 175s(win)/90s(mac)   credential-store 202s/108s
+热   rust-cache 47s/21s   Check Rust 56s/16s          credential-store 20s/18s
+```
+
+所以：所有用 rust-cache 的 workflow 都带上 `add-rust-environment-hash-key: false`（本仓共 6 处）。
+另外仓库 cache 总量上限 10 GB，超了会驱逐旧 cache —— 清过之后从 11.51 GB 回到 2.19 GB。
+
+### 8.3 镜像的 30 分钟 cron **不可依赖**（实测被节流）
+
+最近 40 次 `modelscope-mirror` run 里 schedule 只触发 16 次，时刻散落（01:55 / 05:52 / 10:23 / 18:11 …），
+其中 `10:23 → 18:11` 有 **7.8 小时空窗**（按配置本应 ~15 次）。所以：
+
+```text
+主路径  release: published 触发的那一次（0.2.504 靠它一次成功）
+兜底    收口脚本对账：先读镜像 latest；已齐平则 no-op；不齐平才 dispatch 并回读
+```
+
+### 8.4 `cancelled` 不是 `failure`（但也不能全局忽略）
+
+`ios-pods-check` 的 `pods` job 会被取消：成功时 87–131s 跑完 11 个 step，
+被取消那次是 **931s 且 0 个 step**（从没拿到 macos-15 runner）。两条 bump PR 同时开时更容易撞上。
+
+处理：`ios-pods-autoretry.yml` 只在 `conclusion == cancelled` 时重跑，最多到第 3 次。
+**不要**把 cancelled 全局当绿——真失败必须保持红。
+
+## 9. 2026-11-11 桌面发版链上的两条死锁与两个看门狗
+
+这两条都不是「代码错」，是**流程里没人值班就会静默停住**的地方。现在由本机 cron 兜住。
+
+### 9.1 签名闸没人批 ⇒ 整条链静默停在 `waiting`
+
+`build-release (macos)` 进入 `macos-signing` environment 后 run 停在 `waiting`，
+直到有人点 approve。**它不报错、不发通知、看起来像「正在构建」**。
+
+判据（别盯 Actions 页面等）：
+
+```bash
+# 该 run 有没有待批的 environment
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://api.github.com/repos/sleep2agi/agent-network-app/actions/runs/<run_id>/pending_deployments \
+  | jq -r '.[].environment.name'          # 出现 macos-signing = 在等人批
+```
+
+### 9.2 `waiting` 的 run 会**永久占住** concurrency 组，而 `cancel` 对它无效
+
+`release-desktop-auto-update.yml` 的组名是固定的 `release-desktop-auto-update`
+（除非 `bypass_lock=true`）。一个卡在 waiting 的 run 会一直占着组 ⇒
+**新 dispatch 的 run 永远 `pending`、一个 job 都起不来**，同样不报错。
+
+实测两次：2026-10-31（卡 2.5h+）、2026-11-11 01:11（新 run 00:35 dispatch，20 分钟 0 job）。
+
+```text
+❌ POST /actions/runs/<id>/cancel         → 返回 202，但状态一直 waiting（连试两次都一样）
+✅ POST /actions/runs/<id>/pending_deployments
+   {"environment_ids":[...],"state":"rejected"}
+   → 该 run 立刻 completed/cancelled，**concurrency 组当秒释放**
+```
+
+所以正确顺序是：**先 reject 掉「同 commit 已经有成功 run」的那个 duplicate**，
+组一空，新 run 自己就会起步；只有在没有 duplicate 可 reject 时，才用
+`dispatch {commit, bypass_lock:true}` 另开一组（`bypass_lock` 是备选，不是首选：
+它会让两个 run 同时跑同一版本，得靠 8.1 的 verify-draft 断言挡住重复资产）。
+
+### 9.3 两个看门狗（本机 cron，不依赖 GitHub 调度）
+
+```text
+mirror-guard.py   */15   ~/.commhub/logs/mirror-guard.log
+  读「最新**已发布**版本」 vs 镜像 desktop/android 的 VERSION
+  齐平 → ok ｜ 有 mirror run 在跑 → waiting ｜ 25 分钟内补过 → cooldown
+  落后且无人管 → dispatch modelscope-mirror（带该 tag 的 commit）→ dispatched
+
+release-guard.py  */10   ~/.commhub/logs/release-guard.log
+  ① 有 run 停在 macos-signing 且我能批 → approve
+  ② 最新 run 长时间 queued 且 0 job、被 waiting 旧 run 占组 →
+     优先 reject 掉「同 commit 已成功」的 duplicate（释放组），否则补 bypass_lock run
+  ③ 每轮一行 verdict
+```
+
+两条都遵守同一个纪律：**判定一次就退出**，不 sleep、不轮询、不在前台等。
+
+实现时踩到的一个小坑（值得写下来）：GitHub 的 `created_at` 是 UTC，
+用 `time.mktime` 解析会按本机 `TZ`（这台是 +08）偏移，算出来的 age 会**凭空多 8 小时**，
+于是「刚起 1 分钟的 run」被误判成「卡了 8 小时」。必须用 `calendar.timegm`。
+
+### 9.4 desktop 镜像 ≠ android 镜像：是**两条独立流水线**
+
+0.2.509 实测：`modelscope-mirror` 跑绿之后 `desktop/latest/VERSION` 已经是 0.2.509，
+但 `android/latest/VERSION` 仍停在 0.2.507。原因是安卓有自己的一条：
+
+```text
+desktop   modelscope-mirror.yml            inputs: commit
+android   modelscope-android-publish.yml   inputs: commit + run_id（产出该 APK 的 android-build run）
+```
+
+安卓那条**不会**被 `modelscope-mirror` 或 `release: published` 自动带动，最后一次跑还是上一版
+（01:20 对应 0.2.508 的 commit）。判据只有一条：
+
+```bash
+curl -s "<mirror>/android/latest/VERSION"   # 必须等于本次版本，别只看 desktop
+curl -s "<mirror>/desktop/latest/VERSION"
+```
+
+补 dispatch 时要配对：`run_id` 必须是**同 commit** 且 `conclusion=success` 的 `android-build` run，
+随便给一个 run_id 会把别的版本的 APK 推上去。`mirror-guard.py` 现在两条都覆盖：
+desktop 落后走 mirror，android 落后走 android-publish（自动找同 commit 的 android-build run）。
+
+### 9.5 「草稿对」不等于「发布后对」：发布后必须再核一次 tag 名
+
+`verify-draft` 断言的是**草稿阶段**的 `release.tag_name == desktop-v<version>`。
+0.2.509 实测：它当时是绿的，但 PATCH `draft=false` 之后，发布对象的 tag 名变成了
+`untagged-d676edc9b93361015139`，而 `/git/ref/tags/desktop-v0.2.509` 根本不存在 ⇒
+用户按 tag 下载 404、镜像按 tag 找资产落空、updater 也算不出新版本。
+
+```text
+发布后必须回读三件：
+  1  GET /releases/tags/desktop-v<version>      → 200 且 draft=false
+  2  GET /releases/latest                       → tag_name 不是 untagged-*
+  3  assets >= 6
+```
+
+修复方式（已验证）：先 `POST /git/refs {ref: refs/tags/desktop-v<ver>, sha: <该发布 commit>}`，
+再 `PATCH /releases/<id> {tag_name: desktop-v<ver>}`。
+`release-tag-guard.py`（cron */10）自动做这件事：latest 是 untagged-* 就按资产名解析版本并改名；
+解析不出版本、或同名 tag 指向别的 commit，就报 `error` 交给人——不猜。

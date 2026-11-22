@@ -4,6 +4,9 @@ ARG SOURCE_COMMIT=unknown
 ENV SOURCE_COMMIT=${SOURCE_COMMIT}
 
 WORKDIR /workspace
+COPY contracts /workspace/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /workspace/server/src/contracts
 COPY agent-node/package.json /workspace/agent-node/package.json
 RUN cd /workspace/agent-node && bun install --ignore-scripts
 COPY agent-node /workspace/agent-node

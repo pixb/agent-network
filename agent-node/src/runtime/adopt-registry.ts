@@ -11,7 +11,11 @@ export interface AdoptedChild {
   nodeDir: string;
   launch_mode: "bare" | "tmux";
   codex_v2?: { version: 1; layout: "native" | "external-appserver"; socket: string; marker: string; config_hash: string; start_inputs?: CodexStartInputs };
+  /** OpenCode V2 co-presence: registered for source reads (fork); daemon start/stop not yet supported. */
+  opencode_v2?: { version: 1; config_hash: string };
   launch_evidence?: { mode: "bare" | "tmux"; config_hash: string; socket?: string; session?: string; pane?: string };
+  /** The node's own Hub URL, proven at adoption to be the daemon's Hub (proveSameHubByToken). */
+  proven_hub?: string;
 }
 export function readWorkdirRegistry(root: string): Record<string, unknown> {
   const path = join(root, ".anet", "child-workdirs.json");
@@ -51,4 +55,16 @@ export function forgetAdoptedChild(root: string, alias: string, requestId: strin
 export function refreshAdoptedChild(root: string, alias: string, entry: AdoptedChild): void {
   if (adoptedChild(root, alias)?.request_id !== entry.request_id) throw Error("adopt_binding_revoked_during_start");
   writeAdoptedChild(root, alias, entry);
+}
+
+/** Project directory of a child this daemon manages: an adopted entry's `workdir`
+ * (object entry), else the plain registry / legacy layout (`childWorkDirFor`). A
+ * malformed adopted entry falls back to the plain lookup, never throws. */
+export function managedChildWorkdirFor(daemonWorkDir: string, alias: string,
+  plain: (daemonWorkDir: string, alias: string) => string): string {
+  try {
+    const entry = adoptedChild(daemonWorkDir, alias);
+    if (entry?.workdir) return entry.workdir;
+  } catch { /* fall back */ }
+  return plain(daemonWorkDir, alias);
 }

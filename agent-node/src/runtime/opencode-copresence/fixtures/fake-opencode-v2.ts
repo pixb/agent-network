@@ -92,6 +92,9 @@ Bun.serve({
     if (process.env.TEST832_TRACE) appendFileSync(process.env.TEST832_TRACE, `${process.pid} ${path}\n`);
     if (path === "/api/info") return json({ version: process.env.TEST_INFO_VERSION ?? "2.0.22", pid: process.pid, urls: [`http://${hostname}:${port}`] });
     const directory = request.headers.get("x-opencode-directory");
+    if (path === "/api/model" && process.env.TEST4822_PARTIAL_MODEL === "1") return json({ location: { directory }, data: [
+      { providerID: "stub", id: "other", variants: [{ id: "low" }, { id: "high" }] },
+    ] });
     const projectConfig = directory && existsSync(join(directory, "opencode.json"))
       ? JSON.parse(readFileSync(join(directory, "opencode.json"), "utf8")) : {};
     if (path === "/api/config") return json(directory
@@ -113,15 +116,31 @@ Bun.serve({
     }
     const sessionLookup = /^\/api\/session\/(ses_[A-Za-z0-9]+)$/.exec(path);
     if (sessionLookup && request.method === "GET") {
+      if (sessionLookup[1] === "ses_FixtureNullResume") return json(null);
+      if (sessionLookup[1] === "ses_FixtureEmptyResume") return new Response(null, { status: 200 });
+      if (sessionLookup[1] === "ses_FixtureNoDataResume") return json({});
+      if (sessionLookup[1] === "ses_FixtureErrorResume") return json({ error: "synthetic unavailable" }, 503);
+      if (sessionLookup[1] === "ses_FixtureTimeoutResume") return new Promise<Response>(() => {});
+      if (sessionLookup[1] === "ses_FixtureWrongResume") return json({ data: { id: "ses_OtherFixture", location: { directory } } });
       const existing = sessions.get(sessionLookup[1]);
       return existing ? json({ data: { id: sessionLookup[1], location: existing.location, model: existing.model } }) : json({ error: "session not found" }, 404);
+    }
+    const sessionFork = /^\/api\/session\/(ses_[A-Za-z0-9]+)\/fork$/.exec(path);
+    if (sessionFork && request.method === "POST") {
+      const source = sessions.get(sessionFork[1]);
+      if (!source) return json({ error: "session not found" }, 404);
+      const sid = `ses_${Date.now().toString(16)}Fork${++counter}`;
+      sessions.set(sid, { entries: structuredClone(source.entries), inbox: [], running: false, steer: [], location: source.location, model: source.model });
+      return json({ data: { id: sid, location: source.location, model: source.model } });
     }
     const modelSwitch = /^\/api\/session\/(ses_[A-Za-z0-9]+)\/model$/.exec(path);
     if (modelSwitch && request.method === "POST") {
       const existing = sessions.get(modelSwitch[1]);
       if (!existing) return json({ error: "session not found" }, 404);
       const body: any = await request.json();
-      existing.model = body.model;
+      existing.model = process.env.TEST4822_PARTIAL_MODEL === "1"
+        ? { providerID: body.model.providerID, id: body.model.id, variant: "low" }
+        : body.model;
       return new Response(null, { status: 204 });
     }
     if (path === "/test/state") return json(Object.fromEntries(sessions));

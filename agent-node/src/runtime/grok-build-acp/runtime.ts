@@ -71,6 +71,47 @@ export interface GrokAcpTurnOptions {
    * turn fails closed before any prompt is sent. Undefined = agent default.
    */
   model?: string;
+  /** ACP 子进程的可执行文件（默认 grok）；agy 传 agy。 */
+  binary?: string;
+  /** ACP 子进程的 argv（默认 `grok agent stdio`）；agy 传 ["acp"]。 */
+  argv?: string[];
+  /**
+   * 运行时标签，只用于错误文案（`grok` / `antigravity`）。默认 `grok`；
+   * agy 这条链必须传 `antigravity`，否则报错会把人指向 `~/.grok/sessions/`
+   * 和 `flags.grokAcpTimeoutMs`，对 agy 节点完全不适用。
+   */
+  runtimeLabel?: string;
+  /**
+   * 是否强制 `session/set_model` 读回等于配置模型（grok 需要，#1958）。
+   * agy 目前没有验证过的 set_model 语义，接的时候传 false，按 argv 记 modelSource。
+   */
+  enforceModelReadback?: boolean;
+  /**
+   * 2026-11-20 —— 有些 ACP server（agy）`session/set_model` 返回 `{}` 成功，但**不发**
+   * `model_changed` / 任何 model 通知，读回这条路不存在。真机验证（负责人 2026-11-20）：
+   * set_model 换成 gemini-3.8-flash-high 后同一 session 追问「你是什么模型」，回
+   * 「我是 Gemini 3.8 Flash」—— 调用被接受就是生效。置 true 时以「调用没报错」为生效判据，
+   * modelSource 记 `set_model`（区别于有硬读回的 `readback`）。
+   */
+  trustSetModelResult?: boolean;
+  /**
+   * 2026-11-20 —— ACP `initialize` 的 `protocolVersion`。Grok 的服务端对类型宽容，
+   * 一直发字符串 `"1"`（默认不变）；agy（Go 写的 ACP server）对 JSON 类型敏感，
+   * 字符串会报 `cannot unmarshal string into Go struct field …protocolVersion of
+   * type int`（真机实测抓到），agy 侧传数字 `1`。
+   */
+  protocolVersion?: number | string;
+  /**
+   * 2026-11-20 —— `authenticate` 选哪个非交互方式。`selectAuthMethod()` 原本硬编码
+   * 只认 grok 自己的两个 method id（`xai.api_key` / `cached_token`），agy 的
+   * advertised 方式（`oauth-personal` 等）永远不在这张表里，于是即使 admin 已经在
+   * 这台机器上 `agy acp --login` 登录过（`agy models` 能正常列出模型，证明 keyring
+   * 里有有效凭据），headless 回合还是每次都报 "no supported non-interactive auth
+   * method" 并拒绝往下走——不是没登录，是我们的选择逻辑根本不认识 agy 的方式。
+   * 真机实测抓到。调用方可以传一份按优先级排列的 method id 列表；默认不变
+   * （grok 继续用内置的两条规则）。
+   */
+  authMethodPreference?: readonly string[];
   timeoutMs?: number;
   /**
    * #261 P1 redirect (2026-06-28) — handshake deadline (initialize +
@@ -82,7 +123,6 @@ export interface GrokAcpTurnOptions {
    */
   handshakeTimeoutMs?: number;
   drainMs?: number;
-  binary?: string;
   env?: NodeJS.ProcessEnv;
   /**
    * #204 — explicit MCP server list passed verbatim to `session/new` /
@@ -122,6 +162,8 @@ export interface GrokAcpTurnResult {
   /**
    * #1958 — where `effectiveModel` comes from:
    *   readback — agent confirmed it (`session/set_model` Ok / `model_changed` / session response);
+   *   set_model — the agent accepted `session/set_model` but emits no model events; the
+   *              call itself is the confirmation (agy 2026-11-20 verified on a real node);
    *   argv     — a model was configured and passed on argv, but this grok build has no
    *              `session/set_model` and reported nothing, so it is the *requested* id;
    *   default  — no model configured; the id is whatever the agent reported (or unknown).
@@ -129,7 +171,7 @@ export interface GrokAcpTurnResult {
   modelSource: GrokModelSource;
 }
 
-export type GrokModelSource = "readback" | "argv" | "default";
+export type GrokModelSource = "readback" | "set_model" | "argv" | "default";
 
 interface SessionResponse {
   sessionId?: string;
@@ -149,12 +191,26 @@ function rpcErrorParts(err: unknown): { code?: number; message: string; data?: u
 }
 
 export class GrokModelMismatchError extends Error {
-  constructor(readonly requested: string, readonly reported: string | undefined, readonly available: string[], detail?: string) {
+  constructor(
+    readonly requested: string,
+    readonly reported: string | undefined,
+    readonly available: string[],
+    detail?: string,
+    readonly runtimeLabel = "grok",
+  ) {
+    const cli = runtimeLabel === "antigravity" ? "agy" : "grok";
+    // 账号漂移最常见的表现：模型列表突然只剩一小撮（真机：27 → 6），配置的模型
+    // 根本不在里面。这时报「模型不存在」会把人带偏，补一句账号排查提示。
+    const looksLikeAccountDrift =
+      available.length > 0 && available.length <= 8 && !available.includes(requested);
     super(
-      `Grok ACP model check failed: configured model "${requested}" but the agent ${reported ? `reports "${reported}"` : "reported no model"}` +
+      `${runtimeLabel} ACP model check failed: configured model "${requested}" but the agent ${reported ? `reports "${reported}"` : "reported no model"}` +
       (detail ? ` (${detail})` : "") +
       (available.length ? `; available: ${available.join(", ")}` : "") +
-      ". Refusing to run the turn on a model other than the configured one (#1958).",
+      ". Refusing to run the turn on a model other than the configured one (#1958)." +
+      (looksLikeAccountDrift
+        ? ` The model list looks smaller than expected — the account behind the CLI may have changed (shared credential slot). Verify with \`${cli} models\` and re-run \`${cli} acp --login\` if needed.`
+        : ""),
     );
     this.name = "GrokModelMismatchError";
   }
@@ -175,6 +231,37 @@ interface InitializeResponse {
  *   4. reduce streamed notifications with replay filtering,
  *   5. return the accumulated reply text.
  */
+
+/**
+ * 2026-11-20 —— `initialize` 请求体的纯构造。抽出来是因为这里踩过真机坑：
+ * `protocolVersion` 原来写死成字符串 "1"（Grok 的服务端类型宽容），agy（Go 写的
+ * ACP server）对 JSON 类型敏感，字符串会报 `-32602 unmarshal string into Go
+ * struct field …int`。默认值不变（grok 继续发字符串），调用方可以显式覆盖
+ * （agy 传数字 1）。纯函数，方便直接断言字段类型，不用 mock 真实的 ACP 子进程。
+ */
+/** Shared with the session-level `_meta` hint further down in runGrokAcpTurn — one list, not two. */
+const BACKEND_TOOLS_HINT = ["x_keyword_search", "x_user_search", "video_gen", "web_search"];
+
+export function buildAcpInitParams(opts: {
+  protocolVersion?: number | string;
+  backendToolsHintEnabled: boolean;
+}): Record<string, unknown> {
+  const backendToolsHint = BACKEND_TOOLS_HINT;
+  return {
+    protocolVersion: opts.protocolVersion ?? "1",
+    clientCapabilities: {
+      fs: { readTextFile: true, writeTextFile: true },
+      // Only advertise capabilities implemented by GrokAcpClient.
+      // Claiming terminal support lets Grok send terminal/* client
+      // requests, which this adapter cannot satisfy and can surface as
+      // generic ACP -32603 internal errors.
+      terminal: false,
+      ...(opts.backendToolsHintEnabled ? { _meta: { "x.ai/requestedBackendTools": backendToolsHint } } : {}),
+    },
+    ...(opts.backendToolsHintEnabled ? { _meta: { "x.ai/requestedBackendTools": backendToolsHint } } : {}),
+  };
+}
+
 export async function runGrokAcpTurn(opts: GrokAcpTurnOptions): Promise<GrokAcpTurnResult> {
   const timeoutMs = opts.timeoutMs ?? 120_000;
   // #261 P1 redirect — handshake (init+auth+session) is a separate
@@ -184,7 +271,7 @@ export async function runGrokAcpTurn(opts: GrokAcpTurnOptions): Promise<GrokAcpT
   const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? Math.min(45_000, timeoutMs);
   const drainMs = opts.drainMs ?? 15_000;
   const childEnv = { ...process.env, ...opts.env };
-  const client = new GrokAcpClient();
+  const client = new GrokAcpClient(opts.runtimeLabel ?? "grok");
   const state = newGrokTurnState(opts.sessionId);
 
   const onNotification = (msg: GrokAcpNotification) => {
@@ -209,7 +296,7 @@ export async function runGrokAcpTurn(opts: GrokAcpTurnOptions): Promise<GrokAcpT
   if (opts.onStderr) client.on("stderr", onStderr);
 
   try {
-    client.start({ cwd: opts.cwd, env: childEnv, binary: opts.binary , model: opts.model });
+    client.start({ cwd: opts.cwd, env: childEnv, binary: opts.binary, model: opts.model, argv: opts.argv });
 
     // #205 RFC-021 Path A — request Grok backend tools (X search, video
     // gen, web search/fetch) via _meta capability hint. ACP spec has no
@@ -257,20 +344,10 @@ export async function runGrokAcpTurn(opts: GrokAcpTurnOptions): Promise<GrokAcpT
         `Grok's backend tools (X search / video_gen), see RFC-021 §11.`,
       );
     }
-    const backendToolsHint = ["x_keyword_search", "x_user_search", "video_gen", "web_search"];
-    const initParams: Record<string, unknown> = {
-      protocolVersion: "1",
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        // Only advertise capabilities implemented by GrokAcpClient.
-        // Claiming terminal support lets Grok send terminal/* client
-        // requests, which this adapter cannot satisfy and can surface as
-        // generic ACP -32603 internal errors.
-        terminal: false,
-        ...(_hintEnabled ? { _meta: { "x.ai/requestedBackendTools": backendToolsHint } } : {}),
-      },
-      ...(_hintEnabled ? { _meta: { "x.ai/requestedBackendTools": backendToolsHint } } : {}),
-    };
+    const initParams: Record<string, unknown> = buildAcpInitParams({
+      protocolVersion: opts.protocolVersion,
+      backendToolsHintEnabled: _hintEnabled,
+    });
     // #261 P1 redirect (2026-06-28) — handshake (initialize / authenticate
     // / session/new|load) now uses `handshakeTimeoutMs` (default 45s),
     // decoupled from the long-running `session/prompt` deadline. Pre-fix
@@ -278,7 +355,7 @@ export async function runGrokAcpTurn(opts: GrokAcpTurnOptions): Promise<GrokAcpT
     // a wedged `initialize` would burn the full prompt window before the
     // operator saw a failure signal.
     const init = await client.request<InitializeResponse>("initialize", initParams, handshakeTimeoutMs);
-    const authMethod = selectAuthMethod(init, childEnv);
+    const authMethod = selectAuthMethod(init, childEnv, opts.authMethodPreference, opts.runtimeLabel ?? "grok");
     await client.request("authenticate", { methodId: authMethod, meta: { headless: true } }, handshakeTimeoutMs);
 
     // #204 — pass through the caller's mcpServers list; empty array preserves
@@ -292,14 +369,14 @@ export async function runGrokAcpTurn(opts: GrokAcpTurnOptions): Promise<GrokAcpT
     // session-create time rather than at initialize-time; we cover both.
     const mcpServers = opts.mcpServers ?? [];
     const sessionExtra = _hintEnabled
-      ? { _meta: { "x.ai/requestedBackendTools": backendToolsHint } }
+      ? { _meta: { "x.ai/requestedBackendTools": BACKEND_TOOLS_HINT } }
       : {};
     const session = opts.sessionId
       ? await client.request<SessionResponse>("session/load", { sessionId: opts.sessionId, cwd: opts.cwd, mcpServers, ...sessionExtra }, handshakeTimeoutMs)
       : await client.request<SessionResponse>("session/new", { cwd: opts.cwd, mcpServers, ...sessionExtra }, handshakeTimeoutMs);
 
     const sessionId = extractSessionId(session) ?? opts.sessionId;
-    if (!sessionId) throw new Error("Grok ACP session response did not include sessionId");
+    if (!sessionId) throw new Error(`${opts.runtimeLabel ?? "grok"} ACP session response did not include sessionId`);
 
     state.sessionId = sessionId;
     await opts.onSession?.(sessionId);
@@ -412,6 +489,10 @@ async function applyConfiguredModel(
   opts: GrokAcpTurnOptions,
   timeoutMs: number,
 ): Promise<{ effectiveModel?: string; modelSource: GrokModelSource }> {
+  // agy 这类没有验证过 set_model 读回的 runtime：不猜、不读回，按 argv 记来源。
+  if (opts.enforceModelReadback === false) {
+    return { effectiveModel: opts.model, modelSource: opts.model ? "argv" : "default" };
+  }
   const { current, available } = sessionModels(session);
   const requested = opts.model?.trim();
   if (!requested) {
@@ -426,6 +507,17 @@ async function applyConfiguredModel(
     const res = await client.request<SetModelResponse>("session/set_model", { sessionId, modelId: requested }, timeoutMs);
     const ok = res?._meta?.model?.Ok;
     confirmed = typeof ok === "string" ? ok : undefined;
+    // agy：没有 model_changed 可等，调用本身成功即生效（真机已验证会真的换模型）。
+    if (opts.trustSetModelResult) {
+      // agy 在部分路径会回空对象；「没报错」不等于「换了模型」，至少要在日志里说清楚。
+      if (!confirmed) {
+        opts.onStderr?.(
+          `[agy] session/set_model returned no _meta.model.Ok; trusting the call because agy emits no model events — ` +
+          `cannot prove "${requested}" took effect on this session.`,
+        );
+      }
+      return { effectiveModel: requested, modelSource: "set_model" };
+    }
   } catch (err) {
     const { code, message, data } = rpcErrorParts(err);
     if (code === -32601 || /method not found/i.test(message)) {
@@ -436,8 +528,13 @@ async function applyConfiguredModel(
       return { effectiveModel: requested, modelSource: "argv" };
     }
     // -32602 "unknown model id" and anything else: fail closed, verbatim.
-    throw new GrokModelMismatchError(requested, state.modelId ?? current, available,
-      `session/set_model rejected: ${message}${data !== undefined ? ` ${typeof data === "string" ? data : JSON.stringify(data)}` : ""}`);
+    throw new GrokModelMismatchError(
+      requested,
+      state.modelId ?? current,
+      available,
+      `session/set_model rejected: ${message}${data !== undefined ? ` ${typeof data === "string" ? data : JSON.stringify(data)}` : ""}`,
+      opts.runtimeLabel ?? "grok",
+    );
   }
   // Prefer the notification that followed set_model; give it a moment to land.
   const started = Date.now();
@@ -446,16 +543,21 @@ async function applyConfiguredModel(
   }
   const reported = state.modelChanges > changesBefore ? state.modelId : (confirmed ?? state.modelId ?? current);
   if (reported !== requested) {
-    throw new GrokModelMismatchError(requested, reported, available, "after session/set_model");
+    throw new GrokModelMismatchError(requested, reported, available, "after session/set_model", opts.runtimeLabel ?? "grok");
   }
   return { effectiveModel: reported, modelSource: "readback" };
 }
 
-function selectAuthMethod(init: InitializeResponse, env: NodeJS.ProcessEnv): string {
+export function selectAuthMethod(init: InitializeResponse, env: NodeJS.ProcessEnv, preference?: readonly string[], runtimeLabel = "grok"): string {
   const ids = new Set((init.authMethods ?? []).map((method) => method.id).filter((id): id is string => typeof id === "string"));
+  // 调用方显式给的优先级表（目前只有 agy 传）先试——保持 grok 的两条内置规则不变，
+  // 不让这份新表影响它。
+  if (preference) {
+    for (const id of preference) if (ids.has(id)) return id;
+  }
   if (env.GROK_CODE_XAI_API_KEY && ids.has("xai.api_key")) return "xai.api_key";
   if (ids.has("cached_token")) return "cached_token";
-  throw new Error(`Grok ACP authenticate failed: no supported non-interactive auth method (advertised=${JSON.stringify([...ids])})`);
+  throw new Error(`${runtimeLabel} ACP authenticate failed: no supported non-interactive auth method (advertised=${JSON.stringify([...ids])})`);
 }
 
 function extractSessionId(value: unknown): string | undefined {

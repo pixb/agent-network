@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     test "$(opencode --version)" = "$OPENCODE_VERSION"
 
 WORKDIR /test227
+COPY contracts /contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts //server/src/contracts
 COPY agent-node /agent-node-src
 COPY agent-network /agent-network-src
 COPY tests/test227-opencode-tui-copresence/harness.ts /test227/harness.ts

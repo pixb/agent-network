@@ -31,6 +31,9 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends tmux \
   && rm -rf /var/lib/apt/lists/*
 
+COPY contracts /workspace/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /workspace/server/src/contracts
 COPY agent-node/package.json ./agent-node/package.json
 COPY agent-node/src ./agent-node/src
 COPY agent-network ./agent-network

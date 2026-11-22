@@ -35,7 +35,7 @@ const PROJECT = resolve(mkdtempSync(join(tmpdir(), "oc-hub-proj-")));
 function cleanup() {
   resetOpenCodeCatalogForTest();
   for (const net of [NET, OTHER]) {
-    for (const table of ["node_create_requests", "audit_log", "nodes", "sessions", "api_tokens", "network_members"]) {
+    for (const table of ["node_create_requests", "node_daemon_bindings", "audit_log", "nodes", "sessions", "api_tokens", "network_members"]) {
       try { db.run(`DELETE FROM ${table} WHERE network_id = ?1`, [net]); } catch {}
     }
     try { db.run("DELETE FROM networks WHERE network_id = ?1", [net]); } catch {}
@@ -123,6 +123,20 @@ function snapshot(directory = PROJECT, overrides: Record<string, unknown> = {}) 
 }
 
 describe("hub authorizes an owned OpenCode V2 catalog read", () => {
+  test("session model write is denied by default and requires human admin", async () => {
+    seed();
+    const args = { daemon_node_id: DAEMON, node_id: V2, session_id: "ses_synthetic", model: { providerID: "stub", id: "model", variant: "high" } };
+    const admin = handlers(USER, false, null);
+    expect(await call(admin.out.select_opencode_session_model!, args)).toEqual({ ok: false, status: "rejected", reason: "unsupported" });
+    const viewer = handlers(VIEWER, false, null);
+    expect(await call(viewer.out.select_opencode_session_model!, args)).toEqual({ ok: false, error: "access_denied" });
+    const outsider = handlers(OUTSIDER, false, null);
+    expect(await call(outsider.out.select_opencode_session_model!, args)).toEqual({ ok: false, error: "access_denied" });
+    const node = handlers(USER, true, DAEMON_TOK);
+    expect(await call(node.out.select_opencode_session_model!, args)).toEqual({ ok: false, error: "user_token_required" });
+    const schema = (admin.server as any)._registeredTools.select_opencode_session_model.inputSchema;
+    expect((await schema.safeParseAsync({ ...args, model: { ...args.model, headers: { token: "fixture" } } })).success).toBe(false);
+  });
   test("member queues, daemon reads the owned loopback, ready snapshot stays unverified", async () => {
     seed();
     const user = handlers(USER, false, null);
@@ -182,6 +196,27 @@ describe("hub authorizes an owned OpenCode V2 catalog read", () => {
     expect(queue(USER, V1)).toEqual({ ok: false, error: "not_opencode_v2" });
     expect(queue(USER, UNSAFE)).toEqual({ ok: false, error: "not_opencode_v2" });
     expect(queue(USER, "node_missing")).toEqual({ ok: false, error: "node_not_found" });
+  });
+
+  test("an ADOPTED OpenCode V2 node (no create row) may be read; directory = binding workdir (admin 2026-11-11)", () => {
+    seed();
+    const adopt = (nodeId: string, runtime: string, generation: string | null, status = "active") => {
+      db.run(`INSERT INTO nodes (node_id, node_name, alias, network_id, runtime, config_snapshot, hostname, created_at, updated_at, lifecycle_state)
+        VALUES (?1, ?1, ?1, ?2, ?3, ?4, 'host-x', datetime('now'), datetime('now'), 'active')`,
+        [nodeId, NET, runtime, JSON.stringify(generation ? { flags: { opencodeGeneration: generation } } : {})]);
+      db.run(`INSERT INTO node_daemon_bindings(request_id,network_id,node_id,daemon_node_id,workdir,requested_by,status,created_at,updated_at)
+        VALUES(?1,?2,?3,?4,?5,'u',?6,1,1)`, [`adopt_${nodeId}`, NET, nodeId, DAEMON, PROJECT, status]);
+    };
+    adopt("node_adopted_v2", "opencode-sdk", "v2");
+    adopt("node_adopted_v1", "opencode-sdk", "v1");
+    adopt("node_adopted_refused", "opencode-sdk", "v2", "refused");
+    const ok = queue(USER, "node_adopted_v2");
+    expect(ok.ok).toBe(true);
+    const taken = takeOpenCodeCatalogRequest((ok as any).request_id, DAEMON);
+    expect(taken.ok && taken.alias).toBe("node_adopted_v2");
+    expect(taken.ok && taken.directory).toBe(PROJECT);
+    expect(queue(USER, "node_adopted_v1")).toEqual({ ok: false, error: "not_opencode_v2" });
+    expect(queue(USER, "node_adopted_refused")).toEqual({ ok: false, error: "node_not_found" });
   });
 
   test("pending is not a snapshot; expiry, bad acks, and a missing endpoint stay closed", async () => {

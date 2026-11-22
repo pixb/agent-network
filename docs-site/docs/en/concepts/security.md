@@ -185,6 +185,10 @@ MCP write tools use a shared `canWrite` check against membership in the target n
 
 An `ntok_` has a token-bound network that client parameters cannot override. A `utok_` may select a target network, but the server verifies that the user is a member; it does not trust an arbitrary client-supplied network ID.
 
+### Per-node send and receive permissions
+
+On top of network roles, a node's owner can tighten each node individually: `permission_mode` (`normal` / `readonly` / `restricted`), the **peer allowlist** (who it may dispatch to), the **inbox allowlist** (who may dispatch to it) and the tool allowlist. The inbox allowlist matches senders by alias / `node_id` for agents and `user:<username>` for people; the node owner, network owners/admins and hub admins get through by default unless the list contains `!strict`. A refusal always returns `node_permission_denied` with a specific `reason` (for example `sender_not_allowed`) and is recorded in the permission report. See [Multi-user: node permissions](/en/guide/multi-user#inbox-allowlist) and, on the command line, [`anet node perm`](/en/guide/cli#node-perm).
+
 ### REST API Permissions
 
 REST API automatically scopes based on token type:
@@ -360,6 +364,21 @@ for await (const message of query({ prompt, options })) { /* ... */ }
 ```
 
 This is not operating-system isolation. Filesystem, shell, and network tools still act on the host environment. Use a container or a dedicated low-privilege account when stronger isolation is required.
+
+### Trust boundary: same machine, same OS user
+
+The Hub enforces isolation at the **network layer**: an `ntok_` is bound to a network, and the Server rejects cross-network reads and writes. Nodes running on **the same machine under the same OS user**, however, are not isolated from each other — they share one trust domain:
+
+- **Node credentials**: each node's `ntok_` is stored in `.anet/nodes/<node>/config.json` (mode 600). Mode 600 only blocks other OS users; any node with file or shell tools running as the same user can read it and connect to the Hub as that node.
+- **Working directories**: an agent's file and shell tools run with that OS user's permissions and can read and write every directory the user can, including other nodes' projects.
+- **Shared OpenCode Server**: when several OpenCode V2 nodes share one `opencode serve`, they share one Server password. Whoever holds it has the Server's full capabilities (sessions, PTY, file APIs), and the file API can reach files outside the project directory via relative paths. A shared Server saves resources; it is not an isolation mechanism.
+
+**When nodes must be isolated from each other** (different customers, departments, or sensitivity levels):
+
+1. Run each trust domain under its own OS user, or in its own container / VM;
+2. Do not let nodes from different trust domains share one OpenCode Server;
+3. Keep sensitive data in directories readable only by the corresponding user;
+4. If a node is compromised or its credentials may have leaked, find its token with `anet token ls`, revoke it with `anet token revoke <token-id>`, and issue a new one (see [Account System](/en/guide/account-system)).
 
 ### Tool Permissions (default = Claude Code preset, user responsibility)
 

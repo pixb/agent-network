@@ -12,7 +12,7 @@ export default withMermaid(defineConfig({
     const fm = pageData.frontmatter
     if (fm.layout !== 'home' || !fm.hero?.text) return
     const slogan = String(fm.hero.text)
-    const sub = fm.hero.tagline ? String(fm.hero.tagline) : ''
+    const sub = fm.hero.tagline ? String(fm.hero.tagline).replace(/<\/span>/g, '。').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : ''
     const name = String(fm.hero.name ?? fm.title ?? 'Agent Network')
     fm.titleTemplate = slogan
     ;(pageData as any).titleTemplate = slogan // PageData 自带 titleTemplate 字段(加载时从 frontmatter 拷过来),两处都要写
@@ -44,6 +44,28 @@ export default withMermaid(defineConfig({
         // skip fence/code_block — VitePress treats their first attr as the
         // language name, which breaks if we prepend data-source-line.
       ])
+      // API reference: render `### GET /api/x` as a method badge + monospace path.
+      // Runs after the anchor plugin and only rewrites rendered children, so the
+      // heading id/slug (deep links like #get-api-status) is unchanged.
+      const METHOD = /^(GET|POST|PUT|PATCH|DELETE)\s+(\S.*)$/
+      md.core.ruler.push('http_method_badge', (state: any) => {
+        const toks = state.tokens
+        for (let i = 0; i + 1 < toks.length; i++) {
+          if (toks[i].type !== 'heading_open' || !['h2', 'h3', 'h4'].includes(toks[i].tag)) continue
+          const inline = toks[i + 1]
+          const kids = inline?.children
+          // VitePress' anchor plugin appends a permalink link; only the leading text token matters.
+          const at = kids ? kids.findIndex((t: any) => t.type === 'text' && t.content.trim() !== '') : -1
+          if (at !== 0) continue
+          const m = METHOD.exec(kids[0].content.trim())
+          if (!m) continue
+          const esc = (v: string) => md.utils.escapeHtml(v)
+          const html = new state.Token('html_inline', '', 0)
+          html.content = `<span class="http-method http-${m[1].toLowerCase()}">${m[1]}</span><code class="http-path">${esc(m[2])}</code>`
+          kids.splice(0, 1, html)
+          toks[i].attrJoin('class', 'http-endpoint')
+        }
+      })
       md.core.ruler.push('source_line_attrs', (state: any) => {
         state.tokens.forEach((tok: any) => {
           if (

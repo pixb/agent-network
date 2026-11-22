@@ -18,8 +18,8 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } fro
 import { opencodeOwnedPathModeIsSafe } from "./opencode-owner-mode";
 import { describeUnsafeDirectory, describeUnsafePath } from "./unsafe-package-path-reason";
 
-export const PAIRED_AGENT_NETWORK_VERSION = "2.3.0-preview.216";
-export const PAIRED_AGENT_NODE_VERSION = "2.5.0-preview.182";
+export const PAIRED_AGENT_NETWORK_VERSION = "2.3.0-preview.254";
+export const PAIRED_AGENT_NODE_VERSION = "2.5.0-preview.220";
 export const PAIRED_AGENT_NODE_SPEC = `@sleep2agi/agent-node@${PAIRED_AGENT_NODE_VERSION}`;
 // Backward-compatible names for the first consumer of the shared pair.
 export const OPENCODE_AGENT_NETWORK_VERSION = PAIRED_AGENT_NETWORK_VERSION;
@@ -234,4 +234,59 @@ export function resolveAgentNodePackageEntrypointFromPath(
     `no exact trusted ${packageSpec} package entrypoint found on PATH` +
     (errors[0] ? `; first rejected candidate: ${errors[0]}` : ""),
   );
+}
+
+/**
+ * `anet pair` 的内容。为什么要有这个命令：
+ *
+ * 客户端/文档过去写的是 `npm i -g @sleep2agi/agent-node@preview` 这种**单边**提示。
+ * 但 opencode-cli 这条路径**禁用了自动 npx**（见 resolveOpencodeAgentNodeLaunchPlan：
+ * "automatic npx execution is disabled for opencode-cli"），所以目标机上必须有一份
+ * **精确版本**的全局 agent-node；单边装一个 @preview 很容易装成**半对**，
+ * CLI 随即 `Incompatible agent-node for opencode-cli` 拒绝启动，节点掉线。
+ *
+ * 更糟的是两个包的 preview tag 会**先后**移动（node 先发、声明它的 CLI 后发），
+ * 所以「两边都用 @preview」本身也有窗口期不自洽 —— tag 不是配对判据，
+ * **本包里的常量才是**。把常量打印出来，是唯一不用猜的答案。
+ */
+/** `engines` 要求的 Node 版本（与 agent-network/package.json 同源）。 */
+export const REQUIRED_NODE_VERSION = "22.13.0";
+
+/**
+ * `anet pair` 的 Node 版本提示（不阻断）。
+ *
+ * 2026-11-22 —— 负责人：npm 的 EBADENGINE 只是裸警告，用户看不懂「会怎样」。
+ * 这里用一句话说清：当前版本 X、建议 ≥ required、否则可能有不明确的行为差异。
+ * 纯函数，方便单测；返回 null 表示无需提示。
+ */
+export function nodeEngineWarning(
+  current: string = process.versions.node,
+  required: string = REQUIRED_NODE_VERSION,
+): string | null {
+  const parse = (v: string) => v.split(".").map(n => parseInt(n, 10) || 0);
+  const [maj, min, patch] = parse(current);
+  const [rMaj, rMin, rPatch] = parse(required);
+  const ok = maj > rMaj || (maj === rMaj && min > rMin) || (maj === rMaj && min === rMin && patch >= rPatch);
+  if (ok) return null;
+  return `[anet] ⚠️  当前 Node v${current} 低于本包 engines 要求的 ${required} —— 建议升级到 ≥${required}，否则可能有不明确的行为差异（本次不阻断）。`;
+}
+
+export function pairInfo(includeOpenCodeConstraints = true): string {
+  const lines = [
+    `CLI:        @sleep2agi/agent-network@${PAIRED_AGENT_NETWORK_VERSION}`,
+    `agent-node: ${PAIRED_AGENT_NODE_SPEC}   (精确配对，不接受其它版本)`,
+    ``,
+    `安装这对精确版本:`,
+    `  ${opencodeExactPairInstallCommand()}`,
+  ];
+  if (includeOpenCodeConstraints) {
+    lines.push(
+      ``,
+      `opencode-cli / OpenCode V2 的额外约束:`,
+      `  · 自动 npx 已被禁用 —— 目标机上必须有上面那个**精确版本**的全局 agent-node`,
+      `  · 用别的版本会直接拒启: Incompatible agent-node for opencode-cli`,
+      `  · 别用 @preview 猜: 两个包的 preview tag 会先后移动，tag 不是配对判据`,
+    );
+  }
+  return lines.join("\n");
 }

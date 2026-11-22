@@ -6,6 +6,9 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends curl jq \
   && rm -rf /var/lib/apt/lists/*
 
+COPY contracts /workspace/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /workspace/server/src/contracts
 COPY server/package.json server/bun.lock* server/package-lock.json ./server/
 RUN cd server && bun install --frozen-lockfile --ignore-scripts
 

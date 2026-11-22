@@ -17,6 +17,8 @@
 
 import { spawn } from "node:child_process";
 import {
+  chmodSync,
+  constants as fsConstants,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -24,15 +26,17 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { adoptedChild } from "./adopt-registry.js";
 import { childDirNameForCreate, resolveChildDirName } from "./child-dir-name.js";
 import { childWorkDirFor, prepareChildWorkdir, recordChildWorkdir, WorkdirError } from "./child-workdir.js";
 import { atomicWriteJson } from "./config-apply.js";
 import { findCodexRolloutFile } from "./codex-thread-size-check.js";
 import { writeCopresenceYoloToCodexHome } from "./codex-copresence-yolo.js";
 import {
-  ensureGlobalAnetConfig,
+  daemonChildCliEnv,
   getAnetBinAbs,
   minimalEnv,
   resolveChildHome,
@@ -53,6 +57,11 @@ const COPY_FIELDS = [
   "anet_version", "runtime", "model", "tools", "hub", "systemPrompt", "team",
   "codexBin", "codexCopresence", "codexCopresenceFullAccess",
   "opencodeGeneration", "opencodeMode", "grokCopresence",
+  // OpenCode V2 共存节点挂在机器上的共享 serve（provider 密钥只在那个进程里）。不带过去，
+  // 克隆会自己起一个私有 serve，没有密钥，第一轮就 outcome=failed（vdev 2026-11-11 实测）。
+  // 这两格是地址和**文件路径**，不是秘密本身。
+  "opencodeSharedServerUrl", "opencodeSharedServerPasswordFile",
+  "network_id",
 ] as const;
 
 export type SessionCapability = "files_copied" | "id_aliased" | "unsupported" | "skipped";
@@ -79,6 +88,8 @@ export function planCloneWorkdir(input: {
   sourceWorkdir: string;
   daemonWorkdir: string;
   newName: string;
+  /** Present = take `<source folder>-N` (first free N >= 2). Absent = folder named after the new node. */
+  taken?: (path: string) => boolean;
 }): CloneDiskPlan {
   const source = resolve(input.sourceWorkdir);
   const daemon = resolve(input.daemonWorkdir);
@@ -92,10 +103,80 @@ export function planCloneWorkdir(input: {
       workdirReason: "new_empty: source has no project workdir (it lives in the daemon cwd), so the clone is a new empty directory under <daemon cwd>/clone-work",
     };
   }
+  if (input.taken) {
+    // admin 2026-11-10: fork 到新目录 = 源目录旁边的 `<源目录名>-N`（与 vdev 上
+    // agent-network-client-oe / -2 / -3 的手工习惯一致）。源目录名本身已带 `-N`
+    // 时从它的主干往后数，不叠成 `-2-2`。
+    const base = basename(source).replace(/-\d+$/, "") || basename(source);
+    for (let n = 2; n < 1000; n++) {
+      const candidate = join(dirname(source), `${base}-${n}`);
+      if (!input.taken(candidate)) {
+        return { workdir: candidate, workdirReason: `new_empty: next free sibling folder ${base}-${n}; only AGENTS.md / CLAUDE.md are seeded from the source` };
+      }
+    }
+  }
   return {
     workdir: join(dirname(source), folder),
     workdirReason: "new_empty: empty sibling under the source workdir's parent (same root); source contents are not copied",
   };
+}
+
+/** Which Hub URL the clone writes: always the daemon's own.
+ *
+ * .201 kept the source's URL for shared-serve OpenCode sources, on the theory that the shared
+ * serve dials the Hub. It does not: it dials the node's 127.0.0.1 MCP proxy, and the **node
+ * process** (spawned by the daemon, with the daemon's env) forwards to the Hub. On vdev that env
+ * carries NODE_USE_ENV_PROXY=1, through which the source's `http://…:9300` gets 407 and the
+ * daemon's https URL works (verified 2026-11-11: TMA客户端欧8号 daemon-started on https ⇒ ready
+ * and answering; on :9300 ⇒ MCP readiness timeout). The daemon's URL is reachable by
+ * construction: the daemon itself is connected through it. */
+export function cloneHubUrl(_source: Record<string, unknown>, daemonHub: string): string {
+  return daemonHub;
+}
+
+/** Human-written instruction files a fork carries into its new folder. Never the
+ * per-node generated ones (opencode.json / ANET-COMMHUB.md hold the source's
+ * MCP Authorization header), never `.anet`, never symlinks. */
+export const CLONE_SEED_FILES = ["AGENTS.md", "CLAUDE.md"] as const;
+const SEED_MAX_BYTES = 256 * 1024;
+
+export function seedCloneInstructions(sourceWorkdir: string, targetWorkdir: string,
+  rename?: { from: string; to: string }): string[] {
+  if (resolve(sourceWorkdir) === resolve(targetWorkdir)) return [];
+  const copied: string[] = [];
+  for (const name of CLONE_SEED_FILES) {
+    const from = join(sourceWorkdir, name);
+    const to = join(targetWorkdir, name);
+    let st;
+    try { st = lstatSync(from); } catch { continue; }
+    if (!st.isFile() || st.isSymbolicLink() || st.size > SEED_MAX_BYTES) continue;
+    if (existsSync(to)) continue;
+    try { copyFileSync(from, to, fsConstants.COPYFILE_EXCL); chmodSync(to, 0o600); copied.push(name); } catch { continue; }
+    // vdev 2026-11-11：fork 出来的 8号 读 AGENTS.md 第一行仍是「# TMA客户端欧6号」。只改**恰好是**
+    // 源节点名的那一行标题，其余逐字节不动。
+    if (rename && rename.from && rename.to && rename.from !== rename.to) {
+      try {
+        const text = readFileSync(to, "utf8");
+        const lines = text.split("\n");
+        const i = lines.findIndex((l) => l.trim().length > 0);
+        if (i >= 0 && lines[i].replace(/\r$/, "").trim() === `# ${rename.from}`) {
+          lines[i] = lines[i].replace(`# ${rename.from}`, `# ${rename.to}`);
+          writeFileSync(to, lines.join("\n"), { mode: 0o600 });
+        }
+      } catch { /* keep the verbatim copy */ }
+    }
+  }
+  return copied;
+}
+
+/** Workdir of a source child: daemon-created entries are plain strings in the
+ * registry; adopted ones are objects (`adopted: true`, `workdir`). */
+export function sourceWorkdirFor(daemonWorkDir: string, alias: string): string {
+  try {
+    const entry = adoptedChild(daemonWorkDir, alias);
+    if (entry?.workdir) return entry.workdir;
+  } catch { /* malformed adopted entry: fall back to the plain registry */ }
+  return childWorkDirFor(daemonWorkDir, alias);
 }
 
 function sessionField(runtime: string, source: Record<string, unknown>): { field: string; id: string } | null {
@@ -120,6 +201,8 @@ export function planSessionCopy(input: {
   sessionId: string | null;
   transcriptFound: boolean;
   field: string | null;
+  /** new_empty for OpenCode = fresh session (an aliased id would make two nodes in two folders write one transcript). */
+  policy?: "new_empty" | "share_source";
 }): SessionCopyOutcome {
   if (!input.copySession) {
     return { capability: "skipped", reason: "copy_session is false; the clone starts with no session id" };
@@ -128,6 +211,9 @@ export function planSessionCopy(input: {
   if (runtime === "opencode-cli") {
     if (!input.sessionId) {
       return { capability: "unsupported", reason: "OpenCode source has no session id to alias" };
+    }
+    if (input.policy === "new_empty") {
+      return { capability: "unsupported", reason: "OpenCode clone in a new folder starts a fresh session; the source transcript is not shared across folders (hand context over by message)" };
     }
     return {
       capability: "id_aliased",
@@ -358,7 +444,7 @@ export async function handleCloneNodeDoorbell(
   const alias = req.clone.source_alias;
   const policy = req.clone.workdir_policy === "share_source" ? "share_source" : "new_empty";
   const copySession = req.clone.copy_session !== false;
-  const sourceWorkdir = childWorkDirFor(deps.workDir, alias);
+  const sourceWorkdir = sourceWorkdirFor(deps.workDir, alias);
   const nodesRoot = join(sourceWorkdir, ".anet", "nodes");
   const sourceDirName = resolveChildDirName(nodesRoot, alias);
   const sourceNodeDir = sourceDirName ? join(nodesRoot, sourceDirName) : "";
@@ -389,7 +475,7 @@ export async function handleCloneNodeDoorbell(
   }
 
   const disk = planCloneWorkdir({
-    policy, sourceWorkdir, daemonWorkdir: deps.workDir, newName: req.node_spec.name,
+    policy, sourceWorkdir, daemonWorkdir: deps.workDir, newName: req.node_spec.name, taken: existsSync,
   });
   let childWorkDir = disk.workdir;
   const childDirName = childDirNameForCreate(req.node_spec.name, policy === "new_empty" ? childWorkDir : sourceWorkdir);
@@ -409,6 +495,10 @@ export async function handleCloneNodeDoorbell(
     }
   }
   deps.log(`[clone-node] workdir ${childWorkDir} — ${disk.workdirReason}`);
+  if (policy === "new_empty") {
+    const seeded = seedCloneInstructions(sourceWorkdir, childWorkDir, { from: alias, to: req.node_spec.name });
+    if (seeded.length) deps.log(`[clone-node] seeded ${seeded.join(", ")} from ${sourceWorkdir}`);
+  }
 
   const childDir = join(childWorkDir, ".anet", "nodes", childDirName);
   try {
@@ -444,6 +534,7 @@ export async function handleCloneNodeDoorbell(
     sessionId: picked?.id ?? null,
     transcriptFound: runtime === "opencode-cli" ? false : transcriptFound,
     field: picked?.field ?? null,
+    policy,
   });
   if (session.capability !== "files_copied" && runtime !== "opencode-cli") {
     // A failed or skipped copy must not leave a half-written transcript under the new cwd.
@@ -455,7 +546,8 @@ export async function handleCloneNodeDoorbell(
     }
   }
   const { config, skipped } = buildClonedConfig({
-    source, name: req.node_spec.name, nodeId, token: req.child_token, hubUrl: deps.hubUrl,
+    source, name: req.node_spec.name, nodeId, token: req.child_token,
+    hubUrl: cloneHubUrl(source, deps.hubUrl),
     session, targetWorkdir: childWorkDir,
   });
   if (Array.isArray(req.clone.channels) && !config.channels) {
@@ -471,8 +563,6 @@ export async function handleCloneNodeDoorbell(
   deps.log(`[clone-node] session ${session.capability}: ${session.reason}`);
   if (skipped.length) deps.log(`[clone-node] skipped secrets/channels: ${skipped.join(", ")}`);
 
-  try { ensureGlobalAnetConfig(home, deps.hubUrl); }
-  catch (e: any) { deps.warn(`[clone-node] global config write failed (continuing): ${e?.message || e}`); }
 
   const childCfgPath = join(childDir, "config.json");
   try {
@@ -519,7 +609,7 @@ export async function handleCloneNodeDoorbell(
   try {
     const launch = deps.spawnChild ?? ((bin: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }) =>
       spawn(bin, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "ignore", "ignore"], detached: true }));
-    const child = launch(anetBin, ["node", "start", childDirName], { cwd: childWorkDir, env: minimalEnv() });
+    const child = launch(anetBin, ["node", "start", childDirName], { cwd: childWorkDir, env: daemonChildCliEnv(deps.hubUrl) });
     childPid = child.pid || -1;
     try { child.stdin?.destroy(); } catch { /* ok */ }
     try { child.stdout?.destroy(); } catch { /* ok */ }

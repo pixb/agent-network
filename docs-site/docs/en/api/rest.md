@@ -1,3 +1,7 @@
+---
+pageClass: api-reference
+---
+
 <script setup>
 // Old deep links (/api/rest#<anchor>) whose section moved to a sub-page when the
 // REST reference was split (docs slimming, 2026-09-25): forward them.
@@ -128,6 +132,12 @@ none).
 > [View source ↗](https://github.com/sleep2agi/agent-network/blob/main/server/src/server.ts)
 
 Register a new user. The first user registered automatically becomes admin.
+
+With `COMMHUB_REGISTRATION=closed` the Hub refuses new sign-ups with 403 `registration_closed`; an empty database (registering the first admin) is not affected. Unset keeps registration open.
+
+The per-IP limits on register and login read the last `X-Forwarded-For` hop by default. When a reverse proxy sits in front of the Hub, set `COMMHUB_TRUSTED_PROXY_IPS=<proxy IP,…>`: forwarded headers are honoured only on connections from those addresses, and anything connecting to the Hub port directly is limited by its own address, so a forged header cannot dodge the limit.
+
+When the Hub port is exposed to the internet and the cloud firewall cannot be changed, set `COMMHUB_ALLOWED_PEER_IPS=<IP,…>`: only those peers and loopback (127.0.0.0/8, ::1) are accepted; anything else gets 403 `peer_not_allowed`. Unset means no restriction.
 
 ```bash
 # v0.8+: register is a public endpoint, no master token needed

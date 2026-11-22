@@ -1,3 +1,7 @@
+---
+pageClass: api-reference
+---
+
 # MCP Tools 参考
 
 CommHub Server 的 MCP Tools 经 `POST /mcp`（Streamable HTTP）调用；实际清单随版本变化，以运行中 Hub 的 `tools/list` 和仓库 `server/src/tool-audience.ts` 为准。下表为分类索引；其中 17 个 agent 日常协作工具在本页有参数与返回值的详细说明，点名字直达。
@@ -128,6 +132,8 @@ CommHub Server 的 MCP Tools 经 `POST /mcp`（Streamable HTTP）调用；实际
 | `get_config_update` | 节点拉取待应用的配置更新 |
 | `ack_config_update` | 节点回报配置更新结果 |
 | `read_node_rules_file` | 请节点回传其工作目录下的规则文件（claude → CLAUDE.md，其余 → AGENTS.md）；无路径参数，结果用 `get_rules_file_result` 轮询（app#225） |
+| `start_agy_login` | 在 Antigravity（agy）节点上启动 `agy acp --login`，返回 Google 授权链接；结果（`url` / `login_id` / `expires_at`）用 `get_rules_file_result` 轮询。仅用户令牌 |
+| `submit_agy_login_code` | 提交授权码或落地页完整 URL（`{request_id, login_id, code}`）；码只转发一次，节点 ack 后立即清除。仅用户令牌 |
 | `write_node_rules_file` | 请节点用 `content` 覆盖其规则文件；无路径参数，256 KB 上限（app#225） |
 | `list_node_skills` | 请节点列出它的运行时实际加载的技能（`{name, scope, path_rel, description}`，只读）；目录由节点按运行时决定，无路径参数，结果用 `get_rules_file_result` 轮询 |
 | `read_node_skill` | 请节点回传某个技能的 SKILL.md（只读，256 KB 上限）；唯一入参是技能名 `name`（`[A-Za-z0-9._-]{1,64}`），不接受路径 |
@@ -145,6 +151,8 @@ CommHub Server 的 MCP Tools 经 `POST /mcp`（Streamable HTTP）调用；实际
 | `ack_stop_request` | daemon 回报停/删完成或失败 |
 | `get_start_request` | daemon 拉取待处理的启动请求 |
 | `ack_start_request` | daemon 回报启动完成或失败 |
+| `pull_session_requests` | daemon 拉取待处理的只读 session 列表请求（#4821，照 node_create_requests 的形状，但没有副作用） |
+| `ack_session_request` | daemon 回报 session 列表请求结果（`request_id`、`ok`、读到的 `data_json` 或 `error`） |
 | `list_host_supervisors` | 列本网络的 host_supervisor daemon（含在线状态） |
 | `list_my_children` | daemon 拉取自己派生的子节点清单 |
 | `request_adopt_node` | 用户申请收编手动节点：`node_id`、`daemon_node_id`、`workdir`；须有网络写权限，且是节点主人或网络 owner/admin。daemon 必须在线、同网同主机，并声明 `daemon_capabilities.adopt_capable`。只建 pending 绑定，不停止进程 |
@@ -183,6 +191,7 @@ CommHub Server 的 MCP Tools 经 `POST /mcp`（Streamable HTTP）调用；实际
 | 工具 | 说明 |
 |------|------|
 | `read_opencode_catalog` | 为已归属的 OpenCode V2 子节点排队一次本机目录读取。`ok` 且 `status: pending` 只表示已授权并记在内存里，不是快照，也不表示 daemon 已收到门铃。不启动服务。拒绝 url、authorization、directory、settings、headers、body |
+| `select_opencode_session_model` | OpenCode V2 会话切模型的入口；当前**不可用**：固定返回不可用，不写任何配置，不重启。切模型请用 `update_node_config` |
 | `get_opencode_catalog` | 轮询上面的读取。`pending` 不是快照；只有 `ready` 带回白名单快照，且 completeness 仍是 unknown、invocationVerified 仍是 false |
 | `get_opencode_catalog_request` | daemon 拉取一次已授权的读取。载荷只有范围：没有 URL、授权、settings、headers、body |
 | `ack_opencode_catalog` | daemon 交回白名单快照或封闭错误码。多出来的字段会被拒绝。存下的失败是 status failed，不是传输错误 |
@@ -633,7 +642,7 @@ send_task({
 ```
 
 ::: warning 限制
-只能取消状态为 `created` / `delivered` / `acked` / `running` 的任务（4 个 cancellable 源状态，verify [`tools.ts`](https://github.com/sleep2agi/agent-network/blob/main/server/src/tools.ts) 在 `cancel_task` 段搜 `status IN ('created', 'delivered', 'acked', 'running')`（全仓 2 处，另一处属 `send_message`） WHERE 子句）。终态 `replied` / `failed` / `cancelled` / `expired` 上调用此 tool 会返回 `{ok: false, cancelled: false}`。
+只能取消状态为 `created` / `delivered` / `acked` / `running` 的任务（4 个 cancellable 源状态，verify [`tools.ts`](https://github.com/sleep2agi/agent-network/blob/main/server/src/tools.ts) 在 `cancel_task` 段搜 `const cancelStatuses` —— 节点令牌 4 态、用户令牌额外可清 `expired`）。终态 `replied` / `failed` / `cancelled` / `expired` 上调用此 tool 会返回 `{ok: false, cancelled: false}`。
 
 `created` 实际只是 DB 默认值，正常 API 路径不会观察到（详见 [Task 生命周期 — `created` 状态](/concepts/task-lifecycle#状态机)）。
 :::

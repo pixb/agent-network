@@ -44,6 +44,7 @@ const OVERRIDES: Record<string, Record<string, unknown>> = {
   upsert_network_secret: { key: "PROBE_KEY" },
   update_provider: { provider_id: "prov_probe" },
   schedule_batch_interval: { schedule_ids: ["sched_probe"], every_seconds: 60 },
+  select_opencode_session_model: { session_id: "ses_probe", model: { providerID: "stub", id: "model" } },
 };
 function fill(schema: any, key: string, ctx: Record<string, unknown>): unknown {
   if (!schema) return "probe";
@@ -117,6 +118,23 @@ describe("every tool is classified", () => {
     expect(registered.filter(n => !TOOL_AUDIENCE[n])).toEqual([]);
     expect(Object.keys(TOOL_AUDIENCE).filter(n => !registered.includes(n))).toEqual([]);
   });
+});
+
+test("create_node source_ref fails MCP validation without minting or enqueueing", async () => {
+  const count = (table: string) => db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)!.n;
+  const before = [count("node_create_requests"), count("api_tokens")];
+  const base = { daemon_node_id: "daemon_source_fixture", network_id: NET,
+    node_spec: { name: "source-fixture", runtime: "opencode-cli" } };
+  for (const source_ref of ["src_fixture", null, "", {}]) {
+    for (const args of [{ ...base, source_ref }, { ...base, node_spec: { ...base.node_spec, source_ref } }]) {
+      const { json } = await rpc(T.owner, "tools/call", { name: "create_node", arguments: args });
+      const text = String(json.result?.content?.[0]?.text ?? "");
+      expect(json.error?.code === -32602 || /^MCP error -32602/.test(text)).toBe(true);
+    }
+  }
+  expect([count("node_create_requests"), count("api_tokens")]).toEqual(before);
+  const ordinary = await rpc(T.owner, "tools/call", { name: "create_node", arguments: base });
+  expect(JSON.parse(ordinary.json.result.content[0].text).error).toBe("daemon_not_found");
 });
 
 describe("compat replay: nothing callable today disappears from the list", () => {
@@ -225,7 +243,15 @@ describe("bytes per role (#476 ceilings stay meaningful per role)", () => {
   // 压到 "Build commit (hex)"（19 字符）⇒ node 64,497 B，余量 **3 B**。
   // ⚠️ 3 B 不是「刚好」，是**陷阱**：下一个人加一个字段名就会撞墙，而这条测试的失败会
   //    读成「谁又把描述写长了」。所以下面把余量打出来，余量低于 100 B 时大声说一句。
-  const CEILINGS = { node: 64_500, user: 60_500, all: 86_500 } as const;
+  // 2026-11-14:create_node 新增 department_id(新节点归哪个部门)。all 先撞墙 86,534 > 86,500(+34 B)。
+  // 照规矩**不抬上限**:去掉工具描述末尾的 RFC / issue 编号(RFC-024/026/027/028、app#225、Hub #938,共 13 处,
+  // 调用方用不上这些编号,上下文都在代码注释里),clone_node 描述顺手压短 —— 合计约 −156 B。
+  // 2026-11-15:get_all_status / get_session_status 描述里点名 description / profile.description(节点职责介绍,
+  // 让调用方知道去哪读别的节点「负责什么」)。照规矩不抬上限,两句都压到最短。
+  // 2026-11-20 — agy 登录（start_agy_login / submit_agy_login_code）是真人功能，只能是 user 工具，
+  // 两个工具 + 必填校验把 all 从 86.4KB 推到 88.0KB。node 不变（不走 node），user 仍在 60.5KB 内；
+  // 只抬 all 的上限（#476 ratchet 的例外要写明原因）。
+  const CEILINGS = { node: 64_500, user: 60_500, all: 89_500 } as const;
   const MARGIN_FLOOR = 100;
   test("node / user / all", async () => {
     const node = await listTools(T.node_normal);

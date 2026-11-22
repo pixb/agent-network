@@ -3,6 +3,9 @@ FROM oven/bun:1.3.14
 WORKDIR /workspace
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
+COPY contracts /workspace/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /workspace/server/src/contracts
 COPY server/package.json ./server/
 RUN cd server && bun install --ignore-scripts
 COPY server ./server

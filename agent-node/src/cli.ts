@@ -11,12 +11,27 @@
  * 配置加载: --config > CLI args > env > .anet/nodes/<name>/config.json > ~/.anet/config.json > defaults
  */
 
+import { opencodeModelEffectiveSnapshot } from "./opencode-model-effective";
+import { launchedByCliVersionField, readLaunchedByCliVersion } from "./launched-by-cli-version";
 import { extractTurnResult, readSessionEntries } from "./runtime/opencode-copresence/late-reply-recover.js";
-import { clearLateReplyRecord, listLateReplyRecords, saveLateReplyRecord } from "./runtime/opencode-copresence/late-reply-store.js";
+import { capReplyText } from "./shared/reply-text-cap.js";
+
+
+import { clearLateReplyRecord, isTerminalLateReplyError, listLateReplyRecords, saveLateReplyRecord } from "./runtime/opencode-copresence/late-reply-store.js";
 import { GET_TASK_TOOL_LINE, IDENTITY_POLL_DISCIPLINE_LINES, POLL_DISCIPLINE_LINES, POLL_STEP_LINES } from "./poll-discipline-guidance.js";
 import { MODEL_SWITCH_DEADLINE_MS, withDeadlineMs } from "./runtime/deadline.js";
+import { applyVariantConfig } from "./runtime/opencode-copresence/variant-config-apply.js";
+import { persistVariantToConfig, shouldPersistVariant, startupVariantPlan } from "./runtime/opencode-copresence/variant-persist.js";
+import { createPromptTracker } from "./shared/interactive-prompt.js";
+import { applyAgentConfig } from "./runtime/opencode-copresence/agent-config-apply.js";
 import { renameOverExistingSync } from "./shared/windows-rename-retry";
 import { createNodeSessionControlBridge, createSessionControlPin } from "./runtime/session-control-bridge.js";
+import { SOURCE_FORK_CAPABILITY } from "../../contracts/session-source-transport";
+import { isSecureSourceHubUrl } from "./runtime/source-hub-url";
+import { SOURCE_DELIVERY_CAPABILITY } from "../../contracts/session-source-delivery";
+import { intendedSourceCapabilities, sourceCapabilities } from "./daemon-source-capabilities";
+import { SOURCE_DIRECTORY_CAPABILITY } from "../../contracts/session-source-directory";
+import { PROJECT_CREATE_CAPABILITY, SESSION_ATTACH_CAPABILITY } from "../../contracts/session-project-create";
 import {
   bundledCodexVersion,
   createCodex,
@@ -61,7 +76,8 @@ import { currentTeamRulesOutcome } from "./runtime/team-rules-inject.js";
 import { hostname as osHostname, homedir } from "os";
 import { codexTuiAlignmentNotice } from "./codex-tui-alignment";
 import { packageRootFrom } from "./runtime/package-root";
-import { processRulesFileRequests } from "./runtime/rules-file";
+import { processRulesFileRequests, startRulesFilePolling } from "./runtime/rules-file";
+import { createAgyLoginManager } from "./runtime/agy-login";
 import { createLogRedactor, parseLogsTailParams, tailNodeLogs } from "./runtime/node-logs";
 import { chooseGrokBinary, grokBinaryPinToRecord, findVerifiedGrokCandidates, grokRecoveryHint } from "./runtime/grok-binary-pin";
 
@@ -149,7 +165,7 @@ import {
   type PendingReply,
 } from "./reply-reliability";
 import { isTelemetrySchemaRejection, withoutOptionalTelemetry } from "./register-telemetry-fallback";
-import { resolveGrokAcpTimeout } from "./runtime/grok-build-acp/timeout-resolve";
+import { resolveAcpIdleTimeout, resolveGrokAcpTimeout } from "./runtime/grok-build-acp/timeout-resolve";
 import {
   resolvePiTimeout,
   describePiTimeout,
@@ -179,6 +195,7 @@ import {
 import {
   CLAUDE_LINUX_X64_PACKAGE,
   installPinnedClaudeNativeBinary,
+  resolveBundledClaudeBinary,
 } from "./runtime/claude-native-binary";
 import {
   buildResumeHint,
@@ -214,6 +231,7 @@ import {
   loadConfigWithSelfHeal,
   mergePatch,
   buildConfigSnapshot,
+  workdirSnapshotField,
   attachRuntimeReadiness,
   attachCodexForkCapability,
   RESTART_SENTINEL,
@@ -326,6 +344,49 @@ import {
 /** 只用于**日志去重**的状态(见 daemon-create-capability.ts 里的注释)。
  *  🔴 它不参与任何判断 —— 上报的能力值每次都是现算的。 */
 const _createCapLogState: CreateCapabilityLogState = {};
+let _insecureSourceHubWarned = false;
+function sourceForkSnapshot<T extends { daemon_capabilities?: object }>(snapshot: T): T {
+  // 判定逻辑抽到 daemon-source-capabilities.ts（纯函数 + 单测）：那里同时解释了
+  // 「为什么生产上 7 台 daemon 一条都不报」——原来要求四个环境变量全为 1。
+  const secure = isSecureSourceHubUrl(COMMHUB_URL);
+  // 只在「本来想开、却因为 Hub 不安全被清空」时告警；一个 transport 都没配的 daemon
+  // 不该看到「被安全策略拦了」这种误导性日志。⚠️ 只有不安全时才去探针（它会读文件系统）。
+  if (fileConfig.role === "host_supervisor" && !secure && !_insecureSourceHubWarned
+    && Object.keys(intendedSourceCapabilities({
+      role: fileConfig.role,
+      platform: process.platform,
+      env: process.env,
+      config: fileConfig,
+      createOk: !!daemonCreateCapability()?.ok,
+    })).length > 0) {
+    _insecureSourceHubWarned = true;
+    warn(`[source-control] fork/directory lanes disabled: Hub URL must be https:// (or http on loopback); current ${(() => { try { return new URL(COMMHUB_URL).origin; } catch { return "invalid URL"; } })()}`);
+  }
+  // 🔴 报什么只能来自「起了什么」：这里用的是**启动时**算好的那份 lanes（见 startedSourceLanes），
+  //    不在这里现算。daemonCreateCapability() 会真的读文件系统，运行期装/卸 anet 会让它翻转；
+  //    若心跳现算，就会出现「快照开始报 fork 能力，但 worker 启动时没起 fork lane」——
+  //    与 P1 同一个形状（报了没人接，用户卡到超时）。
+  const caps = startedSourceLanes();
+  if (!Object.keys(caps).length) return snapshot;
+  return { ...snapshot, daemon_capabilities: { ...snapshot.daemon_capabilities, ...caps } };
+}
+
+/** 启动时算一次、全进程共用：能力上报与 worker lane 都从这里取，杜绝两套判据 / 运行期漂移。 */
+let _startedSourceLanes: ReturnType<typeof sourceCapabilities> | null = null;
+function startedSourceLanes(): ReturnType<typeof sourceCapabilities> {
+  if (_startedSourceLanes === null) {
+    _startedSourceLanes = sourceCapabilities({
+      role: fileConfig.role,
+      platform: process.platform,
+      env: process.env,
+      config: fileConfig,
+      secureHub: isSecureSourceHubUrl(COMMHUB_URL),
+      createOk: !!daemonCreateCapability()?.ok,
+    });
+  }
+  return _startedSourceLanes;
+}
+
 function daemonCreateCapability(): (DaemonCreateCapability & { defaultWorkdirRoot?: string | null }) | undefined {
   const cap = evaluateCreateCapability({
     role: fileConfig?.role,
@@ -355,6 +416,10 @@ const INITIAL_LAUNCH_PATH = process.env.PATH || "";
 const INITIAL_OPENCODE_SAFE_BASE = process.env.ANET_OPENCODE_SAFE_BASE;
 // RFC-043 — pi coding agent binary override (anet may pin an exact version).
 const INITIAL_PI_BIN = process.env.ANET_PI_BIN;
+// 2026-11-10 —— 与上面几格同理：这是**启动者边界**，必须在 config.json 的 `env` 合并
+// 之前读一次。profile 里的 env 不该能改「我是被哪个 anet CLI 起的」这句话的真假。
+// 形状不对/没有 ⇒ undefined ⇒ 心跳里**完全不出现**这一格（见 launched-by-cli-version.ts）。
+const INITIAL_LAUNCHED_BY_CLI_VERSION = readLaunchedByCliVersion(process.env);
 
 // ── 参数解析 ──
 const argv = process.argv.slice(2);
@@ -405,7 +470,7 @@ for (let i = 0; i < argv.length; i++) {
   --config <path>     配置文件 (.anet/nodes/<name>/config.json)
   --opencode-borrowed-attach <config>  Attach the exact existing borrowed V1 TUI
   --alias <name>      Agent 别名 / CommHub alias (必需)
-  --runtime <type>    claude-agent-sdk (default) | codex-sdk | codex-app-server | grok-build-acp | grok-build-cli | opencode-cli | pi-cli
+  --runtime <type>    claude-agent-sdk (default) | codex-sdk | codex-app-server | grok-build-acp | grok-build-cli | opencode-cli | pi-cli | antigravity-acp
                       (claude-code-cli is NOT here: it runs via \`anet node start\`, not by passing --runtime to agent-node — see the Runtime section)
   --model <name>      AI 模型 (codex 默认: ${DEFAULT_CODEX_MODEL}, claude-agent-sdk 默认: 账号默认模型)
   --hub <url>         CommHub URL
@@ -425,11 +490,13 @@ Runtime:
   codex-sdk         Codex SDK — GPT-5.4，复用 codex 登录态
   codex-app-server  Codex app-server — Codex TUI bridge
   grok-build-acp    Grok Build ACP — xAI Grok Build via "grok agent stdio"
+  antigravity-acp   Antigravity CLI (agy) — Google Antigravity via "agy acp"（版本要钉在 1.5.13）
   grok-build-cli    Grok Build CLI — headless 或 grokCopresence 共存 TUI 模式
   opencode-cli      opencode CLI — Anthropic/OpenAI vendor preset via ACP
   pi-cli            pi coding agent (pi.dev) — RPC mode，自定义 provider（本地模型服务等）
 
 Capabilities: ANET_CAPABILITY_GROK_COPRESENCE_V2 ANET_CAPABILITY_OPENCODE_BORROWED_TUI_V1
+Capabilities: ANET_CAPABILITY_SOURCE_RESUME_V1
 `);
     process.exit(0);
   }
@@ -707,6 +774,8 @@ const RUNTIME_MAP: Record<string, string> = {
   // `pi` is the short alias. Internal bucket is `"pi"` — RPC mode
   // transport, see src/runtime/pi-rpc/.
   "pi-cli": "pi", "pi": "pi",
+  // 2026-11-20 — Antigravity CLI（agy）走正常 ACP。`agy` / `antigravity` 是短别名。
+  "antigravity-acp": "antigravity", "antigravity": "antigravity", "agy": "antigravity", "antigravity-cli": "antigravity",
 };
 // 🔴 `claude-code-cli` is intentionally NOT a key here (#909). Its execution lane lives in the LAUNCHER
 //    (`agent-network/bin/cli.ts` — `anet node start` → launchAgent → spawns the real `claude` CLI, ~:5096)
@@ -731,7 +800,7 @@ if (!Object.prototype.hasOwnProperty.call(RUNTIME_MAP, rawRuntime)) {
   console.error(`[${ALIAS}] Unsupported runtime "${rawRuntime}". Supported: ${supported}`);
   process.exit(1);
 }
-const RUNTIME = RUNTIME_MAP[rawRuntime] as "claude" | "codex" | "grok" | "opencode" | "codex-app-server" | "pi";
+const RUNTIME = RUNTIME_MAP[rawRuntime] as "claude" | "codex" | "grok" | "opencode" | "codex-app-server" | "pi" | "antigravity";
 const RUNTIME_LABEL = rawRuntime; // 日志用原始名
 // `grok-build-cli` defaults to the compatible `grok -p` headless lane.
 // `grokCopresence:true` explicitly switches it to the single PTY-owner bridge
@@ -748,7 +817,7 @@ const GROK_EXECUTION_MODE: "acp" | "cli" =
 // the PTY child are created. Existing credential stores are separately
 // validated/repaired by their boundary-specific writers.
 if (GROK_EXECUTION_MODE === "cli") process.umask(0o077);
-const rawGrokCopresence = opts["grok-copresence"]
+const rawGrokCopresence: unknown = opts["grok-copresence"]
   ?? fileConfig.grokCopresence
   ?? fileConfig.flags?.grokCopresence
   ?? process.env.ANET_GROK_COPRESENCE;
@@ -804,7 +873,11 @@ if (RUNTIME === "opencode" && OPENCODE_GENERATION === undefined) {
   process.exit(1);
 }
 if (RUNTIME === "opencode" && OPENCODE_GENERATION === "v2" && INITIAL_OPENCODE_VERSION !== undefined
-  && !isAcceptedOpencodeVersionFor("v2", INITIAL_OPENCODE_VERSION)) {
+  && !isAcceptedOpencodeVersionFor("v2", INITIAL_OPENCODE_VERSION)
+  // Exact source runtime verifies the independent operator authority and real
+  // listener itself. This exception only reaches that admission, not ordinary open.
+  && !(fileConfig.sourceDelivery && (fileConfig as any).sharedVariantAuthority
+    && INITIAL_OPENCODE_VERSION === "2.0.22-anet-test.29040e2")) {
   const v2 = opencodeGenerationSupport("v2");
   console.error(
     `[${ALIAS}] Refusing ANET_OPENCODE_VERSION=${INITIAL_OPENCODE_VERSION}; ` +
@@ -1012,6 +1085,12 @@ const TELEGRAM_GETUPDATES_TIMEOUT_MS = resolveTimeoutMs({
   defaultMs: 45_000,
 }).valueMs;
 const NEW_SESSION = opts["new-session"] === "true";
+if (fileConfig.sourceDelivery && (RUNTIME !== "opencode" || fileConfig.opencodeGeneration !== "v2"
+  || fileConfig.opencodeMode !== "copresence" || NEW_SESSION || !process.env.ANET_SOURCE_RESUME_NONCE
+  || process.env.ANET_SOURCE_RESUME_CONFIG !== configFilePath
+  || (opts.session && opts.session !== fileConfig.sessionId))) {
+  throw Error("source_resume_cli_runtime_override_refused");
+}
 const SESSION_ID = NEW_SESSION ? "" : (
   RUNTIME === "grok"
     ? (GROK_EXECUTION_MODE === "cli"
@@ -1257,6 +1336,34 @@ function clearGrokSession(reason: string) {
   }
 }
 
+// admin 2026-11-21「agy runtime 没有上下文吗」—— 真的没有：processWithAntigravity 从来没把
+// sessionId 传给 runAgyAcpTurn，每轮任务都走 session/new，agy 节点和其他运行时（claude 的
+// claudeSessionId、grok ACP 模式的 grokSessionId）不一样，没有「一个节点续用同一会话」。
+// 补齐同一套机制：复用通用的 writebackSession()（agy 没有自己专属的 config 键，SESSION_ID
+// 的兜底链本来就读 fileConfig.session，不用新开键）。
+function clearAgySession(reason: string) {
+  // 会话被丢弃时把它记住的重放历史一起清掉，否则下次万一拿到同一个 session id，
+  // 会拿旧前缀去剥新会话的回复（不同 id 天然不撞 key，所以这里是兜底，不承担主逻辑）。
+  const deadSessionId = agySessionId;
+  agySessionId = undefined;
+  if (deadSessionId) {
+    // runtime 是动态 import 的（agy 相关依赖不进 cli 的启动路径），这里同样异步取一次。
+    void import("./runtime/antigravity-acp/runtime")
+      .then((m) => m.forgetAgySession(deadSessionId))
+      .catch(() => undefined);
+  }
+  if (!configFilePath) return;
+  try {
+    const cfg = JSON.parse(readFileSync(configFilePath, "utf-8"));
+    if (!cfg.session) return;
+    delete cfg.session;
+    atomicWriteJson(configFilePath, cfg);
+    warn(`cleared session (agy, ${reason})`);
+  } catch (e: any) {
+    warn(`clearAgySession failed: ${e.message}`);
+  }
+}
+
 // ── Channel config ──
 function loadEnvFile(path: string) {
   if (!existsSync(path)) return;
@@ -1431,7 +1538,8 @@ import { probeWindowsTuiHealth, readWindowsTuiIdentity } from "./runtime/windows
 import { systemdSupervisionSnapshot } from "./runtime/systemd-supervision-snapshot.js";
 import { consumePlannedRestart, currentBootId, writeRestartIntent } from "./runtime/restart-intent.js";
 import { readOpenCodeV2CatalogEndpoint } from "./runtime/opencode-v2-catalog-endpoint";
-import { readOpenCodeCatalog } from "./runtime/opencode-v2-catalog";
+import { interruptCurrentTurn, parseControlOp } from "./runtime/control-interrupt";
+import { readOpenCodeCatalog, readOpenCodeAgents, readOpenCodeSessionAgent } from "./runtime/opencode-v2-catalog";
 // #3144 —— 清单与采集时刻同进同出（纯函数在 runtime/opencode-catalog-report.ts，可单测）
 import { catalogReport, keepLastCatalog } from "./runtime/opencode-catalog-report";
 import { createAppServerWatchdog, hungKillGraceFromEnv, watchdogLimitsFromEnv } from "./runtime/codex-appserver-watchdog";
@@ -1550,9 +1658,48 @@ const taskTraceLog = (line: string) => {
 
 // 规则文件门铃(rules_file / skills / files / logs_tail)的依赖。logs_tail 读本进程自己的
 // 日志目录;脱敏器每次现建,节点 token 轮换后(reloadNodeToken)立刻按新值遮。
+// 2026-11-20 — agy 登录会话管理器：一个进程一份（单并发由它保证）。
+const agyLoginManager = RUNTIME === "antigravity" ? createAgyLoginManager() : null;
+
+// #5321 —— agy 的模型清单 / 登录状态：后台每 10 分钟探测一次，心跳只读缓存（绝不等探测）。
+const agyCatalogCache = RUNTIME === "antigravity"
+  ? (() => {
+      const { createAgyCatalogCache } = require("./runtime/antigravity-acp/agy-catalog.js") as typeof import("./runtime/antigravity-acp/agy-catalog.js");
+      const cache = createAgyCatalogCache({ binary: process.env.AGY_BIN?.trim() || "agy" });
+      void cache.refresh();
+      const timer = setInterval(() => { void cache.refresh(); }, 10 * 60_000);
+      (timer as any).unref?.();
+      return cache;
+    })()
+  : null;
+
+/** 心跳里取 agy 两格：没探测过 / 读不到 ⇒ 不报模型、登录态 unknown（不是「未登录」）。 */
+function agyCatalogSnapshotFields(): Record<string, unknown> {
+  if (!agyCatalogCache) return {};
+  const c = agyCatalogCache.current();
+  return {
+    ...(c.models && c.models.length ? { agy_models: c.models } : {}),
+    agy_login_state: c.loginState,
+  };
+}
+
+// CLI 等选项的可观测信号（#cli-prompt-options ②）。
+// 只读我们 spawn 的子进程 stderr/stdout —— 不碰任何 TUI 行为，检测到就上报、不改输出。
+const interactivePromptTracker = createPromptTracker();
+function clearInteractivePrompt(reason: string): void {
+  if (interactivePromptTracker.clear(reason)) log(`[prompt] cleared (${reason})`);
+}
+function observeInteractivePrompt(line: string): void {
+  try {
+    const seen = interactivePromptTracker.observe(line);
+    if (seen?.first) warn(`[prompt] node looks like it is waiting on an option: kind=${seen.signal.kind}`);
+  } catch { /* 观测失败绝不影响主流程 */ }
+}
+
 function rulesFileDeps() {
   return {
     callCommHub, runtime: RUNTIME, workDir: process.cwd(), log, warn,
+    ...(agyLoginManager ? { agyLogin: agyLoginManager } : {}),
     logsTail: (raw: string | undefined) => tailNodeLogs(
       PRIVATE_LOG_DIR,
       parseLogsTailParams(raw),
@@ -1907,8 +2054,8 @@ let claudeLoginDead = false;
  * 失败一律 undefined:心跳既不许被这件事拖住(3s 超时),也不许因为读列表失败被拒。
  */
 // 上一次成功采到的清单。读失败时沿用它（见 keepLastCatalog 的注释）。
-let lastCatalogReport: { models: string[]; seenAt: string } | undefined;
-async function reportedOpenCodeCatalog(endpoint: { url: string; authorization: string; directory: string } | null): Promise<{ models: string[]; seenAt: string } | undefined> {
+let lastCatalogReport: { models: string[]; seenAt: string; variants: string[] } | undefined;
+async function reportedOpenCodeCatalog(endpoint: { url: string; authorization: string; directory: string } | null): Promise<{ models: string[]; seenAt: string; variants: string[] } | undefined> {
   if (RUNTIME !== "opencode" || OPENCODE_GENERATION !== "v2" || !endpoint) return undefined;
   try {
     const snapshot = await readOpenCodeCatalog({
@@ -1927,6 +2074,36 @@ async function reportedOpenCodeCatalog(endpoint: { url: string; authorization: s
     // 读失败：沿用上一次成功的清单（带它自己的 seenAt），而不是让这次心跳把它抹掉。
     return lastCatalogReport;
   }
+}
+
+/** #4150-Build — the agents this node's OpenCode V2 server exposes.
+ *  Read on the same loopback endpoint as the model catalog and cached like it:
+ *  an empty answer is meaningful (no agents configured) and must not be turned
+ *  into a default entry. */
+let lastAgentsReport: { agents: string[]; seenAt: string } | undefined;
+async function reportedOpenCodeAgents(endpoint: { url: string; authorization: string; directory: string } | null): Promise<{ agents: string[]; seenAt: string } | undefined> {
+  if (RUNTIME !== "opencode" || OPENCODE_GENERATION !== "v2" || !endpoint) return undefined;
+  try {
+    const read = await readOpenCodeAgents({
+      scope: { networkId: NETWORK_ID || "default", daemonId: NODE_ID || "n_self", directory: endpoint.directory },
+      url: endpoint.url, authorization: endpoint.authorization, timeoutMs: 3_000,
+    });
+    lastAgentsReport = { agents: read.agents, seenAt: read.observedAt };
+    return lastAgentsReport;
+  } catch { return lastAgentsReport; }
+}
+
+/** Current agent of the node's bound native session (client cannot read it). */
+async function reportedOpenCodeAgentCurrent(endpoint: { url: string; authorization: string; directory: string } | null): Promise<{ agent: string; seenAt: string } | undefined> {
+  if (RUNTIME !== "opencode" || OPENCODE_GENERATION !== "v2" || !endpoint) return undefined;
+  const bindSession = typeof (fileConfig as any)?.session === "string" ? (fileConfig as any).session : undefined;
+  try {
+    const read = await readOpenCodeSessionAgent({
+      scope: { networkId: NETWORK_ID || "default", daemonId: NODE_ID || "n_self", directory: endpoint.directory },
+      url: endpoint.url, authorization: endpoint.authorization, sessionId: bindSession, timeoutMs: 3_000,
+    });
+    return read ? { agent: read.agent, seenAt: new Date().toISOString() } : undefined;
+  } catch { return undefined; }
 }
 /**
  * #3952 —— 每轮结束后把这一次的 token 用量报给 Hub（只报计数，不报内容）。
@@ -1993,6 +2170,12 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
     ? readOpenCodeV2CatalogEndpoint(NODE_DIR) ?? readOpenCodeV2CatalogEndpoint(process.cwd())
     : null;
   const reportedCatalog = await reportedOpenCodeCatalog(catalogEndpoint);
+  const reportedAgents = await reportedOpenCodeAgents(catalogEndpoint);
+  const reportedAgentCurrent = await reportedOpenCodeAgentCurrent(catalogEndpoint);
+  const variantSession = RUNTIME === "opencode" && OPENCODE_GENERATION === "v2" && opencodeCopresenceSession?.variantConfigCapable
+    ? opencodeCopresenceSession : undefined;
+  const variantReadback = variantSession?.variantConfigReadback
+    ? await variantSession.variantConfigReadback().catch(() => undefined) : undefined;
   return callCommHub("report_status", {
     resume_id: RESUME_ID, alias, status: resolveReportedStatus(status), task,
     // #1510 —— 每次上报都重新报一次 transport(Hub 侧「每份 report 重新测一次」的要求)。
@@ -2065,11 +2248,34 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
     // #594 —— 上报用 reportedNodeHealth()(多带 codex_login);上面的 model_auth 闸门仍只看监视器那份。
     ...(reportedNodeHealth() ? { health: reportedNodeHealth() } : {}),
     config_snapshot: configApplyDraining ? undefined : {
+      // #5125 续 —— 上报本节点的工作目录（Hub 的 fork 向导要显示「与源节点共用目录」）。
+      // 放快照顶层而不是 flags：flags 参与 config content-match，加键会让旧 Hub 的比对漂移。
+      ...workdirSnapshotField(process.cwd()),
+      // CLI 在等选项（只读观测，不改行为）
+      ...(interactivePromptTracker.current() ? { interactive_prompt: interactivePromptTracker.current() } : {}),
       ...(fileConfig.role === 'host_supervisor' ? { scoped_secrets_capable: true } : {}),
+      // 2026-11-20 — agy 登录通道（设计稿 handoff/agy-login-channel-design.md）。
+      // 只在 antigravity 节点上报；老 daemon 没这个键 → 客户端回退「复制命令」。
+      ...(RUNTIME === "antigravity" ? { agy_login_capable: true } : {}),
+      // #5321 —— 模型清单 + 登录状态（只读缓存，来源是后台 `agy models` 探测）
+      ...(RUNTIME === "antigravity" ? agyCatalogSnapshotFields() : {}),
       ...(nodeSecretsDir && fileConfig.node_id && fileConfig.network_id ? { node_secrets_capable: true } : {}),
+      ...(variantReadback && variantSession?.isRunning ? { opencode_variant_config_capable: true } : {}),
+      // Agent (Build) hot switch: advertised only when this process actually has
+      // the bound-session writer, so the hub can fail closed for everything else.
+      ...(RUNTIME === "opencode" && OPENCODE_GENERATION === "v2"
+        && opencodeCopresenceSession?.isRunning === true
+        && typeof opencodeCopresenceSession.selectSessionAgent === "function"
+        ? { opencode_agent_config_capable: true } : {}),
+      ...(RUNTIME === "opencode" && OPENCODE_GENERATION === "v2" ? opencodeModelEffectiveSnapshot({
+        variantReadback,
+        variantRunning: variantSession?.isRunning === true,
+        sessionModel: opencodeEffectiveModel,
+        sessionRunning: opencodeCopresenceSession?.isRunning === true,
+      }) : {}),
       // #622 —— daemon 的逐 runtime 自检结果(后台每 10 分钟一轮,这里只读缓存,不阻塞心跳)。
       ...attachAdoptionCandidates(attachCodexForkCapability(attachRuntimeReadiness(
-        buildConfigSnapshot(fileConfig, process.env.ANET_CONFIG_UPDATE_CAPABLE === "1", currentConfigRevision, daemonCreateCapability()),
+        sourceForkSnapshot(buildConfigSnapshot(fileConfig, process.env.ANET_CONFIG_UPDATE_CAPABLE === "1", currentConfigRevision, daemonCreateCapability())),
         runtimeReadinessMonitor?.current(),
       ), codexForkCapabilityMonitor?.current()), heartbeatAdoptionCandidates(fileConfig, COMMHUB_URL, NETWORK_ID)),
       ...(sideThreadCapabilitySnapshot ? { side_thread_capability: sideThreadCapabilitySnapshot } : {}),
@@ -2088,7 +2294,19 @@ const reportStatus = async (rawStatus: string, rawTask?: string) => {
       ...(reportedCatalog ? {
         opencode_catalog: reportedCatalog.models,
         ...(reportedCatalog.seenAt ? { opencode_catalog_seen_at: reportedCatalog.seenAt } : {}),
+        ...(reportedCatalog.variants.length ? { opencode_catalog_variants: reportedCatalog.variants } : {}),
       } : {}),
+      // 2026-11-10 —— 起这份 agent-node 的 anet CLI 版本（启动时抓的，见
+      // INITIAL_LAUNCHED_BY_CLI_VERSION）。没有/形状不对 ⇒ 摊进来是空对象，
+      // 快照与改动前逐字节相同。**不要**塞进 `anet_version`（那是另一码事，且是静态占位值）。
+      ...launchedByCliVersionField(INITIAL_LAUNCHED_BY_CLI_VERSION),
+      // #4150-Build — agents the server exposes; empty array means "none configured".
+      ...(reportedAgents ? {
+        opencode_agents: reportedAgents.agents,
+        ...(reportedAgents.seenAt ? { opencode_agents_seen_at: reportedAgents.seenAt } : {}),
+      } : {}),
+      // #4150-Build — the agent this node's bound session currently uses.
+      ...(reportedAgentCurrent ? { opencode_agent_current: reportedAgentCurrent.agent } : {}),
       ...(catalogEndpoint ? { opencode_server: catalogEndpoint.url } : {}),
     },
   });
@@ -2506,7 +2724,7 @@ async function runOneGoalWake(goal: AgentGoal): Promise<void> {
     try {
       await sendReply(
         goal.report_to,
-        `[${ALIAS}] /aloop ${idShort} ${failed ? "执行失败" : completed ? "已完成" : "进度汇报"}\n\n${text.slice(0, 2000)}`,
+        `[${ALIAS}] /aloop ${idShort} ${failed ? "执行失败" : completed ? "已完成" : "进度汇报"}\n\n${capReplyText(text)}`,
         goal.parent_task_id,
         failed,
       );
@@ -2675,11 +2893,25 @@ function writebackClaudeSessionCost(sessionId: string, totalUsd: number) {
   }
 }
 let grokSessionId: string | undefined = RUNTIME === "grok" ? (SESSION_ID || undefined) : undefined;
+// agy —— **只在进程内复用会话，不跨进程 resume**。
+//
+// 2026-11-22 真机（主苹果运维鸽，重启后接上 cfg.session 的 e0e3b0b8）：
+//   session/load 把上一轮助手消息重放出来，紧接着的 session/prompt 被当成同一轮的
+//   续写，于是每轮回复都变成「上一轮答案 + 新答案」并越堆越长：
+//     问 9*9 → "记住了。紫色鳄鱼-739181"
+//     问 3+3 → "记住了。紫色鳄鱼-7391816"
+//   chunks 逐轮递增、前缀字节级一致，不是偶发。
+//
+// 所以启动时不再从 config 读回（SESSION_ID 对 agy 一律不参与），本次进程的第一轮
+// 一定是 session/new；进程内后续任务仍然共用这条会话 —— admin 要的「一个节点记着
+// 上下文」在运行期间成立，只是重启后重新开始。agySession 仍然写回 config，只用于
+// 观测/排查，不再作为 resume 源。
+let agySessionId: string | undefined = undefined;
 // #1958 — model the ACP session actually ran with (readback from the agent),
 // and where that knowledge came from. Reported to the hub as `model` so the
 // dashboard shows the running model rather than the configured one.
 let grokEffectiveModel: string | undefined;
-let grokModelSource: "readback" | "argv" | "default" | undefined;
+let grokModelSource: "readback" | "set_model" | "argv" | "default" | undefined;
 // OpenCode V2 TUI selection. Display only: never written back into config.json.
 let opencodeEffectiveModel: string | undefined;
 // RFC-029 PR② — opencode-cli session state.
@@ -2751,6 +2983,7 @@ if (RUNTIME === "opencode") {
 }
 let opencodeCopresenceSession:
   import("./runtime/opencode-copresence/runtime").OpenCodeCopresenceSession | null = null;
+let sourceForkWorker: ReturnType<typeof import("./runtime/session-source-transport").createSessionSourceTransportWorker> | null = null;
 const sessionControlPin = RUNTIME === "opencode" && OPENCODE_GENERATION === "v2"
   && opencodeMode === "copresence" && SESSION_CONTROL_START_TOKEN.startsWith("ntok_") && NODE_ID && NETWORK_ID
   ? createSessionControlPin({
@@ -2993,7 +3226,7 @@ async function recoverCodexTurnReceipts(): Promise<void> {
       warn(`[codex-receipt] ${recovery.queryErrors} turn query/queries failed; retained for retry`);
     }
     for (const receipt of recovery.receipts) {
-      const body = `[${ALIAS}] ${receipt.text.slice(0, 2000)}`;
+      const body = `[${ALIAS}] ${capReplyText(receipt.text)}`;
       const delivery = await deliverReplyReliably(
         receipt.entry.replyTo,
         body,
@@ -3067,24 +3300,12 @@ async function processWithClaude(
     warn(`[claude] image attachments (${images!.length}) received but resolved model is NOT marked imageCapable (flags.modelImageCapable !== true); sending text-only. Set modelImageCapable=true via anet node create with a vision-capable model (MiniMax-M3 / claude-sonnet-4-6 / etc).`);
   }
 
-  // Pre-flight: if no Claude binary is resolvable, on-the-fly install the
-  // glibc one. SDK ships musl-only by default on Linux x64 which fails on
-  // Debian/Ubuntu/RHEL hosts. Auto-install means the user doesn't need to
-  // know about the binary distribution detail.
-  const { existsSync } = await import("fs");
-  let hasBinary = false;
-  try {
-    const glibcPath = require.resolve("@anthropic-ai/claude-agent-sdk-linux-x64/claude");
-    if (existsSync(glibcPath)) hasBinary = true;
-  } catch {}
-  if (!hasBinary) {
-    try {
-      const { execSync } = await import("child_process");
-      execSync("which claude", { stdio: "pipe" });
-      hasBinary = true;
-    } catch {}
-  }
-  if (!hasBinary && process.platform === "linux") {
+  // Native packages are optionalDependencies of the exact installed SDK.
+  // Use the same resolved path for preflight and query(), not a Linux-only
+  // presence check followed by a different global/PATH executable.
+  const resolveNative = () => resolveBundledClaudeBinary({ resolvePackage: specifier => require.resolve(specifier) });
+  let claudePath = resolveNative();
+  if (!claudePath && process.platform === "linux" && process.arch === "x64") {
     try {
       const { execFileSync } = await import("child_process");
       const packageRoot = packageRootFrom(import.meta.url, process.argv[1]);
@@ -3100,26 +3321,23 @@ async function processWithClaude(
         }),
       });
       log(`[claude] no Claude binary found — installed ${CLAUDE_LINUX_X64_PACKAGE}@${install.sdkVersion} (glibc) ...`);
-      try {
-        const glibcPath2 = require.resolve("@anthropic-ai/claude-agent-sdk-linux-x64/claude");
-        if (existsSync(glibcPath2)) {
-          hasBinary = true;
-          log(`[claude] glibc binary installed: ${glibcPath2}`);
-        }
-      } catch {}
+      claudePath = resolveNative();
     } catch (e: any) {
       log(`[claude] auto-install of glibc binary failed: ${e?.message || e}`);
     }
   }
-  if (!hasBinary) {
+  if (!claudePath) {
     return [
       "claude 错误: Claude Code 二进制未找到。",
-      "agent-node 默认运行 claude-agent-sdk runtime 需要 Claude Code 本地二进制。",
-      "解决方案：",
-      "  1. 全局安装 Claude Code: npm i -g @anthropic-ai/claude-code",
-      "  2. 或者切换到 codex-sdk runtime: anet node create <name> --runtime codex-sdk (需 codex auth login)",
-      "  3. 或者在 node config.json 里设 pathToClaudeCodeExecutable 指向已安装的 claude 二进制",
+      `缺少 SDK 平台包 @anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/${process.platform === "win32" ? "claude.exe" : "claude"}。`,
+      "请修复 agent-node 的配对 SDK 安装并包含 optionalDependencies；不需要全局安装 Claude Code，也不会从用户 PATH 查找。",
     ].join("\n");
+  }
+  try {
+    const { execFileSync } = await import("node:child_process");
+    execFileSync(claudePath, ["--version"], { stdio: "pipe", shell: false, windowsHide: true, timeout: 15_000 });
+  } catch (error: any) {
+    return `claude 错误: SDK 平台二进制无法执行 (${process.platform}-${process.arch}): ${error?.message || error}`;
   }
 
   // Root-safety log (was a hard-fail before 2026-06-24 — see the partner-team host incident). Claude Code's security policy rejects `--dangerously-skip-
@@ -3368,37 +3586,6 @@ async function processWithClaude(
   } catch (e: any) {
     warn(`[claude] loops SDK MCP server init failed (${e?.message || e}); self-loop tools unavailable for this agent`);
   }
-
-  // ALWAYS resolve a working binary. Earlier we returned undefined when
-  // commhub MCP was injected to avoid a URL-MCP rejection, but the SDK's
-  // default falls back to a musl binary on Linux that doesn't exist on
-  // glibc (Debian/Ubuntu) → 'Claude Code native binary not found'. Newer
-  // SDK + Claude CLI accept URL-type MCP, so we resolve a binary either
-  // way and let it handle the MCP config.
-  const claudePath = (() => {
-    try {
-      const { execSync } = require("child_process");
-      const fs = require("fs");
-      // 1. SDK-bundled glibc binary (works on most Linux x64)
-      try {
-        const glibcPath = require.resolve("@anthropic-ai/claude-agent-sdk-linux-x64/claude");
-        if (fs.existsSync(glibcPath)) {
-          execSync(`${glibcPath} --version`, { stdio: "pipe" });
-          log(`[claude] using glibc binary: ${glibcPath}`);
-          return glibcPath;
-        }
-      } catch {}
-      // 2. Global Claude Code install (claude in PATH — Mac users on Pro)
-      try {
-        const globalPath = execSync("which claude", { encoding: "utf-8" }).trim();
-        if (globalPath) { log(`[claude] using global binary: ${globalPath}`); return globalPath; }
-      } catch {}
-      // 3. SDK default (likely fails on glibc but lets the SDK surface a
-      // clearer error than a silent path mismatch).
-      log(`[claude] no binary resolved, falling back to SDK default`);
-      return undefined;
-    } catch { return undefined; }
-  })();
 
   // permissionMode resolution (Vincent ask via 通信龙 2026-06-24):
   //
@@ -4498,6 +4685,8 @@ async function processWithOpencode(
           sessionId: threadId,
           armedAt: new Date().toISOString(),
           deadlineAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+          // #4529 —— 把发送方一起落盘：补发时不必反查任务行（它可能已被清理）。
+          ...(_from ? { to: _from } : {}),
         });
       },
       onLateReply: (payload) => {
@@ -4505,6 +4694,7 @@ async function processWithOpencode(
         log(`[${OPENCODE_PROCESS_BUNDLE_MARKER}] late reply for ${taskId}: ${payload.status} (${payload.replyText.length} chars)`);
         void callCommHub("send_reply", {
           in_reply_to: taskId,
+          ...(_from ? { alias: _from } : {}),
           text: payload.replyText,
           status: payload.status,
           thread_id: payload.threadId,
@@ -4829,11 +5019,13 @@ async function ensureOpencodeCopresenceRuntime(): Promise<
   import("./runtime/opencode-copresence/runtime").OpenCodeCopresenceSession
 > {
   if (opencodeCopresenceSession?.isRunning) return opencodeCopresenceSession;
+  if (fileConfig.sourceDelivery && opencodeCopresenceSession) throw Error("source_resume_no_reopen_rotation_required");
   if (opencodeBorrowedCli && opencodeCopresenceSession) {
     throw new Error("Borrowed V1 runtime unavailable; retain original binding/recovery, no automatic reopen");
   }
   return opencodeCopresenceOpening.run(async () => {
     if (opencodeCopresenceSession?.isRunning) return opencodeCopresenceSession;
+    if (fileConfig.sourceDelivery && opencodeCopresenceSession) throw Error("source_resume_no_reopen_rotation_required");
     if (opencodeBorrowedCli && opencodeCopresenceSession) {
       throw new Error("Borrowed V1 runtime unavailable; retain original binding/recovery, no automatic reopen");
     }
@@ -4874,7 +5066,19 @@ async function ensureOpencodeCopresenceRuntime(): Promise<
         ? fileConfig.opencodeConfiguredModelAtLastOpen : null)} `
       + `generation=${JSON.stringify(OPENCODE_GENERATION ?? null)} `
       + `resume=${JSON.stringify(opencodeSessionId ?? null)} decide=${reconcileDecision}`);
-    const opened = await openOpenCodeCopresenceRuntime({
+    let sourceOpened: import("./runtime/opencode-copresence/runtime").OpenCodeCopresenceSession | undefined;
+    if (fileConfig.sourceDelivery) {
+      const { openSourceResumeRuntime } = await import("./runtime/source-resume-launcher");
+      if (!process.env.ANET_SOURCE_RESUME_NONCE || process.env.ANET_SOURCE_RESUME_CONFIG !== configFilePath
+        || NEW_SESSION || fileConfig.sessionId !== opencodeSessionId
+        || (INITIAL_OPENCODE_VERSION !== undefined && INITIAL_OPENCODE_VERSION !== fileConfig.sourceDelivery.expected_version) || !sharedServer) throw Error("source_resume_runtime_refused");
+      // Existing shared Server's policy/MCP are retained; no project config,
+      // provider injection, model reconcile, TUI spawn or Server creation.
+      sourceOpened = await openSourceResumeRuntime({ configPath: configFilePath, cwd: process.cwd(),
+        nonce: process.env.ANET_SOURCE_RESUME_NONCE, binary: INITIAL_OPENCODE_BIN!, model: MODEL,
+        expectedVersion: fileConfig.sourceDelivery.expected_version, sessionId: opencodeSessionId!, newSession: NEW_SESSION, nodeId: NODE_ID });
+    }
+    const opened = sourceOpened ?? await openOpenCodeCopresenceRuntime({
       // #543 — V1 nodes pass the V1 backend, i.e. exactly the pre-#543 default.
       backend: opencodeBackendFor(OPENCODE_GENERATION ?? "v1"),
       cwd: process.cwd(),
@@ -4916,6 +5120,29 @@ async function ensureOpencodeCopresenceRuntime(): Promise<
     opencodeCopresenceSession = opened;
     void sessionControlBridge?.register();
     if (OPENCODE_GENERATION === "v2") void pollOpencodeSessionModel();
+    // #5123 —— 启动恢复：配置里存过档位就尽力应用一次（best-effort，绝不阻断启动；
+    // busy/unsupported 只记一行，不重试 —— 共享 server 下并发启动按「最后写者生效」处理）。
+    if (OPENCODE_GENERATION === "v2") void (async () => {
+      try {
+        const configured = typeof fileConfig?.modelVariant === "string" ? fileConfig.modelVariant : undefined;
+        const session: any = opened;
+        const capable = session?.variantConfigCapable === true || typeof session?.setSelectedVariant === "function";
+        let current: string | undefined;
+        try {
+          const sel = await session?.selectedSessionModel?.(opened.sessionId);
+          current = typeof sel?.variant === "string" ? sel.variant : undefined;
+        } catch { current = undefined; }
+        const plan = startupVariantPlan(configured, current, capable);
+        if (plan !== "apply") {
+          if (configured && plan === "skip-unsupported") warn("[variant] configured variant present but this node cannot apply it (session-level only)");
+          return;
+        }
+        await withDeadlineMs(session.setSelectedVariant(configured), MODEL_SWITCH_DEADLINE_MS, "startup variant restore timed out");
+        log(`[variant] restored configured depth: ${configured}`);
+      } catch (e: any) {
+        warn(`[variant] startup restore skipped: ${e?.message ?? e}`);
+      }
+    })();
     if (borrowed && process.env.ANET_BORROWED_V1_LAUNCH_ID) {
       const { publishBorrowedLaunchHealth } = await import("./shared/opencode-borrowed-launch-health");
       clearBorrowedLaunchHealth = publishBorrowedLaunchHealth(configFilePath, process.env.ANET_BORROWED_V1_LAUNCH_ID);
@@ -5013,7 +5240,7 @@ async function resumePersistedOwnedFollowUps(): Promise<void> {
       let body: string, failed = false;
       try { body = await processWithOwnedFollowUpReplyOnly(row.entry); }
       catch (error: any) { if (error?.code === "codex_task_skipped") return; failed = true; body = error instanceof Error ? error.message : String(error); }
-      await deliverReplyReliably(row.entry.replyTo, `[${ALIAS}] ${body.slice(0, 2000)}`, row.entry.taskId, failed);
+      await deliverReplyReliably(row.entry.replyTo, `[${ALIAS}] ${capReplyText(body)}`, row.entry.taskId, failed);
       // Local reply completion suppresses redelivery; it is not Hub runtime
       // consumption/activity evidence. Transport ACK still uses inbox.id.
       commhubCompensation?.recordLifecycle(row.entry.taskId, "completed");
@@ -5118,6 +5345,94 @@ async function processWithCodexAppServer(
     throw new Error(`${describeModelAuthBlock(authFailure, NODE_CODEX_HOME)}\n${outcome.replyText.replace(/^codex-app-server 错误:\s*/, "")}`);
   }
   return codexAppServerReplyOrThrow(outcome);
+}
+
+/**
+ * Antigravity CLI（agy）—— 正常 ACP runtime 的回合执行。
+ *
+ * 复用 grok 的 ACP 回合实现（runAgyAcpTurn → runGrokAcpTurn，binary=agy / argv=["acp"]），
+ * 所以这里只做四件事：版本钉检查、MCP 注入（同一套 HTTP commhub）、prompt 组装、返回文本。
+ * 暂不做的（后续按需补）：resume hint、逐 token 推送、图片直发（先按文本发并告警）。
+ */
+async function processWithAntigravity(
+  task: string,
+  from: string,
+  images?: string[],
+  evidence?: TaskRuntimeEvidenceReporter,
+): Promise<string> {
+  const { checkAgyReadiness } = await import("./runtime/antigravity-acp/readiness");
+  const readiness = checkAgyReadiness();
+  if (!readiness.ok) throw new Error(readiness.message);
+  // 版本是建议值：不钉死，只提醒。真出兼容问题再按提示装回/换基线。
+  if (readiness.state !== "pinned") warn(`[antigravity] ${readiness.message}`);
+  if (images?.length) {
+    warn(`[antigravity] image attachments received; sending text-only prompt for now (ACP reports image=true, no verified image case yet)`);
+  }
+
+  const { buildGrokMcpServers } = await import("./goals/loops-grok-wire");
+  const mcpServers = buildGrokMcpServers({
+    commhubUrl: COMMHUB_URL,
+    alias: ALIAS,
+    authToken: AUTH_TOKEN || undefined,
+    nodeDir: typeof NODE_DIR === "string" ? NODE_DIR : undefined,
+  });
+
+  const { runAgyAcpTurn } = await import("./runtime/antigravity-acp/runtime");
+  const runOnce = (sessionId?: string) => runAgyAcpTurn({
+    prompt: buildGrokCommhubPrompt(task, from),
+    cwd: process.cwd(),
+    sessionId,
+    // #3704 follow-up（负责人 2026-11-21 真机）：AGY 这条链从来没把配置的模型传进来，
+    // applyConfiguredModel 拿到空 requested ⇒ 每次都按会话默认模型跑
+    //（真机表现：配 claude-sonnet-5-5-high，自报 "Gemini 4 Neon"）。grok 早已传
+    // `model: MODEL || undefined`，这里补齐同一行。
+    model: MODEL || undefined,
+    mcpServers,
+    // #agy-timeout —— 原来这里写死 300s（和 grok 一样），但真机上一条 7.5 分钟的
+    // 长文任务直接被判 idle 超时。agy 的默认放宽到 15 分钟，同时支持通用开关
+    // ACP_IDLE_TIMEOUT_MS / flags.acpIdleTimeoutMs（历史键 GROK_ACP_TIMEOUT_MS /
+    // flags.grokAcpTimeoutMs 仍兼容）。
+    timeoutMs: resolveAcpIdleTimeout({
+      envValue: process.env.ACP_IDLE_TIMEOUT_MS,
+      flagValue: fileConfig.flags?.acpIdleTimeoutMs,
+      legacyEnvValue: process.env.GROK_ACP_TIMEOUT_MS,
+      legacyFlagValue: fileConfig.flags?.grokAcpTimeoutMs,
+      defaultMs: 900_000,
+    }).valueMs,
+    // admin 2026-11-21「上一轮下一轮应该知道的吧」—— 真的不知道：这里原来没传 sessionId，
+    // 每轮任务都是全新 session/new，agy 节点没有跨任务记忆，和 claude(claudeSessionId) /
+    // grok ACP 模式(grokSessionId)不一致。续会话、写回同一份 config.json，和那两个一样的机制。
+    onSession: (newSessionId: string) => { agySessionId = newSessionId; writebackSession(newSessionId); },
+    onSubmitted: evidence?.submitted,
+    onConsumed: evidence?.consumed,
+    onStderr: (line) => { observeInteractivePrompt(line); debug(`[agy-stderr] ${line}`); },
+  });
+
+  // agy 只续「本次进程内」的会话：不拿 SESSION_ID（它是 cfg.session 的读回值），
+  // 见 agySessionId 的声明处那段真机复现说明。
+  const firstSessionId = agySessionId || undefined;
+  try {
+    const result = await runOnce(firstSessionId);
+    clearInteractivePrompt("turn-completed");
+    return result.replyText;
+  } catch (e: any) {
+    // admin 2026-11-22「这个能修一下吗」（公众号鸽连续两次 session/prompt idle 30 分钟）——
+    // 卡死的会话会一直卡死：agy 侧那条 session 停在未完成的一轮，之后 session/load 进去
+    // 再 prompt 依旧不出帧，于是同一个任务重试也是再等 30 分钟。
+    // 所以任何一轮失败都把进程内会话判死，下一个任务从 session/new 开始；带 firstSessionId
+    // 续失败的还额外立刻用全新会话重试一次（最坏情况只是这一轮没有上文）。
+    const failedSession = agySessionId;
+    if (failedSession) {
+      clearAgySession(`turn failed (${String(e?.message || e).slice(0, 80)})`);
+    }
+    if (firstSessionId) {
+      warn(`[antigravity] resumed session failed (${e?.message || e}); retrying once with a fresh session`);
+      const result = await runOnce(undefined);
+      clearInteractivePrompt("turn-completed");
+      return result.replyText;
+    }
+    throw e;
+  }
 }
 
 async function processWithGrok(
@@ -5312,9 +5627,11 @@ async function processWithGrok(
       // session kept whatever model it had while the hub showed config.model.
       model: MODEL || undefined,
       mcpServers: grokMcpServers,
-      timeoutMs: resolveGrokAcpTimeout({
-        envValue: process.env.GROK_ACP_TIMEOUT_MS,
-        flagValue: fileConfig.flags?.grokAcpTimeoutMs,
+      timeoutMs: resolveAcpIdleTimeout({
+        envValue: process.env.ACP_IDLE_TIMEOUT_MS,
+        flagValue: fileConfig.flags?.acpIdleTimeoutMs,
+        legacyEnvValue: process.env.GROK_ACP_TIMEOUT_MS,
+        legacyFlagValue: fileConfig.flags?.grokAcpTimeoutMs,
         defaultMs: 300000,
       }).valueMs,
       // #261 P1 redirect — handshake decoupled from prompt deadline.
@@ -5352,6 +5669,7 @@ async function processWithGrok(
       // anything not in that table keeps the old warn()/debug() split, so
       // a failure shape nobody has classified yet is never made quiet.
       onStderr: (line) => {
+        observeInteractivePrompt(line);
         const emission = stderrAggregator.observe(line);
         if (!emission) return;
         if (emission.level === "warn") warn(emission.line);
@@ -5397,6 +5715,7 @@ async function processWithGrok(
       warn(`[grok] #205 path surface skipped: ${e?.message || e}`);
     }
 
+    clearInteractivePrompt("turn-completed");
     return replyText;
   };
 
@@ -6225,6 +6544,7 @@ async function processWithGrokCli(
           if (event.type === "end") debug(`[grok-cli] end stopReason=${event.stopReason || "unknown"}`);
         },
         onStderr: (line) => {
+          observeInteractivePrompt(line);
           const emission = stderrAggregator.observe(line);
           if (!emission) return;
           if (emission.level === "warn") warn(emission.line);
@@ -6240,6 +6560,7 @@ async function processWithGrokCli(
     }
     writebackGrokSession(result.sessionId);
     log(`[grok-cli] done ${label} | ${Date.now() - started}ms | session=${result.sessionId.slice(0, 8)} | events=${result.eventCount}`);
+    clearInteractivePrompt("turn-completed");
     return sanitizeGrokCommhubLeak(result.replyText || "（无回复）");
     } finally {
       await turnLock.release();
@@ -6422,6 +6743,9 @@ function think(
             ? await processWithGrokCopresence(task, from, taskId, images, evidence)
             : await processWithGrokCli(task, from, images, evidence)
           : await processWithGrok(task, from, images, evidence);
+      }
+      if (RUNTIME === "antigravity") {
+        return await processWithAntigravity(task, from, images, evidence);
       }
       if (RUNTIME === "opencode") {
         // #1879 ③ —— 把 taskId 带进去，排队项才有归属。
@@ -6813,6 +7137,14 @@ function isIMBridgeMessage(msg: any): boolean {
   return meta?.im?.bridge === "feishu";
 }
 
+/** #4685 —— Hub send_message(steer:true) 的标记：meta_json = {"delivery":"steer"}。 */
+function wantsSteer(msg: any): boolean {
+  const meta = msg?.meta || (() => {
+    try { return msg?.meta_json ? JSON.parse(msg.meta_json) : null; } catch { return null; }
+  })();
+  return meta?.delivery === "steer";
+}
+
 function shouldSkipMessage(from: string, content: string, msgType?: string, msg?: any): string | null {
   // #519 — logic lives in inbox-skip-close.ts so the verdict is unit-testable.
   return classifyInboundSkip({
@@ -6857,6 +7189,44 @@ async function ackAndRecordConsumed(msg: any, label: string): Promise<void> {
   }
 }
 
+// #cancel —— 控制消息（interrupt）必须**并发**处理，不能走串行的 work lane。
+// 串行 lane 会被正在跑的回合占住（await 整个 model turn），于是 interrupt 要等回合
+// 跑完才被取到 → interrupted:false（没东西可停了）。这里抽出来，让 SSE 侧在
+// 收到 control 事件时立刻并发调用，不等回合结束。
+async function processControlInstruction(msg: any): Promise<void> {
+  if (inflightMessageIds.has(msg.id)) return; // 并发路径与串行 fallback 竞态：只处理一次
+  inflightMessageIds.add(msg.id);
+  try {
+    const op = parseControlOp(msg.content);
+    if (op !== "interrupt") {
+      warn(`[control] unknown op, acknowledged and ignored: ${String(msg.content).slice(0, 120)}`);
+      await ackMessage(msg.id);
+      return;
+    }
+    const out = await interruptCurrentTurn({
+      readEndpoint: () => {
+        const ep = readOpenCodeV2CatalogEndpoint(NODE_DIR) ?? readOpenCodeV2CatalogEndpoint(process.cwd());
+        return ep ? { url: ep.url, authorization: ep.authorization } : null;
+      },
+      sessionId: () => opencodeSessionId ?? null,
+    });
+    log(`[control] interrupt → ${JSON.stringify(out)}`);
+    try {
+      await sendReply(
+        msg.from_session || "hub",
+        `[${await liveAlias()}] interrupt ${JSON.stringify(out)}`,
+        msg.task_id || undefined,
+        !out.ok,
+      );
+    } catch (e: any) {
+      warn(`[control] reply failed: ${e?.message ?? e}`);
+    }
+    await ackMessage(msg.id);
+  } finally {
+    inflightMessageIds.delete(msg.id);
+  }
+}
+
 async function processInbox() {
   // (1) Drain leftovers from previous runs.
   if (shouldDrainPendingReplies(RUNTIME, inflightMessageIds.size)) {
@@ -6872,6 +7242,44 @@ async function processInbox() {
   const messages = await getInbox();
   if (!messages.length) return;
   const processInboxMessage = async (msg: any) => {
+    // #cancel —— 控制消息是一条**指令**，不是任务：绝不能让它进模型回合。
+    // 目前只有一种 op：interrupt（停掉当前在跑的那一轮）。
+    // 走 inbox 是因为这是 Hub → 节点已经存在的可靠通道（有 ack、有重投、有 SSE）。
+    if ((msg.type || "task") === "control") {
+      await processControlInstruction(msg);
+      return;
+    }
+    // #4685 —— steer：把一条 send_message(steer:true) 并进**正在跑的那一轮**（不排队）。
+    // 与 control 同性质：它是一条「注入当前轮次」的指令，不是新任务。
+    if ((msg.type || "task") === "message" && RUNTIME === "opencode" && opencodeMode === "copresence" && wantsSteer(msg)) {
+      const session = opencodeCopresenceSession;
+      let outcome: { ok: boolean; delivered: "steer" | "missed" | "failed"; reason?: string };
+      try {
+        if (!session?.isRunning || typeof session.steer !== "function") {
+          // 没有在跑的轮次 / 这个运行时没有 steer ⇒ **丢弃**（下面那条 fast-lane 会 ack，send_message
+          // 本来就不触发模型回合）。如实回「missed」，客户端据此提示「这一轮已结束，未插入」，
+          // 而不是让用户以为说了却没反应。
+          outcome = { ok: false, delivered: "missed", reason: "no-running-turn" };
+        } else {
+          await session.steer(String(msg.content ?? "").trim() ? String(msg.content ?? "").trim() : (() => { throw new Error("steer needs a non-empty instruction"); })());
+          outcome = { ok: true, delivered: "steer" };
+        }
+      } catch (e: any) {
+        outcome = { ok: false, delivered: "failed", reason: String(e?.message ?? e) };
+      }
+      try {
+        await sendReply(
+          msg.from_session || "hub",
+          `[${await liveAlias()}] steer ${JSON.stringify(outcome)}`,
+          msg.task_id || undefined,
+          !outcome.ok,
+        );
+      } catch (e: any) {
+        warn(`[steer] reply failed: ${e?.message ?? e}`);
+      }
+      await ackMessage(msg.id);
+      return;
+    }
     // OpenCode copresence informational messages belong to their own fast
     // lane. Leaving them in the task drain would make a message wait behind
     // an arbitrarily long model turn from an earlier inbox row.
@@ -7084,7 +7492,7 @@ async function processInbox() {
       }
 
       // (3c-e) Persist + ack + try send.
-      const replyBody = `[${ALIAS}] ${result.slice(0, 2000)}`;
+      const replyBody = `[${ALIAS}] ${capReplyText(result)}`;
       await deliverReplyReliably(from, replyBody, logicalTaskId, failed);
       try {
         // Keep the transport ACK visibly bound to inbox.id here. Stable
@@ -7934,6 +8342,51 @@ async function processConfigUpdate(): Promise<void> {
       return;
     }
 
+    // Variant changes are live-session-only: never enter legacy restart or
+    // config-file writeback paths, including on timeout or unsupported nodes.
+    if (update.patch.modelVariant !== undefined) {
+      const result = RUNTIME === "opencode" && OPENCODE_GENERATION === "v2"
+        ? await withDeadlineMs(
+            applyVariantConfig(opencodeCopresenceSession ?? undefined, { model: update.patch.model, modelVariant: update.patch.modelVariant }),
+            MODEL_SWITCH_DEADLINE_MS, "variant switch timed out",
+          ).catch(() => ({ status: "unknown" as const }))
+        : { status: "rejected" as const, reason: "unsupported" as const };
+      await callCommHub("ack_config_update", {
+        update_id: updateId,
+        status: result.status === "applied" ? "applied" : result.status === "unknown" ? "timeout" : "rejected",
+        // 拒绝时把判据一起回执：Hub 只存 `error` 这个字符串，丢掉原文之后
+        // 「恰好有一轮在飞」和「计数器卡死」在观测面上不可分（#4414）。
+        ...(result.status === "applied" ? { new_revision: ++currentConfigRevision }
+          : { error: result.status === "unknown" ? `variant_outcome_unknown${"detail" in result && typeof result.detail === "string" ? ` ${result.detail}` : ""}`
+              : `variant_${result.reason}${result.detail ? ` ${result.detail}` : ""}` }),
+      });
+      // #5123 —— 只有回读确认 applied 才写回配置；rejected/unknown 不落盘
+      //（unknown 落盘会制造「配置说切了、会话没切」的谎，比不持久化更坏）。
+      // #5123 review —— 先过守卫再落盘：applied 且形状合法才写。
+      // （shouldPersistVariant 是这条不变量的唯一定义处，不能只让测试用它。）
+      if (shouldPersistVariant(result.status, update.patch.modelVariant)) {
+        persistVariantToConfig(configFilePath, update.patch.modelVariant, { warn });
+      }
+      return;
+    }
+
+    // Agent selection is the same shape as the variant path: live-session only,
+    // never a config write, never a restart (a restart reopens the old agent).
+    if (update.patch.agent !== undefined) {
+      const result = RUNTIME === "opencode" && OPENCODE_GENERATION === "v2"
+        ? await withDeadlineMs(
+            applyAgentConfig(opencodeCopresenceSession ?? undefined, update.patch.agent),
+            MODEL_SWITCH_DEADLINE_MS, "agent switch timed out",
+          ).catch(() => ({ status: "unknown" as const }))
+        : { status: "rejected" as const, reason: "unsupported" as const };
+      await callCommHub("ack_config_update", {
+        update_id: updateId,
+        status: result.status === "applied" ? "applied" : result.status === "unknown" ? "timeout" : "rejected",
+        ...(result.status === "applied" ? { new_revision: ++currentConfigRevision } : { error: result.status === "unknown" ? "agent_outcome_unknown" : `agent_${result.reason}` }),
+      });
+      return;
+    }
+
     const localMode = computeConfigApplyMode(update.patch, {
       runtime: fileConfig?.runtime,
       opencodeGeneration: fileConfig?.opencodeGeneration,
@@ -7969,6 +8422,10 @@ async function processConfigUpdate(): Promise<void> {
       const sessionRunning = opencodeCopresenceSession?.isRunning === true;
       const switchable = typeof opencodeCopresenceSession?.setSelectedModel === "function";
       if (!sessionRunning || !switchable) {
+        if (opencodeCopresenceSession?.variantConfigTestOwned) {
+          await callCommHub("ack_config_update", { update_id: updateId, status: "rejected", error: "variant_session_unavailable" });
+          return;
+        }
         // 打印「分支 + 输入」，不打印「谓词的布尔」：
         // 布尔只能区分“方法在不在”，而“方法在但一调用就抛”会被读成 true，
         // 正好回到这个坑本身（present ≠ 可用）。
@@ -8017,6 +8474,10 @@ async function processConfigUpdate(): Promise<void> {
           `OpenCode session model switch timed out after ${MODEL_SWITCH_DEADLINE_MS}ms`,
         );
       } catch (switchErr: any) {
+        if (session?.variantConfigTestOwned) {
+          await callCommHub("ack_config_update", { update_id: updateId, status: "timeout", error: "variant_model_outcome_unknown" });
+          return;
+        }
         const reason = String(switchErr?.message || switchErr).slice(0, 400);
         // 本地日志保留 message（便于现场排查），**上报给 Hub 的摘要只带
         // err.name + 白名单 err.code**：message 可能包含上游原文，
@@ -8252,6 +8713,17 @@ async function connectSSE() {
                 import('./runtime/scoped-secrets.js').then(({ reconcileScopedSecrets }) => reconcileScopedSecrets({
                   callCommHub, workDir: process.cwd(), alias: ALIAS, networkId: NETWORK_ID, daemonId: NODE_ID, warn,
                 })).catch(()=>warn('[daemon-secrets] module unavailable'));
+                // #4821 —— daemon 侧会话列表：拉 Hub 排队的请求，读本地 OpenCode V2，回填原始页。
+                // 没有共享 server（opencodeSharedServerUrl/PasswordFile）就什么都不做 —— 不猜默认 server。
+                import("./runtime/opencode-sessions-bridge.js").then(({ startSessionRequestDrainLoop, makeSharedServerPageReader }) => {
+                  const readPage = makeSharedServerPageReader({
+                    url: fileConfig.opencodeSharedServerUrl,
+                    passwordFile: fileConfig.opencodeSharedServerPasswordFile,
+                    readFile: (path: string) => readFileSync(path, "utf8"),
+                  });
+                  if (!readPage) return;
+                  startSessionRequestDrainLoop({ callCommHub, key: `${NETWORK_ID}:${NODE_ID}`, warn: (m: string) => warn(m), readPage });
+                }).catch(() => warn("[opencode-sessions] bridge module unavailable"));
                 import("./runtime/daemon-provider-snapshot.js").then(({ reconcileProviderSnapshots }) => reconcileProviderSnapshots({
                   callCommHub, workDir: process.cwd(), alias: ALIAS, networkId: NETWORK_ID, daemonId: NODE_ID, serverUrl: COMMHUB_URL,
                   warn: (m: string) => warn(m),
@@ -8335,8 +8807,26 @@ async function connectSSE() {
             // main fixed both with a single coalescing drain; this branch adds
             // the separate informational lane copresence needs, which subsumes it.
             if (ev.type === "new_message" && RUNTIME === "opencode" && opencodeMode === "copresence") {
-              log(`← SSE ${ev.type}`);
+              log(`← SSE ${ev.type}${(ev as any).control ? ` control=${(ev as any).control}` : ""}`);
               scheduleInformationalInboxDrain();
+              // 控制消息（停止当前轮）既不是 task 也不是 message：
+              // 信息通道只排空 type=message，工作通道只在 new_task/broadcast 时排空 ——
+              // 于是 control 行在两条 lane 之间被漏掉（实测：回合进行中发出，回合结束后仍 acked=0，
+              // 节点再也没去取）。这里让它也唤醒工作通道。
+              if ((ev as any).control) {
+                scheduleWorkInboxDrain();
+                // 但串行 work lane 会被正在跑的回合占住，interrupt 要等回合跑完才被处理 →
+                // interrupted:false。所以这里**并发**取一次 control 行立刻打断，不等回合结束。
+                void (async () => {
+                  try {
+                    const rows = await getInbox();
+                    const ctrl = rows.find((m: { type?: string }) => (m.type || "task") === "control");
+                    if (ctrl) await processControlInstruction(ctrl);
+                  } catch (e: any) {
+                    warn(`[control] concurrent drain failed: ${e?.message || e}`);
+                  }
+                })();
+              }
             } else if (["new_task", "new_message", "broadcast"].includes(ev.type)) {
               log(`← SSE ${ev.type}`);
               scheduleWorkInboxDrain();
@@ -8383,7 +8873,8 @@ async function connectSSE() {
               const requestId = typeof ev.request_id === "string" ? ev.request_id : "";
               if (!requestId) continue;
               const deps = { callCommHub, workDir: process.cwd(), home: process.env.HOME || "",
-                hubUrl: COMMHUB_URL, networkId: NETWORK_ID, uid: process.getuid?.() ?? -1,
+                hubUrl: COMMHUB_URL, hubAliases: Array.isArray(fileConfig.hub_aliases) ? fileConfig.hub_aliases : [],
+                networkId: NETWORK_ID, uid: process.getuid?.() ?? -1,
                 daemonEnv: process.env,
                 adoptRoots: Array.isArray(fileConfig.adopt_roots) ? fileConfig.adopt_roots : [],
                 warn: (m: string) => warn(m) };
@@ -8591,16 +9082,26 @@ log(`  instance: ${INSTANCE_ID}`);
 // is the same one runGrokAcpTurn() will use for its session/prompt
 // activity-based timeout (#211).
 if (RUNTIME === "grok" && GROK_EXECUTION_MODE === "acp") {
-  const t = resolveGrokAcpTimeout({
-    envValue: process.env.GROK_ACP_TIMEOUT_MS,
-    flagValue: fileConfig.flags?.grokAcpTimeoutMs,
+  const t = resolveAcpIdleTimeout({
+    envValue: process.env.ACP_IDLE_TIMEOUT_MS,
+    flagValue: fileConfig.flags?.acpIdleTimeoutMs,
+    legacyEnvValue: process.env.GROK_ACP_TIMEOUT_MS,
+    legacyFlagValue: fileConfig.flags?.grokAcpTimeoutMs,
     defaultMs: 300000,
   });
-  const sourceLabel =
-    t.source === "flags" ? "flags.grokAcpTimeoutMs" :
-    t.source === "env" ? "env GROK_ACP_TIMEOUT_MS" :
-    "default";
+  const sourceLabel = t.knob ?? "default";
   log(`  [grok] session/prompt idle timeout = ${t.valueMs}ms (source: ${sourceLabel})`);
+} else if (RUNTIME === "antigravity") {
+  // agy 的 idle 阈值同样可以被打错名字的旧键影响，启动时明确打印解析结果，
+  // 免得运维以为配了 flags.acpIdleTimeoutMs 却没生效。
+  const t = resolveAcpIdleTimeout({
+    envValue: process.env.ACP_IDLE_TIMEOUT_MS,
+    flagValue: fileConfig.flags?.acpIdleTimeoutMs,
+    legacyEnvValue: process.env.GROK_ACP_TIMEOUT_MS,
+    legacyFlagValue: fileConfig.flags?.grokAcpTimeoutMs,
+    defaultMs: 900_000,
+  });
+  log(`  [antigravity] session/prompt idle timeout = ${t.valueMs}ms (source: ${t.knob ?? "default"})`);
 } else if (RUNTIME === "grok") {
   const raw = process.env.GROK_CLI_TIMEOUT_MS || fileConfig.flags?.grokCliTimeoutMs || "300000";
   log(`  [grok-cli] execution mode=${GROK_COPRESENCE ? "co-presence TUI" : "headless TUI engine"}; idle timeout=${raw}ms`);
@@ -8758,6 +9259,44 @@ if (RUNTIME === "codex" || RUNTIME === "codex-app-server") {
 }
 await register();
 log("已注册到 CommHub");
+// Independent explicit directory/fork previews; directory-only never probes or
+// starts a launcher. Ordinary daemons do not poll either source queue.
+// 🔴 能力上报与实际拉起 worker 用**同一份** sourceCapabilities 结果：
+//    报了什么就必须起什么，否则会出现「Hub 按能力派活、daemon 从不轮询 → 用户点了卡到超时」。
+const sourceLanes = startedSourceLanes();
+log(`[source-control] lanes: ${Object.keys(sourceLanes).join(",") || "none"}`);
+if (Object.keys(sourceLanes).length > 0
+  && SESSION_CONTROL_START_TOKEN.startsWith("ntok_") && NODE_ID && NETWORK_ID && process.platform === "linux"
+  && isSecureSourceHubUrl(COMMHUB_URL)) {
+  // An optional preview lane must never be the reason a daemon dies: any setup
+  // error leaves the daemon running without the lane (and without advertising it).
+  try {
+  const { createSessionSourceTransportWorker } = await import("./runtime/session-source-transport");
+  sourceForkWorker = createSessionSourceTransportWorker({ hubUrl: COMMHUB_URL, daemonWorkDir: process.cwd(), home: daemonHome(),
+    // 直接由 sourceLanes 推导：不重新读 env / config，杜绝两套判据漂移。
+    directoryEnabled: "source_directory_read" in sourceLanes,
+    attachEnabled: "session_attach" in sourceLanes,
+    projectEnabled: "project_new_session" in sourceLanes,
+    forkEnabled: "source_fork_transport" in sourceLanes,
+    pin: createSessionControlPin({ hubUrl: COMMHUB_URL, token: SESSION_CONTROL_START_TOKEN, nodeId: NODE_ID, networkId: NETWORK_ID,
+      epoch: sessionControlCredentialEpoch, currentToken: () => AUTH_TOKEN, currentEpoch: () => sessionControlCredentialEpoch,
+      signal: sessionControlCredentialAbort.signal }) });
+  // Say *why* the tick failed (was swallowed, which hid e.g. unknown_rotation_required
+  // causes). Rate-limited: once per distinct reason, or once a minute if it repeats.
+  let lastTickErr = ""; let lastTickErrAt = 0;
+  const tick = () => { void sourceForkWorker?.tick().catch((e: any) => {
+    const reason = String((typeof e?.code === "string" && e.code) || e?.name && e?.message && `${e.name}: ${e.message}` || e?.message || e).replace(/\b(ntok|utok|stok|ghp)_[A-Za-z0-9_-]+/g, "$1_***").slice(0, 200);
+    const now = Date.now();
+    if (reason === lastTickErr && now - lastTickErrAt < 60_000) return;
+    lastTickErr = reason; lastTickErrAt = now;
+    warn(`[source-control] transport unavailable; no automatic replay (${reason})`);
+  }); };
+  tick(); setInterval(tick, 1000).unref();
+  } catch (e: any) {
+    sourceForkWorker = null;
+    warn(`[source-control] source transport not started: ${String(e?.message || e).slice(0, 200)}`);
+  }
+}
 
 // 2026-10-31 —— 上一次退出是「按计划的」吗？读了就清。
 //   生命周期 = 一次退出 → 下一次启动（不做 TTL）：标记只回答「我是被计划重启拉起来的吗」，
@@ -9038,12 +9577,26 @@ async function recoverLateResult(rec: { sessionId: string; turnId: string }): Pr
           if (recovered) log(`[late-reply] recovered content for ${rec.taskId} from session history`);
           return callCommHub("send_reply", {
             in_reply_to: rec.taskId,
+            // #4529 —— 显式带回收件人：任务行若已被清理，Hub 反查 from_name 会落空
+            // （reply_target_unresolved），补发就静默丢了。旧记录没有 to ⇒ 不传，行为不变。
+            ...(rec.to ? { alias: rec.to } : {}),
             text,
             status: recovered ? "replied" : "failed",
             thread_id: rec.threadId,
             turn_id: rec.turnId,
           }, 0).then((response: any) => {
-          if (response?.ok === false) warn(`[late-reply] startup notice refused: ${response?.error ?? "?"}`);
+          if (response?.ok === false) {
+            warn(`[late-reply] startup notice refused: ${response?.error ?? "?"}`);
+            // #4529 收尾：`reply_target_unresolved` 表示这条记录**永远**补不上 ——
+            // 旧记录（#4529 之前写的，没有 to 字段）只能靠 Hub 从 tasks 反查 from_name，
+            // 任务行一旦被清理就反查落空。留着它只会让每次重启都重报一次、且发送方永远收不到。
+            // 实测 2026-11-13 本机有 4 条这种旧记录（11-05/08/09/11 各一条），每次重启都刷 4 行 warning。
+            // 这类错误是终态：删记录并说明，不再无限重试。
+            if (isTerminalLateReplyError(response?.error)) {
+              clearLateReplyRecord(NODE_DIR, rec.taskId);
+              warn(`[late-reply] dropped unrecoverable record ${rec.taskId.slice(0, 8)} (no reply target; task row already gone)`);
+            }
+          }
           else {
             clearLateReplyRecord(NODE_DIR, rec.taskId);
             log(`[late-reply] startup notice sent for ${rec.taskId}`);
@@ -9092,6 +9645,7 @@ const scheduleHeartbeat = (): void => {
   (timer as any)?.unref?.();
 };
 scheduleHeartbeat();
+const stopRulesFilePolling = startRulesFilePolling(rulesFileDeps());
 if (RUNTIME === "opencode" && OPENCODE_GENERATION === "v2" && opencodeMode === "copresence") {
   setInterval(() => { void pollOpencodeSessionModel(); }, OPENCODE_MODEL_POLL_MS).unref();
   if (sessionControlBridge) {
@@ -9246,10 +9800,12 @@ const shutdown = async () => {
   shuttingDown = true;
   codexWatchdogStopping = true;
   ownerScheduleConsumer?.stop();
+  stopRulesFilePolling();
   sideThreadNodeRuntime?.close();
   sideThreadOwnedSession?.client.close();
   sideThreadOwnedSession?.proc?.kill("SIGTERM");
   log("shutting down...");
+  await sourceForkWorker?.stop();
   await import('./runtime/daemon-provider-login.js').then(m => m.closeProviderLogins()).catch(() => {});
   await closeOpencodeRuntime("signal shutdown");
   await grokCopresenceRuntimeSession?.close().catch((e: any) => {
@@ -9291,6 +9847,11 @@ process.on("SIGHUP", shutdown);
 if (RUNTIME === "opencode" && opencodeMode === "copresence") {
   try {
     await ensureOpencodeCopresenceRuntime();
+    if (fileConfig.sourceDelivery) {
+      await register(); // authenticated real child registration, not self-asserted health
+      const { publishSourceResumeHealth } = await import("./runtime/source-resume-launcher");
+      publishSourceResumeHealth(configFilePath, process.env.ANET_SOURCE_RESUME_NONCE!, opencodeSessionId!);
+    }
   } catch (error: any) {
     console.error(`[${ALIAS}] OpenCode copresence startup failed: ${error?.message ?? error}`);
     await closeOpencodeRuntime("startup failure");

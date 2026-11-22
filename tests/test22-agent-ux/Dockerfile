@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y curl python3 make g++ procps && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+COPY contracts /app/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /app/server/src/contracts
 COPY server/ server/
 COPY agent-node/ agent-node/
 COPY agent-network/ agent-network/

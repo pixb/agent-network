@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 
 WORKDIR /workspace
+COPY contracts /workspace/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /workspace/server/src/contracts
 COPY agent-node/package.json ./agent-node/package.json
 RUN cd agent-node && npm install --omit=optional --ignore-scripts
 COPY agent-node ./agent-node

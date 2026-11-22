@@ -9,6 +9,25 @@ set -euo pipefail
 #
 # 形状抄 tests/test745-agent-network-unit-ci。
 
+# 🔴 进程组 1 会让「进程组身份」整体失效（2026-11-10 定位）
+#
+# 容器里 bash 是 PID 1 时，bun 与它拉起的子进程都留在**进程组 1**。
+# agent-node 的 readLinuxIdentity 有一条护栏：pgrp <= 1 视为「不是真实进程组」，
+# 于是 readProcessGroupIdentity() 恒为 undefined，source-resume 的
+# namespace / claim-handoff 守卫必然拒绝 —— 3 条用例确定性变红（连红 4 天），
+# 与产品代码无关；开发者本机 pgrp≠1，所以一直绿。
+#
+# 三组对照（同镜像、同提交，只换启动方式）：
+#   docker run … bash -lc "bun test …"   → fail
+#   docker run --init …                  → pass
+#   setsid -w bash -c "bun test …"       → pass
+#
+# 修在夹具里：给每条用例自己的 session/进程组。
+# **不放宽** pgrp<=1 这条护栏 —— pgrp 0/1 在真实系统里另有含义，
+# 放宽等于把「PID 复用防线」削弱成装饰。
+SETSID=()
+command -v setsid >/dev/null 2>&1 && SETSID=(setsid -w)
+
 ROOT=/workspace
 SOURCE_COMMIT=${TEST798_SOURCE_COMMIT:-}
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
@@ -85,12 +104,17 @@ while IFS= read -r f; do
   db="/tmp/test798-$name.db"
   rm -f "$db"
   if runuser -u node -- env HOME=/home/node COMMHUB_DB="$db" \
-       bash -lc "cd $ROOT && bun test '$rel'" >"/tmp/test798-$name.log" 2>&1; then
+       "${SETSID[@]}" bash -lc "cd $ROOT && bun test '$rel'" >"/tmp/test798-$name.log" 2>&1; then
     ran=$((ran+1))
   else
     ran=$((ran+1)); failed=$((failed+1)); failed_names="$failed_names $name"
     echo "--- FAILED: $rel ---"
     tail -25 "/tmp/test798-$name.log"
+    # 2026-11-10 —— tail -25 只剩一串用例名；失败**原因**（error/Expected/Received 与其上下文）
+    # 在更前面。把每条失败的原因块也打出来（有上限），否则 CI 独有的红只能猜。
+    echo "--- FAILURE CAUSES: $rel (first 160 lines) ---"
+    grep -n -B6 -A4 -E '^error:|Expected|Received|ENOENT|EACCES|source_[a-z_]+_refused|unknown_rotation_required' \
+      "/tmp/test798-$name.log" | grep -vE '^[0-9]+-\(pass\)' | head -160 || true
     # 2026-10-31 —— **红在哪一档**比「红了几条」可行动。
     # 用 scripts/report-server-test-triage.py（同一个分档器），把这一条的失败块喂给它：
     # 前面的汇总行是它认文件用的，真正的失败原因在后面的原日志里。
@@ -146,7 +170,7 @@ after=$(sha256sum "$SRC" | cut -d' ' -f1)
 rm -f /tmp/test798-mut.db
 set +e
 runuser -u node -- env HOME=/home/node COMMHUB_DB=/tmp/test798-mut.db \
-  bash -lc "cd $ROOT && bun test server/src/auth-validate.test.ts" \
+  "${SETSID[@]}" bash -lc "cd $ROOT && bun test server/src/auth-validate.test.ts" \
   >/tmp/test798-mutation.log 2>&1
 mutation_rc=$?
 set -e

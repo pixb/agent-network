@@ -1,3 +1,7 @@
+---
+pageClass: api-reference
+---
+
 # MCP Tools Reference
 
 CommHub Server registers **74** MCP Tools, all called through `POST /mcp` (Streamable HTTP). The index below is complete; the 17 tools agents use for day-to-day collaboration are documented in full further down — click the name to jump.
@@ -144,6 +148,8 @@ Node tokens only; people use the app or `/api/scheduled-tasks`. Permissions and 
 | `get_config_update` | Node pulls its pending config update |
 | `ack_config_update` | Node reports the config-update outcome |
 | `read_node_rules_file` | Ask a node to send back the rules file in its working directory (claude → CLAUDE.md, others → AGENTS.md); no path argument, poll `get_rules_file_result` (app#225) |
+| `start_agy_login` | Start `agy acp --login` on an Antigravity node and return the Google authorization URL; poll `get_rules_file_result` for `url` / `login_id` / `expires_at`. User logins only. |
+| `submit_agy_login_code` | Submit the authorization code or the full redirect URL (`{request_id, login_id, code}`); relayed once, purged right after the node acknowledges. User logins only. |
 | `write_node_rules_file` | Ask a node to overwrite its rules file with `content`; no path argument, 256 KB cap (app#225) |
 | `list_node_skills` | Ask a node to list the skills its runtime actually loads (`{name, scope, path_rel, description}`, read-only); directories are chosen by the node per runtime, no path argument, poll `get_rules_file_result` |
 | `read_node_skill` | Ask a node to send back one skill's SKILL.md (read-only, 256 KB cap); the only input is the skill `name` (`[A-Za-z0-9._-]{1,64}`), never a path |
@@ -161,6 +167,8 @@ Node tokens only; people use the app or `/api/scheduled-tasks`. Permissions and 
 | `ack_stop_request` | Daemon reports stop/delete completion or failure |
 | `get_start_request` | Daemon pulls a pending start request |
 | `ack_start_request` | Daemon reports start completion or failure |
+| `pull_session_requests` | Daemon pulls pending read-only session-list requests (#4821, shaped like node_create_requests but side-effect free) |
+| `ack_session_request` | Daemon acks a session-list request's result (`request_id`, `ok`, the `data_json` it read, or `error`) |
 | `list_host_supervisors` | List host_supervisor daemons in this network, with online status |
 | `list_my_children` | Daemon pulls the list of children it spawned |
 | `request_adopt_node` | Human requests adoption with `node_id`, `daemon_node_id`, `workdir`. Requires network write access plus node ownership or network owner/admin. Daemon must be online, same network/hostname, and advertise `daemon_capabilities.adopt_capable`. Creates a pending binding, without signalling processes |
@@ -200,6 +208,7 @@ before controlling a process; a restored Hub row alone is insufficient.
 | Tool | What it does |
 |------|------|
 | `read_opencode_catalog` | Queue a native catalog read for one owned OpenCode V2 child. `ok` with `status: pending` means authorized and stored in memory. It is not a snapshot and does not mean a daemon received the doorbell. Does not start a server. Rejects url, authorization, directory, settings, headers, and body |
+| `select_opencode_session_model` | Entry point for an OpenCode V2 session model change; currently **unavailable**: it always reports unavailable, writes nothing and restarts nothing. Change models with `update_node_config` |
 | `get_opencode_catalog` | Poll that read. `pending` is not a snapshot. Only `ready` returns a whitelist snapshot, still completeness unknown and invocationVerified false |
 | `get_opencode_catalog_request` | Daemon pulls one authorized read. Scope only: no URL, authorization, settings, headers, or body |
 | `ack_opencode_catalog` | Daemon stores a whitelist snapshot or a closed error code. Extra fields are rejected. A stored failure is status failed, not a transport error |
@@ -640,7 +649,7 @@ Cancel a pending task.
 ```
 
 ::: warning Constraint
-Only cancellable from these 4 source statuses: `created` / `delivered` / `acked` / `running` (verify the WHERE clause at [`tools.ts`](https://github.com/sleep2agi/agent-network/blob/main/server/src/tools.ts) — grep `status IN ('created', 'delivered', 'acked', 'running')` inside `cancel_task` (2 sites; the other is `send_message`)). Calling on a terminal status (`replied` / `failed` / `cancelled` / `expired`) returns `{ok: false, cancelled: false}`.
+Only cancellable from these 4 source statuses: `created` / `delivered` / `acked` / `running` (verify the WHERE clause at [`tools.ts`](https://github.com/sleep2agi/agent-network/blob/main/server/src/tools.ts) — grep `const cancelStatuses` inside `cancel_task`: node token 4 states, user token also clears `expired`). Calling on a terminal status (`replied` / `failed` / `cancelled` / `expired`) returns `{ok: false, cancelled: false}`.
 
 `created` is only the DB column default; the normal API path never produces a row in that state (see [Task lifecycle — the `created` state](/en/concepts/task-lifecycle#state-machine)).
 :::

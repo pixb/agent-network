@@ -7,6 +7,9 @@ RUN apt-get update \
 WORKDIR /work
 COPY tests/test637-database-url-guard/package.json ./package.json
 RUN bun install --production
+COPY contracts /work/contracts
+# contracts/*.ts re-export ../server/src/contracts/*
+COPY server/src/contracts /work/server/src/contracts
 COPY server/src ./server/src
 COPY tests/test637-database-url-guard ./tests/test637-database-url-guard
 

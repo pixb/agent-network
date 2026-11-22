@@ -15,6 +15,12 @@ import { statusAliasResolverRead } from "./status-alias-resolver.js";
 import { readNodeHealth } from "./node-health-store.js";
 import { wantsAllTools } from "./tool-audience.js";
 import { assertNodeHealthy, degradedLayers } from "./node-health-guard.js";
+import { GRANT_CAPABILITIES, grantsWithinManaged, listNodeGrants, parseNodeGrants, replaceNodeGrants } from "./node-grants.js";
+import { readReportedWorkdir, workdirProjection } from "./node-workdir.js";
+import { createSessionRequest, findFreshResult, findOpenRequest, getSessionRequest, ensureSessionRequestsTable } from "./opencode-session-requests.js";
+import { userManageScope, canUserManageNode, USER_GRANT_CAPABILITIES, USER_GRANT_LEVELS, USER_GRANT_SCOPES, canGrantUserScope, listUserGrants, setUserGrant } from "./user-grants.js";
+import { isInboxTightening, isPermissionModeTightening } from "./permission-tightening.js";
+import { permissionManagementAudit, permissionManagementDenial } from "./node-permission-management.js";
 import { auditDepartment, createDepartment, deleteDepartment, listDepartments, setAgentDepartment, setMemberDepartment, updateDepartment } from "./departments.js";
 import { activeBinding, createdDaemon } from "./node-daemon-bindings.js";
 import { countInFlightTasks } from "./node-in-flight-tasks.js";
@@ -40,6 +46,14 @@ import { aliasBaselineRefreshState, refreshAliasBaseline } from "./alias-baselin
 import { broadcastRecentState, enqueueBroadcast } from "./broadcast-fanout.js";
 import { assertNodeActive } from "./lifecycle-guard.js";
 import { pendingInboxCount } from "./inbox-count.js";
+import { resolveInboxCaller } from "./inbox-caller.js";
+import { inboxAtIsoUtc, inboxScope, inboxCrossNetworkRejected, inboxNetworkFilter } from "./inbox-endpoint-helpers.js";
+import { canListOpencodeSessions } from "./opencode-session-access.js";
+import { runtimeIsOpencode } from "./opencode-runtime.js";
+import { isHumanToken } from "./human-token.js";
+import { getMachineAlias, setMachineAlias, normalizeMachineAlias, countNodesOnHost, MACHINE_ALIAS_MAX } from "./machine-alias.js";
+import { pendingSecretRequests, clearSecretRequest } from "./secret-request-ui.js";
+import { sweepUnconfirmed } from "./acked-unconfirmed.js";
 import { notifyExpiredTasks, type ExpiredTaskRow } from "./task-expiry-notice.js";
 import { expireStaleOpenTasks } from "./task-stale-open.js";
 import { expireDeliveredToOfflineTargets } from "./task-offline-delivery.js";
@@ -54,15 +68,15 @@ import { dmParticipantSeesFile, listDmThread, listDmThreads, sendHumanDm } from 
 import { groupMemberSeesFile, groupUnreadFor, listGroupMessages, listGroupThreads, markGroupRead, memberGroup, sendGroupMessage } from "./group-messages.js";
 import { getTaskAccessMode, isTaskScoped, listProjectGrants, replaceTaskGrants, newMemberTaskAccess } from "./task-access.js";
 import { canMessageAgent, isAgentRestricted, visibleAgents, listAgentGrants, listGroupGrants, getAgentAccessMode, replaceAgentGrants, restrictedNetworkIds, usernameIsAgentAlias, listAgentGroups, createAgentGroup, updateAgentGroup, replaceAgentGroupMembers, deleteAgentGroup, usersGrantedGroup, listDepartmentGrants, departmentCoverage } from "./agent-access.js";
-import { broadcastVerdict, dispatchVerdict, humanOnlyVerdict, NODE_PERMISSION_MODES, nodeDecide, nodeIdentity, nodePermissionDeniedBody, nodePermissionsFlag, streamVerdict, writeVerdict, type NodeIdentity, type NodePermissionMode, type Verdict } from "./node-permissions.js";
+import { broadcastVerdict, dispatchVerdict, filterBroadcastByInbox, humanOnlyVerdict, inboxDenied, inboxSenderFromAuth, NODE_PERMISSION_MODES, nodeDecide, nodeIdentity, nodePermissionDeniedBody, nodePermissionsFlag, streamVerdict, writeVerdict, type InboxSender, type NodeIdentity, type NodePermissionMode, type Verdict } from "./node-permissions.js";
 import { validateAvatarUrl } from "./avatar-validate.js";
-import { narrowTags, parseStoredTags, validateScalarAttr } from "./node-attrs-validate.js";
+import { narrowTags, parseStoredTags, validateDescription, validateScalarAttr } from "./node-attrs-validate.js";
 import { daemonDefaultWorkdirRoot } from "./create-node-validate.js";
 import { register, login, resolveToken, tokenRejection, isExpiredSessionToken, sessionIdleDays, listSessions, revokeSession, revokeOtherSessions, getUserNetworks, getUserAllNetworks, createNetwork, deleteNetwork, adminDeleteEmptyNetwork, renameNetwork, changePassword, issueUserToken, getUserTokenMeta, listTokens, createToken, revokeToken, getNetworkMembers, getNetworkHumans, getUserNetworkRole, addNetworkMember, adminCreateUser, listUsersWithMemberships, updateMemberRole, removeNetworkMember, createInvite, joinByInvite, createNetworkTokenForNode, type AuthUser } from "./auth.js";
 import { abortRename, cleanupCommittedRenameSessions, commitRename, prepareRename, resolveCanonicalAlias } from "./rename.js";
 import { sharedSendDedup, buildDuplicateSendPayload } from "./send_dedup.js";
 import { clientRequestIdFromMeta, idempotentTaskId, idempotentTaskMatches, type StoredIdempotentTask } from "./task-idempotency.js";
-import { getLoginClientIp, sharedLoginFailureLockout, sharedLoginIpRateLimiter } from "./auth_login_guard.js";
+import { getLoginClientIp, normalizePeerIp, sharedLoginFailureLockout, sharedLoginIpRateLimiter } from "./auth_login_guard.js";
 import {
   FILE_ID_REGEX,
   MAX_REQUEST_CONTENT_LENGTH,
@@ -108,6 +122,12 @@ import { startDueReminderTimer } from "./requirement-due-reminders.js";
 import { clearNodeFromRequirements, handleRequirementsRequest } from "./requirements.js";
 import { readHubProviders, putHubProvider, providerWriteStatus } from "./hub-provider-config.js";
 import { readLastConfigUpdate } from "./node-config-last-update.js";
+// #4495 —— 源目录 / 新建节点 / 复用已有 Session 的能力值。Hub 只认这几个**精确**字符串,
+// 别的值一律不投影(daemon 上报的是自由 JSON,不能把任意串透给客户端当能力)。
+import { SOURCE_DIRECTORY_CAPABILITY } from "./contracts/session-source-directory.js";
+import { SOURCE_FORK_CAPABILITY } from "./contracts/session-source-transport.js";
+import { SOURCE_DELIVERY_CAPABILITY } from "./contracts/session-source-delivery.js";
+import { PROJECT_CREATE_CAPABILITY, SESSION_ATTACH_CAPABILITY } from "./contracts/session-project-create.js";
 import { readTokenUsage, tokenUsageCoverage } from "./node-token-usage.js";
 import { readBuildInfo } from "./build-info.js";
 import { requestProviderApplication } from "./daemon-provider-snapshots.js";
@@ -117,6 +137,7 @@ import { enforceImpactOf, normalizePeerAllowlist, normalizeToolAllowlist, restAl
 import { labelRoute, mcpRouteLabel, recordRouteTiming, routeStats, setRouteCallerMasterToken, setRouteCallerTokenReader } from "./route-timing.js";
 import { handleExternalScheduleEditRequest } from "./external-schedule-edits.js";
 import { createNodeSessionControlRelay } from "./node-session-control.js";
+import { createSessionSourceTransport } from "./session-source-transport.js";
 import { recordDeliveredStaleEvents } from "./task-lifecycle-watcher.js";
 import { SIDE_THREAD_FEATURE_FLAG, SideThreadCoordinator, SideThreadPortRegistry, SideThreadStore, type SideThreadActor, type SideThreadAttachmentRef, type SideThreadExecutionPort } from "./side-thread.js";
 import { handleSideThreadHttpRequest } from "./side-thread-http.js";
@@ -215,7 +236,13 @@ const SERVER_VERSION_SOURCE = RESOLVED_VERSION.source;
 // PUT /api/nodes/:id/permission-mode 与 GET /api/networks/:id/node-permission-report 可用(RFC-041 第一阶段)。
 // chat_groups(RFC-042,#457):部门群可用 —— …/departments/:dept/group、…/chat-groups(资料 / 成员 / 消息 / 已读)、
 // GET /api/dm/threads 的 group_threads;群对象带 viewer_can {manage, post},会话行带 last_message 预览,成员带 username / display_name。
-export const HUB_HEALTH_CAPABILITIES = ["status_node_id", "node_permission_mode", "chat_groups"] as const;
+// node_inbox_allowlist:收件白名单可用 —— PUT /api/nodes/:id/inbox-allowlist { senders },GET /api/nodes 每行带 inbox_allowlist,
+// 被挡的派活回 reason=sender_not_allowed,广播回 inbox_skipped(有人被跳过时才出现,没人被跳过时回执与以前逐字节相同)。
+// scheduled_task_purge:POST /api/scheduled-tasks/:id/purge 真删一条已停下(cancelled / completed)的计划,连执行记录一起删;
+// 还在跑的回 409 schedule_not_stopped(先 cancel)。
+// node_inbox_allowlist_dept:收件白名单认 dept:<department_id>(该部门及子部门里的节点和人)。
+// node_grants:节点管理授权 GET/PUT /api/nodes/:id/grants(能力 schedules × 范围 network/department/node × read/edit)。
+export const HUB_HEALTH_CAPABILITIES = ["status_node_id", "node_permission_mode", "chat_groups", "node_inbox_allowlist", "scheduled_task_purge", "node_inbox_allowlist_dept", "node_grants", "create_node_department"] as const;
 
 // In-memory log ring buffer — last N lines streamed via /api/server-logs.
 // Wraps console.log/info/warn/error so EVERY existing log call lands here
@@ -319,6 +346,28 @@ function requireAuth(req: Request, options: RequestTokenOptions = {}): Response 
 
   // #488 —— 令牌存在但因主人的成员身份被拒:说清楚为什么(reason + hint),节点日志里一眼看懂为什么掉线。
   return Response.json({ error: "unauthorized", ...(tokenRejection(token) ?? {}) }, { status: 401 });
+}
+
+/** COMMHUB_ALLOWED_PEER_IPS（逗号分隔）。回环地址（127.0.0.0/8、::1）永远放行；拿不到对端地址时放行（不误伤）。 */
+const ALLOWED_PEER_IPS: Set<string> | null = (() => {
+  const raw = process.env.COMMHUB_ALLOWED_PEER_IPS?.trim();
+  return raw ? new Set(raw.split(",").map(s => normalizePeerIp(s.trim())).filter(Boolean)) : null;
+})();
+export function peerAllowed(peer: string | null, allowed: Set<string> | null = ALLOWED_PEER_IPS): boolean {
+  if (!allowed) return true;
+  const ip = normalizePeerIp(peer);
+  if (!ip) return true;
+  if (ip === "::1" || ip.startsWith("127.")) return true;
+  return allowed.has(ip);
+}
+
+/**
+ * COMMHUB_REGISTRATION=closed —— 关掉公开注册（POST /api/auth/register 回 403 registration_closed）。
+ * 不设 / 其它值 = 开放（旧行为）。第一个用户（自动成为 admin）不受影响：库里还没有用户时照常放行。
+ */
+function registrationClosed(): boolean {
+  if ((process.env.COMMHUB_REGISTRATION ?? "").trim().toLowerCase() !== "closed") return false;
+  return !!db.get<{ ok: number }>("SELECT 1 AS ok FROM users LIMIT 1");
 }
 
 function getClientIP(req: Request, server?: any): string {
@@ -477,9 +526,34 @@ function restNodeDenied(req: Request, restAuth: { networkId: string | null; toke
   const verdict = verdictOf(id);
   return nodeDecide(id, route, verdict) ? withCors(req, Response.json(nodePermissionDeniedBody(verdict!.reason, route), { status: 403 })) : null;
 }
+/** 收件白名单的发件人：网络绑定令牌 = 节点；用户令牌 = 人；没有身份 = legacy。 */
+function restInboxSender(_req: Request, restAuth: { networkId: string | null; tokenId: string | null; userId?: string | null; username?: string | null } | null): InboxSender {
+  return inboxSenderFromAuth({
+    isNodeToken: !!restAuth?.networkId, tokenId: restAuth?.tokenId ?? null, boundNetworkId: restAuth?.networkId ?? null,
+    userId: restAuth?.userId ?? null, username: restAuth?.username ?? null,
+  });
+}
 /** 写别的节点 = 只有人能做;写自己 = 只看模式。 */
 const nodeTargetVerdict = (targetNodeId: string) => (id: NodeIdentity): Verdict =>
   id.nodeId && id.nodeId === targetNodeId ? writeVerdict(id, targetNodeId) : humanOnlyVerdict(id, targetNodeId);
+
+/**
+ * 单节点读写的部门范围拦截（#3665 第二步，HTTP 层强制，不止纯函数/列表过滤）。
+ * 只对「人类用户令牌 + 被明确授了部门范围管理」的调用者生效：
+ *   · 节点令牌（restAuth.networkId 有值）、owner/admin、没有任何 manage_nodes 授权的人 ⇒ 不额外拦，
+ *     原有的 canRestWriteNetwork / canRestWriteNodeSecurity 等判定已经够了；
+ *   · 部门范围管理者访问范围外（或无部门）的节点 ⇒ 403 out_of_scope（不是 404，不装作不存在）。
+ */
+function userDeptScopeDenied(req: Request, restAuth: { userId?: string | null; networkId: string | null } | null, node: { network_id?: string | null; department_id?: string | null }): Response | null {
+  if (!restAuth?.userId || restAuth.networkId) return null;
+  const netId = node.network_id;
+  if (!netId) return null;
+  const role = getUserNetworkRole(restAuth.userId, netId);
+  if (role === "owner" || role === "admin") return null;
+  const scope = userManageScope(netId, restAuth.userId);
+  if (canUserManageNode(scope, node.department_id ?? null)) return null;
+  return withCors(req, Response.json({ ok: false, error: "out_of_scope", message: "this node is outside the departments you manage" }, { status: 403 }));
+}
 
 function userTokenRequired(req: Request): Response {
   return withCors(req, Response.json({ ok: false, error: "user_token_required", message: "this endpoint acts on a user account; node tokens cannot use it" }, { status: 403 }));
@@ -2031,7 +2105,10 @@ function patrolDeliveredStaleTasks(): void {
 // Note: `opts.port ?? PORT` uses nullish-coalescing on purpose — `||`
 // would swallow a legitimate `0`. Same for hostname.
 export function bootServer(opts?: { port?: number; hostname?: string }): ReturnType<typeof Bun.serve> {
+ensureSessionRequestsTable(db);   // #4821 只读 session 请求通道（daemon 拉、Hub 存结果）
 const nodeSessionControl = createNodeSessionControlRelay();
+const sessionSourceTransport = createSessionSourceTransport({ enabled: process.env.COMMHUB_SOURCE_FORK_PREVIEW === "1",
+  directoryEnabled: process.env.COMMHUB_SOURCE_DIRECTORY_PREVIEW === "1", projectEnabled: process.env.COMMHUB_PROJECT_NEW_SESSION_PREVIEW === "1" });
 return Bun.serve({
   port: opts?.port ?? PORT,
   hostname: opts?.hostname ?? HOST,
@@ -2048,6 +2125,12 @@ return Bun.serve({
   error: (err) => buildServeErrorResponse(err),
 
   async fetch(req, server) {
+    // 2026-11-11 安全排查 —— COMMHUB_ALLOWED_PEER_IPS：Hub 端口只接这些对端（外加本机回环）。
+    // 生产 :9200 直接暴露在公网，但真正的来路只有本机（frp、本机节点）和 https 反代那台机器；
+    // 没有云安全组权限时，在 Hub 里把其它来源挡在门外。不设 = 不限制（旧行为）。
+    if (!peerAllowed(server?.requestIP?.(req)?.address ?? null)) {
+      return new Response(JSON.stringify({ ok: false, error: "peer_not_allowed" }), { status: 403, headers: { "Content-Type": "application/json", Connection: "close" } });
+    }
     // 2026-09-16 —— 所有 JSON/文本响应在客户端要求时 gzip(见 http-gzip.ts);SSE/流式/二进制原样。
     // 2026-09-30 —— 每个请求的路由形状 + 耗时进内存环(route-timing.ts),GET /api/stats/routes 看谁在吃 CPU。
     return recordRouteTiming(req, performance.now(), await maybeGzipResponse(req, explainExpiredSession(req, await (async (): Promise<Response | undefined> => {
@@ -2379,7 +2462,9 @@ return Bun.serve({
     // 现已移除；命中时按未知路径处理（404），不再保留兼容壳。
     // ── V3: Auth endpoints (public) ──
     if (url.pathname === "/api/auth/register" && req.method === "POST") {
-      const clientIP = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+      // 与登录同一口径（最后一跳 + COMMHUB_TRUSTED_PROXY_IPS）：原来取第一跳，客户端随便写就能换桶。
+      const clientIP = getLoginClientIp(req, server?.requestIP?.(req)?.address ?? null);
+      if (registrationClosed()) return withCors(req, Response.json({ ok: false, error: "registration_closed", message: "This Hub does not accept new sign-ups. Ask an admin for an invite." }, { status: 403 }));
       if (!checkRateLimit(clientIP, 30)) {
         noteRegisterRateLimited(clientIP);
         return withCors(req, Response.json({ ok: false, error: "too many requests, try again later" }, { status: 429 }));
@@ -2395,7 +2480,7 @@ return Bun.serve({
     }
 
     if (url.pathname === "/api/auth/login" && req.method === "POST") {
-      const clientIP = getLoginClientIp(req);
+      const clientIP = getLoginClientIp(req, server?.requestIP?.(req)?.address ?? null);
       const ipRate = sharedLoginIpRateLimiter.check(clientIP || "unknown");
       if (!ipRate.allowed) {
         logAudit(null, null, "login_rate_limited", "auth", undefined, clientIP);
@@ -3870,7 +3955,8 @@ return Bun.serve({
           since: startedAtIso,
           task_rejections: taskRejectionCounters(),
           // #3271 —— 「到死都没被取走」按节点分桶。窗口用同一个 since。
-          task_expiries_never_consumed: neverConsumedExpiryCounters(),
+          // recent_at 只给闸用（逐条时刻，按节点最多 16 条），不进这个读数，免得读数随节点数膨胀。
+          task_expiries_never_consumed: (({ recent_at: _recent, ...rest }) => rest)(neverConsumedExpiryCounters()),
           // #3314 B 类 —— 故意匿名的那两条路由（register / login）没有身份门，
           // 它们的健康度只能从「限流与锁定命中了几次、打到了几个不同来源」读出来。
           // 比值才是有意义的部分：命中数 ≫ 去重数 ⇒ 单点重试；两者接近 ⇒ 换 IP / 撒网。
@@ -4051,6 +4137,8 @@ return Bun.serve({
     });
     if (externalScheduleEditResponse) return withCors(req, externalScheduleEditResponse);
 
+    const sourceResponse = await sessionSourceTransport(req, url);
+    if (sourceResponse) return withCors(req, sourceResponse);
     const sessionControlResponse = await nodeSessionControl(req, url);
     if (sessionControlResponse) return withCors(req, sessionControlResponse);
 
@@ -4077,7 +4165,8 @@ return Bun.serve({
     const permModeMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/permission-mode$/);
     if (permModeMatch && req.method === "PUT") {
       if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
-      if (restAuth.networkId) return userTokenRequired(req);
+      const delegated = !!restAuth.networkId;
+      const permissionCaller = delegated ? nodeIdentity(restAuth.tokenId, restAuth.networkId) : null;
       let body: any;
       try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid_json" }, { status: 400 })); }
       const mode = body?.mode;
@@ -4089,14 +4178,18 @@ return Bun.serve({
         "SELECT node_id, network_id, owner_user_id, permission_mode FROM nodes WHERE node_id = ?1", nodeRef);
       const role = node?.network_id ? getUserNetworkRole(restAuth.userId, node.network_id) : null;
       // 看不见这个节点(不在它的网络里)与不存在同一个 404。
-      if (!node || !node.network_id || (!role && !isAdmin)) return withCors(req, Response.json({ ok: false, error: "node_not_found" }, { status: 404 }));
+      if (!node || !node.network_id || (delegated ? node.network_id !== restAuth.networkId : (!role && !isAdmin))) return withCors(req, Response.json({ ok: false, error: "node_not_found" }, { status: 404 }));
       // 节点主人、网络 owner / admin、Hub 管理员能改;部门负责人和别的成员不能(RFC-041 §2.3 / §2.4)。
-      if (!canRestWriteNodeSecurity(restAuth, node.owner_user_id, role, isAdmin)) {
+      if (delegated) {
+        const reason = permissionManagementDenial(permissionCaller, node.network_id, node.node_id)
+          ?? (!isPermissionModeTightening(node.permission_mode || "normal", mode) ? "not_tightening" : null);
+        if (reason) return withCors(req, Response.json({ ok: false, error: "node_permission_denied", reason }, { status: 403 }));
+      } else if (!canRestWriteNodeSecurity(restAuth, node.owner_user_id, role, isAdmin)) {
         return withCors(req, Response.json({ ok: false, error: "permission_denied", message: "only the node's owner or a network owner/admin can change its permission mode" }, { status: 403 }));
       }
       const previous = (node.permission_mode || "normal") as NodePermissionMode;
       db.run("UPDATE nodes SET permission_mode = ?1 WHERE node_id = ?2", [mode, node.node_id]);
-      logAudit(restAuth.userId, restAuth.username, "node_permission_mode_changed", "node", node.node_id, JSON.stringify({ from: previous, to: mode }), getClientIP(req), node.network_id);
+      logAudit(restAuth.userId, restAuth.username, "node_permission_mode_changed", "node", node.node_id, JSON.stringify({ from: previous, to: mode, ...permissionManagementAudit(permissionCaller) }), getClientIP(req), node.network_id);
       return withCors(req, Response.json({ ok: true, node_id: node.node_id, permission_mode: mode, previous }));
     }
     // 2026-10-31 —— **读侧：这个节点当前用的是哪个 provider / 模型**（#3145 的数据面）。
@@ -4123,7 +4216,7 @@ return Bun.serve({
       const row = db.get<{ request_id: string; status: string; observed_at: number | null; snapshot_json: string | null; error: string | null }>(
         `SELECT request_id, status, observed_at, snapshot_json, error FROM daemon_provider_snapshots
           WHERE network_id = ?1 AND daemon_node_id = ?2 AND request_id LIKE 'dpa\_%' ESCAPE '\\'
-          ORDER BY created_at DESC LIMIT 1`,
+          ORDER BY created_at DESC, rowid DESC LIMIT 1`,
         node.network_id, node.node_id);
       // 三态而不是「有/没有」：从未切换过 / 正在切 / 切失败，界面要给的下一步完全不同。
       //
@@ -4195,7 +4288,7 @@ return Bun.serve({
       const beforeRow = db.get<{ snapshot_json: string | null }>(
         `SELECT snapshot_json FROM daemon_provider_snapshots
           WHERE network_id = ?1 AND daemon_node_id = ?2 AND request_id LIKE 'dpa\_%' ESCAPE '\\'
-          ORDER BY created_at DESC LIMIT 1`, node.network_id, node.node_id);
+          ORDER BY created_at DESC, rowid DESC LIMIT 1`, node.network_id, node.node_id);
       let before: unknown = null;
       if (beforeRow?.snapshot_json) { try { before = JSON.parse(beforeRow.snapshot_json); } catch { before = null; } }
 
@@ -4346,6 +4439,144 @@ return Bun.serve({
       db.run("UPDATE nodes SET peer_allowlist = ?1 WHERE node_id = ?2", [nextValue, node2.node_id]);
       logAudit(restAuth.userId, restAuth.username, "node_peer_allowlist_changed", "node", node2.node_id, JSON.stringify({ from: node2.peer_allowlist, to: nextValue }), getClientIP(req), node2.network_id);
       return withCors(req, Response.json({ ok: true, node_id: node2.node_id, peers: peers.length ? peers : null }));
+    }
+    // 节点管理授权（node-grants.ts）：GET / PUT /api/nodes/:id/grants { grants: [{capability, scope_kind, scope_id, level}] }
+    // 读：本网络成员。写：网络 owner / admin、Hub 管理员可授任意范围；部门负责人只能授自己负责子树里的
+    // department / node 范围。**节点主人不行**（否则任何成员都能给自己的节点授全网的权）。PUT 是整份替换，[] 清空。
+    const nodeGrantsMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/grants$/);
+    if (nodeGrantsMatch && (req.method === "GET" || req.method === "PUT")) {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      if (restAuth.networkId) return userTokenRequired(req);
+      const ref = decodeURIComponent(nodeGrantsMatch[1]);
+      const gnode = db.get<{ node_id: string; network_id: string | null }>("SELECT node_id, network_id FROM nodes WHERE node_id = ?1", ref);
+      const grole = gnode?.network_id ? getUserNetworkRole(restAuth.userId, gnode.network_id) : null;
+      if (!gnode || !gnode.network_id || (!grole && !isAdmin)) return withCors(req, Response.json({ ok: false, error: "node_not_found" }, { status: 404 }));
+      if (req.method === "GET") {
+        return withCors(req, Response.json({ ok: true, node_id: gnode.node_id, grants: listNodeGrants(gnode.network_id, gnode.node_id), capabilities: GRANT_CAPABILITIES }));
+      }
+      let body: any;
+      try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid_json" }, { status: 400 })); }
+      const parsed = parseNodeGrants(gnode.network_id, body?.grants);
+      if (!parsed.ok) return withCors(req, Response.json(parsed, { status: parsed.error.endsWith("_not_found") ? 404 : 400 }));
+      const fullAdmin = isAdmin || grole === "owner" || grole === "admin";
+      if (!fullAdmin) {
+        const managed = new Set(managedDepartmentIds(gnode.network_id, restAuth.userId).flatMap(d => [...departmentSubtree(gnode.network_id!, d)]));
+        const before = listNodeGrants(gnode.network_id, gnode.node_id);
+        // 负责人改的是整份名单：名单里不在他管辖内的旧授权必须原样保留，新增 / 删除的都得在他的子树里。
+        const outside = (g: { scope_kind: string; scope_id: string }) => !grantsWithinManaged(gnode.network_id!, [g as any], managed);
+        const keptOutside = before.filter(outside).every(b => parsed.grants.some(g => g.capability === b.capability && g.scope_kind === b.scope_kind && g.scope_id === b.scope_id && g.level === b.level));
+        const addedOutside = parsed.grants.filter(outside).some(g => !before.some(b => b.capability === g.capability && b.scope_kind === g.scope_kind && b.scope_id === g.scope_id && b.level === g.level));
+        if (!managed.size || !keptOutside || addedOutside) {
+          return withCors(req, Response.json({ ok: false, error: "permission_denied", message: "only network owners/admins can grant network-wide access; department heads can grant within the departments they lead" }, { status: 403 }));
+        }
+      }
+      const before = listNodeGrants(gnode.network_id, gnode.node_id);
+      replaceNodeGrants(gnode.network_id, gnode.node_id, parsed.grants, restAuth.userId);
+      logAudit(restAuth.userId, restAuth.username, "node_grants_changed", "node", gnode.node_id,
+        JSON.stringify({ from: before.map(({ capability, scope_kind, scope_id, level }) => ({ capability, scope_kind, scope_id, level })), to: parsed.grants }), getClientIP(req), gnode.network_id);
+      return withCors(req, Response.json({ ok: true, node_id: gnode.node_id, grants: listNodeGrants(gnode.network_id, gnode.node_id) }));
+    }
+    // 人的范围管理授权（#3665，admin 2026-11-21）：GET / PUT /api/users/:user_id/grants
+    //   body { grants: [{capability:'manage_nodes', scope_kind:'network'|'department', scope_id, level:'read'|'edit'}] } —— 整份替换
+    // 谁能授：network owner/admin 任意范围；部门负责人只能授自己子树内的 department，不能授 network（接口层强制）。
+    const userGrantsMatch = url.pathname.match(/^\/api\/users\/([^/]+)\/grants$/);
+    if (userGrantsMatch && (req.method === "GET" || req.method === "PUT")) {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      if (restAuth.networkId) return userTokenRequired(req);
+      const netId = singleNetworkId(restScope);
+      if (!netId) return withCors(req, Response.json({ ok: false, error: "network_id_required" }, { status: 400 }));
+      const targetUserId = decodeURIComponent(userGrantsMatch[1]);
+      if (!getUserNetworkRole(targetUserId, netId) && !isAdmin) {
+        return withCors(req, Response.json({ ok: false, error: "user_not_found" }, { status: 404 }));
+      }
+      if (req.method === "GET") {
+        return withCors(req, Response.json({
+          ok: true, user_id: targetUserId, grants: listUserGrants(netId, targetUserId),
+          capabilities: USER_GRANT_CAPABILITIES, scopes: USER_GRANT_SCOPES, levels: USER_GRANT_LEVELS,
+        }));
+      }
+      const actorRole = getUserNetworkRole(restAuth.userId, netId);
+      const actorManaged = new Set(managedDepartmentIds(netId, restAuth.userId).flatMap(d => [...departmentSubtree(netId, d)]));
+      let body: any;
+      try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid_json" }, { status: 400 })); }
+      const raw = Array.isArray(body?.grants) ? body.grants : null;
+      if (!raw) return withCors(req, Response.json({ ok: false, error: "invalid_grants" }, { status: 400 }));
+      const next: Array<{ capability: string; scope_kind: string; scope_id: string; level: string }> = [];
+      for (const g of raw) {
+        const capability = String(g?.capability ?? "");
+        const scopeKind = String(g?.scope_kind ?? "");
+        const scopeId = String(g?.scope_id ?? "").trim();
+        const level = String(g?.level ?? "");
+        if (!(USER_GRANT_CAPABILITIES as readonly string[]).includes(capability)) return withCors(req, Response.json({ ok: false, error: "invalid_capability" }, { status: 400 }));
+        if (!(USER_GRANT_SCOPES as readonly string[]).includes(scopeKind)) return withCors(req, Response.json({ ok: false, error: "invalid_scope" }, { status: 400 }));
+        if (!(USER_GRANT_LEVELS as readonly string[]).includes(level)) return withCors(req, Response.json({ ok: false, error: "invalid_level" }, { status: 400 }));
+        if (scopeKind === "department") {
+          if (!scopeId) return withCors(req, Response.json({ ok: false, error: "scope_id_required" }, { status: 400 }));
+          if (!db.get("SELECT 1 AS x FROM network_departments WHERE network_id = ?1 AND department_id = ?2", [netId, scopeId])) {
+            return withCors(req, Response.json({ ok: false, error: "department_not_found" }, { status: 404 }));
+          }
+        }
+        const verdict = canGrantUserScope({ actorRole, actorManagedDeptIds: actorManaged, scopeKind, scopeId });
+        if (!verdict.ok && !isAdmin) {
+          return withCors(req, Response.json({ ok: false, error: "permission_denied", message: "only network owners/admins can grant network-wide access; department heads can grant within the departments they lead" }, { status: 403 }));
+        }
+        next.push({ capability, scope_kind: scopeKind, scope_id: scopeKind === "network" ? "" : scopeId, level });
+      }
+      const before = listUserGrants(netId, targetUserId);
+      db.transaction(() => {
+        db.run("DELETE FROM user_grants WHERE network_id = ?1 AND user_id = ?2", [netId, targetUserId]);
+        for (const g of next) {
+          setUserGrant({ networkId: netId, userId: targetUserId, capability: g.capability, scopeKind: g.scope_kind, scopeId: g.scope_id, level: g.level, grantedBy: restAuth.userId ?? null });
+        }
+      });
+      logAudit(restAuth.userId, restAuth.username, "user_grants_changed", "user", targetUserId,
+        JSON.stringify({ before, after: next }), getClientIP(req), netId);
+      return withCors(req, Response.json({ ok: true, user_id: targetUserId, grants: listUserGrants(netId, targetUserId) }));
+    }
+
+    // 收件白名单：PUT /api/nodes/:id/inbox-allowlist { senders: string[] | null }
+    // 与 peer-allowlist 同一套授权、审计与空数组语义（拒收 []，清空请传 null）。
+    // 条目语法与发件人匹配规则见 node-permissions.ts「收件白名单」。
+    const inboxAllowMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/inbox-allowlist$/);
+    if (inboxAllowMatch && req.method === "PUT") {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      const delegated = !!restAuth.networkId;
+      const permissionCaller = delegated ? nodeIdentity(restAuth.tokenId, restAuth.networkId) : null;
+      let body: any;
+      try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid_json" }, { status: 400 })); }
+      const rawSenders = body?.senders;
+      if (rawSenders !== null && rawSenders !== undefined && !Array.isArray(rawSenders)) {
+        return withCors(req, Response.json({ ok: false, error: "invalid_senders", message: "senders must be an array of alias / node_id / user:<username> strings, or null" }, { status: 400 }));
+      }
+      const senders = Array.isArray(rawSenders)
+        ? rawSenders.filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0).map((x: string) => x.trim())
+        : [];
+      if (Array.isArray(rawSenders) && senders.length === 0) {
+        return withCors(req, Response.json({
+          ok: false,
+          error: "empty_allowlist_ambiguous",
+          message: "send null to clear the allowlist (no restriction); an empty array is ambiguous and is rejected",
+        }, { status: 400 }));
+      }
+      if (senders.length > 200) {
+        return withCors(req, Response.json({ ok: false, error: "too_many_senders", message: "at most 200 entries" }, { status: 400 }));
+      }
+      const nodeRef5 = decodeURIComponent(inboxAllowMatch[1]);
+      const node5 = db.get<{ node_id: string; network_id: string | null; owner_user_id: string | null; inbox_allowlist: string | null }>(
+        "SELECT node_id, network_id, owner_user_id, inbox_allowlist FROM nodes WHERE node_id = ?1", nodeRef5);
+      const role5 = node5?.network_id ? getUserNetworkRole(restAuth.userId, node5.network_id) : null;
+      if (!node5 || !node5.network_id || (delegated ? node5.network_id !== restAuth.networkId : (!role5 && !isAdmin))) return withCors(req, Response.json({ ok: false, error: "node_not_found" }, { status: 404 }));
+      if (delegated) {
+        const reason = permissionManagementDenial(permissionCaller, node5.network_id, node5.node_id)
+          ?? (!isInboxTightening(normalizePeerAllowlist(node5.inbox_allowlist), senders.length ? senders : null) ? "not_tightening" : null);
+        if (reason) return withCors(req, Response.json({ ok: false, error: "node_permission_denied", reason }, { status: 403 }));
+      } else if (!canRestWriteNodeSecurity(restAuth, node5.owner_user_id, role5, isAdmin)) {
+        return withCors(req, Response.json({ ok: false, error: "permission_denied", message: "only the node's owner or a network owner/admin can change its inbox allowlist" }, { status: 403 }));
+      }
+      const nextSenders = senders.length ? JSON.stringify(senders) : null;
+      db.run("UPDATE nodes SET inbox_allowlist = ?1 WHERE node_id = ?2", [nextSenders, node5.node_id]);
+      logAudit(restAuth.userId, restAuth.username, "node_inbox_allowlist_changed", "node", node5.node_id, JSON.stringify({ from: node5.inbox_allowlist, to: nextSenders, ...permissionManagementAudit(permissionCaller) }), getClientIP(req), node5.network_id);
+      return withCors(req, Response.json({ ok: true, node_id: node5.node_id, senders: senders.length ? senders : null }));
     }
     const permReportMatch = url.pathname.match(/^\/api\/networks\/([^/]+)\/node-permission-report$/);
     if (permReportMatch && req.method === "GET") {
@@ -4704,6 +4935,10 @@ return Bun.serve({
         { userId: restAuth!.userId ?? null, isNode: false, networkId },
         nodeId, action, body?.key, body?.value, body?.revision,
       );
+      // #4827 —— 用户提交后清掉对应的「举手」；delete 同理。
+      if (result.ok && (action === "put" || action === "delete") && typeof body?.key === "string") {
+        clearSecretRequest(nodeId, body.key);
+      }
       if (!result.ok) {
         const status = result.error === "secret_admin_required" ? 403
           : result.error === "node_secrets_upgrade_required" ? 409
@@ -4711,8 +4946,23 @@ return Bun.serve({
           : 400;
         return withCors(req, Response.json(result, { status }));
       }
+      // #4827 —— App 读快照走的是 POST {action:"list"}，pending 挂这里才是它真正能看到的地方。
+      if (action === "list") {
+        const pending = pendingSecretRequests(decodeURIComponent(nodeSecretReq[1]));
+        if (pending) return withCors(req, Response.json({ ...result, pending }));
+      }
       return withCors(req, Response.json(result));
     }
+    // #4827 —— 列表端点：agent 举手的待填密钥（App 卡片的数据源）。无待填时字段缺省，不是空数组。
+    if (nodeSecretReq && req.method === "GET") {
+      if (restAuth!.networkId) return userTokenRequired(req);
+      const listNet = singleNetworkId(restScope);
+      if (!listNet) return withCors(req, Response.json({ ok: false, error: "network_id_required" }, { status: 400 }));
+      const listNodeId = decodeURIComponent(nodeSecretReq[1]);
+      const pending = pendingSecretRequests(listNodeId);
+      return withCors(req, Response.json({ ok: true, node_id: listNodeId, ...(pending ? { pending } : {}) }));
+    }
+
     if (nodeSecretGet && req.method === "GET") {
       if (restAuth!.networkId) return userTokenRequired(req);
       const networkId = singleNetworkId(restScope);
@@ -4725,6 +4975,7 @@ return Bun.serve({
         const status = result.error === "secret_admin_required" ? 403 : 404;
         return withCors(req, Response.json(result, { status }));
       }
+      // 轮询端点（/secrets/:request_id）保持原样：它返回的是某次请求的回执，不挂 pending。
       return withCors(req, Response.json(result));
     }
 
@@ -4899,6 +5150,26 @@ return Bun.serve({
           return new Map<string, number>();
         }
       })();
+      // The node 密钥 page gates on node_secrets_capable, which nodes report in
+      // nodes.config_snapshot (not a sessions column). Without projecting it here the
+      // app never saw it and fell back to the runtime version — null for claude-code
+      // nodes — so a capable node (e.g. claude-code-cli on agent-network ≥ .219) was
+      // shown "upgrade required". Only emitted when true: other rows keep their bytes.
+      const nodeSecretsCapable = (() => {
+        const ids = isLight ? [] : [...new Set(rows.map((r: any) => r.node_id).filter((v: unknown): v is string => typeof v === "string" && v.length > 0))];
+        const out = new Set<string>();
+        for (let i = 0; i < ids.length; i += 500) {
+          const chunk = ids.slice(i, i + 500);
+          try {
+            const found = db.all<{ node_id: string; config_snapshot: string | null }>(
+              `SELECT node_id, config_snapshot FROM nodes WHERE node_id IN (${chunk.map((_, j) => `?${j + 1}`).join(",")})`, ...chunk);
+            for (const r of found) {
+              try { if (JSON.parse(r.config_snapshot || "{}")?.node_secrets_capable === true) out.add(r.node_id); } catch { /* malformed snapshot: not capable */ }
+            }
+          } catch { /* projection is best-effort; never fail /api/status */ }
+        }
+        return out;
+      })();
       // `model` comes straight from the explicit sessions projection; `runtime` is
       // derived from the raw `agent` field. Both default to null for old nodes
       // that never reported a model — the dashboard falls back to a placeholder.
@@ -4955,6 +5226,7 @@ return Bun.serve({
           skills_capable: s.skills_capable === 1,
           files_capable: s.files_capable === 1,
           logs_capable: s.logs_capable === 1,
+          ...(s.node_id && nodeSecretsCapable.has(s.node_id) ? { node_secrets_capable: true } : {}),
           model: s.model ?? null,
           runtime: normalizeRuntime(s.agent),
           host: {
@@ -5740,6 +6012,8 @@ return Bun.serve({
           ...(canonical.renamed ? { renamed_from: body.alias, renamed_to: targetAlias } : {}),
         }, { status: 404 })));
       }
+      const inboxRefused = inboxDenied(taskNetId ?? null, { alias: targetAlias, nodeId: target.session?.node_id ?? null }, restInboxSender(req, restAuth), "POST /api/task");
+      if (inboxRefused) return reject(withCors(req, Response.json(inboxRefused, { status: 403 })));
       // Identity binding, mirroring the MCP transport (tools.ts defaultFrom /
       // fromIdentityMismatchReply). Both transports resolve the same
       // api_tokens row through resolveToken, and auth.ts already documents the
@@ -5999,14 +6273,15 @@ return Bun.serve({
       sql = addNetworkScope(sql, params, restScope);
       if (body.filter_server) { sql += " AND server = ?"; params.push(body.filter_server); }
       if (body.filter_status) { sql += " AND status = ?"; params.push(body.filter_status); }
-      const targets = db.all<{ alias: string; node_id: string | null; network_id: string | null }>(sql, ...params);
+      const allTargets = db.all<{ alias: string; node_id: string | null; network_id: string | null }>(sql, ...params);
+      const { allowed: targets, skipped: inboxSkipped } = filterBroadcastByInbox(allTargets, restScope.networkId ?? null, restInboxSender(req, restAuth), "POST /api/broadcast");
       // #2721 —— 与 MCP broadcast 同一条分批路径（reason 见 broadcast-fanout.ts 顶部）。
       const { ids } = await enqueueBroadcast(targets, body.message, "api", null, {
         // RFC-027 §2.3 inbox-enqueue lifecycle guard (PR1.2a REST site 2/2).
         isActive: (alias, netId) => assertNodeActive(alias, netId).ok,
         notify: (alias, netId) => pushEvent(alias, { type: "broadcast", inbox_count: pendingInboxCount(alias, netId) }, netId),
       });
-      return withCors(req, Response.json({ ok: true, recipients: ids.length, message_ids: ids }));
+      return withCors(req, Response.json({ ok: true, recipients: ids.length, message_ids: ids, ...(inboxSkipped.length ? { inbox_skipped: inboxSkipped } : {}) }));
     }
 
     // ── REST: tmux capture-pane ──
@@ -6344,7 +6619,7 @@ return Bun.serve({
     if (nodeDeleteMatch && req.method === "DELETE") {
       const ref = decodeURIComponent(nodeDeleteMatch[1]);
       const params: any[] = [ref, ref, ref];
-      let sql = "SELECT node_id, node_name, alias, network_id FROM nodes WHERE (node_id = ?1 OR node_name = ?2 OR alias = ?3)";
+      let sql = "SELECT node_id, node_name, alias, network_id, department_id FROM nodes WHERE (node_id = ?1 OR node_name = ?2 OR alias = ?3)";
       sql = addNetworkScope(sql, params, restScope);
       sql += " ORDER BY updated_at DESC LIMIT 1";
       const node = db.get<any>(sql, ...params);
@@ -6354,6 +6629,8 @@ return Bun.serve({
       if (!canRestWriteNetwork(restAuth, nodeNetId, isAdmin)) {
         return withCors(req, Response.json({ ok: false, error: "permission_denied" }, { status: 403 }));
       }
+      const deptScopeDenied = userDeptScopeDenied(req, restAuth, node);
+      if (deptScopeDenied) return deptScopeDenied;
       const nodeWriteDenied = restNodeDenied(req, restAuth, "DELETE /api/nodes/:id", nodeTargetVerdict(node.node_id));
       if (nodeWriteDenied) return nodeWriteDenied;
 
@@ -6449,13 +6726,16 @@ return Bun.serve({
     if (nodeConfigMatch && req.method === "GET") {
       const nodeId = decodeURIComponent(nodeConfigMatch[1] ?? "");
       const params: any[] = [nodeId];
-      let sql = "SELECT node_id, alias, network_id, config_revision, config_snapshot FROM nodes WHERE node_id = ?1";
+      let sql = "SELECT node_id, alias, network_id, department_id, config_revision, config_snapshot FROM nodes WHERE node_id = ?1";
       sql = addNetworkScope(sql, params, restScope);
       sql += " LIMIT 1";
       const node = db.get<any>(sql, ...params);
       if (!node) {
         return withCors(req, Response.json({ ok: false, error: "node_not_found", node_id: nodeId }, { status: 404 }));
       }
+      // #3665 —— 部门范围管理者读单个节点的配置详情，也要落在管理范围内（不止列表收窄）。
+      const readDeptDenied = userDeptScopeDenied(req, restAuth, node);
+      if (readDeptDenied) return readDeptDenied;
       let snapshot: any = {};
       if (node.config_snapshot) {
         try { snapshot = JSON.parse(node.config_snapshot); } catch { snapshot = {}; }
@@ -6467,6 +6747,9 @@ return Bun.serve({
       const lastUpdate = readLastConfigUpdate(
         (sql: string, ...params: any[]) => (db.get as any)(sql, ...params),
         node.node_id,
+        // #4499 —— 排队后被应用的那种下发：ack 当时是 rejected/variant_busy，
+        // 节点随后把档位改过去了。用「当前回读的档位」判断它到底生效了没有。
+        { currentVariant: typeof snapshot.modelVariant === "string" ? snapshot.modelVariant : null },
       );
       return withCors(req, Response.json({
         ok: true,
@@ -6475,6 +6758,14 @@ return Bun.serve({
         network_id: node.network_id,
         config_revision: node.config_revision || 0,
         model: snapshot.model ?? null,
+        ...(typeof snapshot.model_effective === "string" ? { model_effective: snapshot.model_effective } : {}),
+        ...(Object.prototype.hasOwnProperty.call(snapshot, "modelVariant") ? { modelVariant: snapshot.modelVariant } : {}),
+        // Agent (Build): the live session's agent, plus whether this node can
+        // switch it at all. Absent key = node never reported (not "build").
+        opencode_agent_config_capable: snapshot.opencode_agent_config_capable === true,
+        ...(typeof snapshot.opencode_agent_current === "string" ? { agent: snapshot.opencode_agent_current } : {}),
+        ...(Array.isArray(snapshot.opencode_agents) ? { agents: snapshot.opencode_agents } : {}),
+        opencode_variant_config_capable: snapshot.opencode_variant_config_capable === true,
         flags: snapshot.flags ?? {},
         config_update_capable: snapshot.config_update_capable ?? false,
         // null = 这个节点从来没有被下发过配置（与「下发过但还没终局」是两件事）
@@ -6519,7 +6810,7 @@ return Bun.serve({
       }
       const ref = decodeURIComponent(nodeAttrsMatch[1]);
       const params: any[] = [ref, ref, ref];
-      let sql = "SELECT node_id, alias, network_id, display_name, team, tags, attrs_revision FROM nodes WHERE (node_id = ?1 OR node_name = ?2 OR alias = ?3)";
+      let sql = "SELECT node_id, alias, network_id, department_id, display_name, team, tags, description, attrs_revision FROM nodes WHERE (node_id = ?1 OR node_name = ?2 OR alias = ?3)";
       sql = addNetworkScope(sql, params, restScope);
       sql += " ORDER BY updated_at DESC LIMIT 1";
       const node = db.get<any>(sql, ...params);
@@ -6529,6 +6820,8 @@ return Bun.serve({
       if (!canRestWriteNetwork(restAuth, nodeNetId, isAdmin)) {
         return withCors(req, Response.json({ ok: false, error: "permission_denied" }, { status: 403 }));
       }
+      const attrsDeptDenied = userDeptScopeDenied(req, restAuth, node);
+      if (attrsDeptDenied) return attrsDeptDenied;
       const nodeWriteDenied = restNodeDenied(req, restAuth, "PUT /api/nodes/:id/attrs", nodeTargetVerdict(node.node_id));
       if (nodeWriteDenied) return nodeWriteDenied;
 
@@ -6562,6 +6855,20 @@ return Bun.serve({
         return withCors(req, Response.json({ ok: false, error: "invalid_team", reason: nextTeam.reason }, { status: 400 }));
       }
       const nextTags = "tags" in attrsBody ? narrowTags(attrsBody.tags) : null;
+      // 职责介绍(多行,≤ 1000 字);类型错 → 400,和 display_name 同一姿态。
+      const nextDescription = "description" in attrsBody ? validateDescription(attrsBody.description) : null;
+      if (nextDescription && !nextDescription.ok) {
+        return withCors(req, Response.json({ ok: false, error: "invalid_description", reason: nextDescription.reason }, { status: 400 }));
+      }
+      // 职责介绍是节点对外的「名片」:节点令牌只许写**自己的**,不看 node-permissions 开关(那个开关在 off / log 时会放行
+      // 「写别的节点」—— 对展示名还算无害,对名片就是冒名)。人(用户令牌)照旧按网络写权限。
+      if (nextDescription && restAuth?.networkId) {
+        const caller = nodeIdentity(restAuth.tokenId, restAuth.networkId);
+        const self = !!caller && ((!!caller.nodeId && caller.nodeId === node.node_id) || (!!node.alias && caller.aliases.includes(node.alias)));
+        if (!self) {
+          return withCors(req, Response.json({ ok: false, error: "description_self_only", message: "a node may only edit its own description; ask a person to edit another node's" }, { status: 403 }));
+        }
+      }
 
       // Only the supplied fields move; the rest keep their stored value.
       const sets: string[] = [];
@@ -6569,6 +6876,7 @@ return Bun.serve({
       if (nextDisplay) { sets.push(`display_name = ?${vals.length + 1}`); vals.push(nextDisplay.value); }
       if (nextTeam) { sets.push(`team = ?${vals.length + 1}`); vals.push(nextTeam.value); }
       if (nextTags) { sets.push(`tags = ?${vals.length + 1}`); vals.push(JSON.stringify(nextTags)); }
+      if (nextDescription) { sets.push(`description = ?${vals.length + 1}`); vals.push(nextDescription.value); }
       // A no-op patch still bumps the revision: the caller observed a state
       // and asserted it, so honouring the CAS keeps client counters in step.
       sets.push(`attrs_revision = ?${vals.length + 1}`); vals.push(currentRev + 1);
@@ -6591,10 +6899,10 @@ return Bun.serve({
         }, { status: 409 }));
       }
       logAudit(restAuth?.userId ?? null, restAuth?.username ?? null, "node_attrs_updated", "node", node.node_id,
-        JSON.stringify({ display_name: nextDisplay?.value ?? undefined, team: nextTeam?.value ?? undefined, tags: nextTags ?? undefined }),
+        JSON.stringify({ display_name: nextDisplay?.value ?? undefined, team: nextTeam?.value ?? undefined, tags: nextTags ?? undefined, description_changed: nextDescription ? true : undefined }),
         undefined, nodeNetId ?? undefined);
       const after = db.get<any>(
-        "SELECT display_name, team, tags, attrs_revision FROM nodes WHERE node_id = ?1", node.node_id);
+        "SELECT display_name, team, tags, description, attrs_revision FROM nodes WHERE node_id = ?1", node.node_id);
       return withCors(req, Response.json({
         ok: true,
         node_id: node.node_id,
@@ -6602,6 +6910,7 @@ return Bun.serve({
         display_name: after?.display_name ?? null,
         team: after?.team ?? null,
         tags: parseStoredTags(after?.tags),
+        description: after?.description ?? null,
         attrs_revision: Number(after?.attrs_revision ?? currentRev + 1),
       }));
     }
@@ -6768,6 +7077,8 @@ return Bun.serve({
           //    而这一格存在的全部意义就是让人分辨新鲜和陈旧。
           let snapObservedMsAgo: number | undefined;
           let snapReadiness: ReturnType<typeof sanitizeRuntimeReadiness>;
+          // #4495 —— 源能力,只在 daemon 真的按契约上报时才有键。
+          const snapCaps: Record<string, string> = {};
           if (r.config_snapshot) {
             try {
               const parsed = typeof r.config_snapshot === "string" ? JSON.parse(r.config_snapshot) : r.config_snapshot;
@@ -6789,14 +7100,28 @@ return Bun.serve({
               }
               // #622 —— 逐 runtime 就绪度;旧 daemon 不报 ⇒ undefined ⇒ 响应里没有这个键。
               snapReadiness = sanitizeRuntimeReadiness(caps?.runtime_readiness);
+              // #4495 —— 这五条以前**只存在 nodes.config_snapshot 里,没有任何 REST 出口**:
+              // 客户端想知道「这台 daemon 能不能列已有项目 / 复用已有 Session」只能靠猜
+              // (app 里 NodeSourcePalette 干脆写死 hasProjectCreateCapability: true)。
+              // 现在按精确能力值投影出来;没报 / 报的值不认识 ⇒ 键不出现(与 can_create_nodes 同一套兼容口径)。
+              for (const [key, want] of [
+                ["source_directory_read", SOURCE_DIRECTORY_CAPABILITY],
+                ["project_new_session", PROJECT_CREATE_CAPABILITY],
+                ["session_attach", SESSION_ATTACH_CAPABILITY],
+                ["source_fork_transport", SOURCE_FORK_CAPABILITY],
+                ["source_node_delivery", SOURCE_DELIVERY_CAPABILITY],
+              ] as const) {
+                const v = (caps as Record<string, unknown> | undefined)?.[key];
+                if (typeof v === "string" && v === want) snapCaps[key] = v;
+              }
             } catch { /* malformed */ }
           }
           return { row: r, role: snapRole, canCreate: snapCanCreate, blockedReason: snapBlockedReason,
             observedMsAgo: snapObservedMsAgo, readiness: snapReadiness, adoptCapable: snapAdoptCapable,
-            adoptionDiscovery: snapAdoptionDiscovery };
+            adoptionDiscovery: snapAdoptionDiscovery, caps: snapCaps };
         })
         .filter(({ role }) => role === "host_supervisor")
-        .map(({ row: r, canCreate, blockedReason, observedMsAgo, readiness, adoptCapable, adoptionDiscovery }) => {
+        .map(({ row: r, canCreate, blockedReason, observedMsAgo, readiness, adoptCapable, adoptionDiscovery, caps }) => {
           let online = false;
           let lastSeenAt: string | null = null;
           if (r.session_last_seen) {
@@ -6835,6 +7160,8 @@ return Bun.serve({
             runtimes_supported: runtimes,
             allowed_secret_keys: secrets,
             host_telemetry: telemetry,
+            // #4495 —— 没上报就不出现这些键（与 can_create_nodes 的「不是 false,是 undefined」同一口径）。
+            ...caps,
           };
           // #973 — only when the daemon actually reported one (see the SQL comment).
           const reportedVersion = (r as unknown as { reported_version?: string | null }).reported_version;
@@ -6909,8 +7236,8 @@ return Bun.serve({
                         config_path, channels, server, hostname,
                         network_id, created_at, updated_at,
                         config_snapshot, lifecycle_state, avatar_url,
-                        display_name, team, tags, attrs_revision, permission_mode, owner_user_id,
-                        department_id, peer_allowlist, tool_allowlist, rest_allowlist
+                        display_name, team, tags, description, attrs_revision, permission_mode, owner_user_id,
+                        department_id, peer_allowlist, tool_allowlist, rest_allowlist, inbox_allowlist
                  FROM nodes WHERE 1=1`;
       const params: any[] = [];
       sql = addAgentNetworkScope(sql, params, restScope, { alias: "alias", nodeId: "node_id" });
@@ -7056,22 +7383,68 @@ return Bun.serve({
         return role === "owner" || role === "admin";
       };
       const management = lifecycleUser ? lifecycleProjections(restScope) : null;
+      // #5125 —— 逐行判定「这个人能不能看这台节点的工作目录」。
+      // 口径比 canUserManageNode 更严：那一层是「不额外拦没有授权的人」，这里必须**默认拒绝**——
+      //   owner/admin ⇒ 可见；有 network 级 manage_nodes 授权 ⇒ 可见；
+      //   有部门授权 ⇒ 仅本人管辖子树（含子部门）可见；
+      //   其余（含普通成员、节点令牌）⇒ forbidden。
+      // 角色/范围按网络缓存一次（列表可能上千行）。
+      const workdirRoleCache = new Map<string, string | null>();
+      const workdirScopeCache = new Map<string, { kind: "global" } | { kind: "departments"; deptIds: Set<string> }>();
+      const workdirLedCache = new Map<string, Set<string>>();
+      const canViewWorkdirFor = (networkId: string | null, departmentId: string | null): boolean => {
+        if (!restAuth?.userId || restAuth.networkId) return false;
+        const netId = networkId;
+        if (!netId) return false;
+        if (isAdmin) return true;
+        if (!workdirRoleCache.has(netId)) workdirRoleCache.set(netId, getUserNetworkRole(restAuth.userId, netId));
+        const role = workdirRoleCache.get(netId);
+        if (role === "owner" || role === "admin") return true;
+        if (!workdirScopeCache.has(netId)) workdirScopeCache.set(netId, userManageScope(netId, restAuth.userId));
+        const scope = workdirScopeCache.get(netId)!;
+        if (scope.kind === "global") return true;
+        // 允许集合 = 被授的部门子树 ∪ 本人**负责**的部门子树（部门负责人的管辖不写在 user_grants 里）
+        if (!workdirLedCache.has(netId)) workdirLedCache.set(netId, new Set(managedDepartmentIds(netId, restAuth.userId)));
+        const allowed = new Set<string>([...scope.deptIds, ...workdirLedCache.get(netId)!]);
+        if (allowed.size === 0) return false;                // 既没有授权也不负责任何部门 ⇒ 不可见
+        if (!departmentId) return false;                     // 无部门节点只归 owner/admin
+        return allowed.has(departmentId);
+      };
       const rows = rawRows.map(r => {
         let role: string | null = null;
+        const canViewWorkdir = (row: Record<string, any>) => canViewWorkdirFor(row.network_id ?? null, row.department_id ?? null);
+        // config_snapshot 解析结果（#5125 的 workdir 也从这里读；解析失败 = 没上报）
+        let parsedSnapshot: any = null;
         // #2293（admin 2026-10-25）—— 节点自报的 OpenCode V2 模型 id 清单（`provider/model` 字符串数组）。
         // 客户端在**没有 daemon 绑定**时用它当建议列表。读法同 role：快照可能是文本或对象；
         // 解析失败/形状不对 = 这一格没有（null），不影响整行。
         let opencodeCatalog: string[] | null = null;
         // null = daemon 没报采集时刻（不是「很久以前」，也不是「刚刚」）
         let opencodeCatalogSeenAt: string | null = null;
+        let opencodeCatalogVariants: string[] | null = null;
         let opencodeGeneration: "v1" | "v2" | null = null;
         let opencodeMode: string | null = null;
         let opencodeServer: string | null = null;
+        // 2026-11-10 —— 起这台节点的 anet CLI 版本。**声明在 `if (snap)` 外面**：
+        // 下面的投影对每一行都会求值，块内 `let` 会让部署后的 /api/nodes 直接抛
+        // "launchedByCliVersion is not defined"（#4150-Build 的 opencodeAgents 踩过同一次）。
+        // null = 节点没报（老节点 / 不是 CLI 起的，如 daemon adopt 出来的子节点）。
+        let launchedByCliVersion: string | null = null;
         const snap = r.config_snapshot;
+        // #4150-Build — declared outside the `if (snap)` block: the projection below is
+        // evaluated for every row, and a block-scoped `let` here made /api/nodes throw
+        // "opencodeAgents is not defined" on the deployed hub.
+        let opencodeAgents: string[] | null = null;
+        let opencodeAgentsSeenAt: string | null = null;
+        let opencodeAgentCurrent: string | null = null;
+        // 与 GET /api/nodes/:id/config 保持同一口径：列表里也要能读到「能不能切 agent」，
+        // 否则两个端点对同一台节点会给出不一致的能力结论。
+        let opencodeAgentConfigCapable = false;
         if (snap) {
           let parsed: any = null;
           try { parsed = typeof snap === "string" ? JSON.parse(snap) : snap; }
           catch { parsed = null; }
+          parsedSnapshot = parsed;
           role = parsed?.role ?? null;
           const raw = parsed?.opencode_catalog;
           if (Array.isArray(raw) && raw.every((m: unknown) => typeof m === "string" && m.length <= 400)) {
@@ -7083,38 +7456,110 @@ return Bun.serve({
             const seen = parsed?.opencode_catalog_seen_at;
             opencodeCatalogSeenAt =
               typeof seen === "string" && seen.length > 0 && seen.length <= 40 ? seen : null;
+            // admin 2026-11-11 —— 每个模型的思考档位（`provider/model=a,b,c`），只做投影。
+            const rawVariants = parsed?.opencode_catalog_variants;
+            if (Array.isArray(rawVariants) && rawVariants.every((v: unknown) => typeof v === "string" && v.length <= 600)) {
+              opencodeCatalogVariants = rawVariants.slice(0, 400);
+            }
           }
           // #2293 —— 客户端「Runtime · V2」和「OpenCode Server」两行要的正是快照里这三格标量。
           // PR #1092 之前从 `node.config_snapshot` 读，但这个端点**刻意不带整个快照**
           // （见上方 #312 注释）⇒ 真机上两行是空的/整行不出现。这里只放三个标量出来，
           // 仍不暴露 flags 里的其它内容，更不暴露任何凭据。
+          // #4150-Build — agents this node's server exposes; [] means none configured.
+          const rawAgents = parsed?.opencode_agents;
+          if (Array.isArray(rawAgents) && rawAgents.every((a: unknown) => typeof a === "string" && a.length <= 200)) {
+            opencodeAgents = rawAgents.slice(0, 200);
+            const seenAgents = parsed?.opencode_agents_seen_at;
+            opencodeAgentsSeenAt = typeof seenAgents === "string" && seenAgents.length > 0 && seenAgents.length <= 40 ? seenAgents : null;
+          }
+          const rawAgentCurrent = parsed?.opencode_agent_current;
+          if (typeof rawAgentCurrent === "string" && rawAgentCurrent.length > 0 && rawAgentCurrent.length <= 200) {
+            opencodeAgentCurrent = rawAgentCurrent;
+          }
+          opencodeAgentConfigCapable = parsed?.opencode_agent_config_capable === true;
           const flags = parsed?.flags;
           if (flags?.opencodeGeneration === "v1" || flags?.opencodeGeneration === "v2") opencodeGeneration = flags.opencodeGeneration;
           if (typeof flags?.opencodeMode === "string" && flags.opencodeMode.length <= 32) opencodeMode = flags.opencodeMode;
           if (typeof parsed?.opencode_server === "string" && parsed.opencode_server.length <= 200) opencodeServer = parsed.opencode_server;
+          // 2026-11-10 —— 只做投影：节点报了就给出来，没报就是 null（两种成因见上面的注释）。
+          // 形状再校验一遍：schema 那层已经限了 64 字符，但库里的历史行不受 schema 管。
+          const rawLaunchedBy = parsed?.launched_by_cli_version;
+          if (typeof rawLaunchedBy === "string" && rawLaunchedBy.length > 0 && rawLaunchedBy.length <= 64) {
+            launchedByCliVersion = rawLaunchedBy;
+          }
         }
         // #2969 —— 两张白名单原来**只能写不能读**（PUT 有了，GET 里没有），
         // 客户端因此做不出「当前设置」这一屏。这里把原始列解构出来，下面换成解析后的数组。
-        const { config_snapshot, owner_user_id, peer_allowlist, tool_allowlist, rest_allowlist, ...rest } = r;
+        const { config_snapshot, owner_user_id, peer_allowlist, tool_allowlist, rest_allowlist, inbox_allowlist, ...rest } = r;
         // `tags` is stored as JSON text; hand the dashboard a real array so
         // it can map() without a guard, and normalise legacy/absent values
         // to [] rather than null. attrs_revision is normalised to a number
         // so pre-migration rows (NULL) read as 0.
+        // #4976 —— 目录的**显式四态**。此前只有 `opencode_catalog: null` 一个信号，
+        // 客户端无法区分「还在采集」和「这台节点永远不会有」，于是永久停在「正在读取…」。
+        //   reported           有目录（非空）
+        //   reported_empty     报了但是空数组（真·没有可用模型）
+        //   not_reported       OpenCode 运行时但没报目录（采集失败/未采集 —— 可重试）
+        //   unsupported_runtime  不是 OpenCode 运行时（codex / grok …）—— 不可能有目录，不该重试
+        const nodeRuntime = String((r as any).runtime ?? "");
+        const opencodeCatalogState: "reported" | "reported_empty" | "not_reported" | "unsupported_runtime" =
+          Array.isArray(opencodeCatalog)
+            ? (opencodeCatalog.length > 0 ? "reported" : "reported_empty")
+            // 判「是不是 OpenCode 运行时」要宽进严出：
+            //   · runtime 为空（老行 / 刚注册 / 长期离线）⇒ **不能判死**，落到 not_reported（可重试）；
+            //   · runtime 是 opencode*，或报了代际 / opencode_server ⇒ not_reported；
+            //   · 只有 runtime 非空且明确不是 opencode*（codex-cli / grok …）才 unsupported_runtime。
+            // 判死的代价是客户端永远不给重试入口 —— 它其实可能是 OpenCode 节点，只是还没自报。
+            : (nodeRuntime === "" || /^opencode/.test(nodeRuntime) || opencodeGeneration !== null || opencodeServer !== null)
+              ? "not_reported"
+              : "unsupported_runtime";
         // app#196 —— 显式告诉前端这个节点能不能走生命周期操作,以及该找哪个 daemon。
         // daemon 自己(role=host_supervisor)也能被 restart/stop,它的 id 同样是 node_ 前缀
         // 且在 node_create_requests 里没有记录,所以单独放行。
         const lifecycle_controllable = isLifecycleControllable(r.node_id, role, controllable);
         return {
           ...rest,
+          // #5125 —— fork 向导要显示「与源节点共用目录」。权限按 fork 那套逐行判定（不是整表一刀切）：
+          // owner/admin 任意节点；部门负责人仅本管辖部门（含子部门）；其余（含节点令牌）一律 forbidden。
+          ...workdirProjection(canViewWorkdir(r), readReportedWorkdir(parsedSnapshot)),
+          // #5321 —— agy 模型清单 / 登录状态（只读投影；只对 antigravity 节点有意义，其它 runtime 为 null）
+          agy_models: Array.isArray(parsedSnapshot?.agy_models)
+            ? parsedSnapshot.agy_models.filter((m: unknown) => typeof m === "string" && m.length > 0 && m.length <= 200).slice(0, 200)
+            : null,
+          agy_login_state: parsedSnapshot?.agy_login_state === "logged_in" || parsedSnapshot?.agy_login_state === "needs_login"
+            ? parsedSnapshot.agy_login_state
+            : (parsedSnapshot?.agy_login_state === "unknown" ? "unknown" : null),
+          // 「CLI 在等一个选项」：与 workdir **同一套权限**。
+          // 2026-11-22 review：codex_trust / claude_trust 的真实文本常带目录路径
+          //（"Do you trust the files in this folder? <path>"），而 excerpt 只做 token 脱敏、
+          // 不认路径 ⇒ 不裁剪就等于把 workdir 要保护的那类信息从另一条路漏出去。
+          // 先按最严口径收（views 不够 ⇒ null），等真机确认提示文本确实不含路径再考虑放开。
+          prompt_pending: (() => {
+            if (!canViewWorkdir(r)) return null;
+            const ip = parsedSnapshot?.interactive_prompt;
+            if (!ip || typeof ip !== "object") return null;
+            const kind = typeof ip.kind === "string" ? ip.kind : null;
+            const detectedAt = typeof ip.detected_at === "string" ? ip.detected_at : null;
+            if (!kind || !detectedAt) return null;
+            return { kind, excerpt: typeof ip.excerpt === "string" ? ip.excerpt : null, detected_at: detectedAt };
+          })(),
           tags: parseStoredTags(r.tags),
           attrs_revision: Number(r.attrs_revision ?? 0),
           role,
           opencode_catalog: opencodeCatalog,
+          opencode_catalog_state: opencodeCatalogState,
+          opencode_agents: opencodeAgents,
+          opencode_agent_current: opencodeAgentCurrent,
+          opencode_agent_config_capable: opencodeAgentConfigCapable,
+          opencode_agents_seen_at: opencodeAgentsSeenAt,
           // 见上：null 表示 daemon 未上报；非 null 是它自己给的采集时刻
           opencode_catalog_seen_at: opencodeCatalogSeenAt,
+          opencode_catalog_variants: opencodeCatalogVariants,
           opencode_generation: opencodeGeneration,
           opencode_mode: opencodeMode,
           opencode_server: opencodeServer,
+          launched_by_cli_version: launchedByCliVersion,
           lifecycle_controllable,
           lifecycle_daemon_node_id: controllable.get(r.node_id) ?? null,
           ...(management ? (management.get(r.node_id) ?? { managed: "none", adoption: null }) : {}),
@@ -7124,6 +7569,8 @@ return Bun.serve({
           tool_allowlist: normalizeToolAllowlist(tool_allowlist),
           // #2969 续 —— REST 写接口白名单（形如 "POST /api/task"）。null = 不限制。
           rest_allowlist: normalizePeerAllowlist(rest_allowlist),
+          // 收件白名单（谁能给这个节点派活 / 发消息）。null = 谁都能发。
+          inbox_allowlist: normalizePeerAllowlist(inbox_allowlist),
           // #1510 —— 管理员要能看出「谁的 transport 未知」才敢打开 strict。
           // 这一格**只读**，不参与任何判定（判定在 env-transport-policy.ts）。
           env_transport: envTransportOf(r.node_id, r.alias, r.network_id),
@@ -7134,7 +7581,27 @@ return Bun.serve({
           restart_readiness: restartReadiness(r.node_id, r.alias, r.network_id, role, r.lifecycle_state ?? null),
         };
       });
-      return withCors(req, Response.json({ ok: true, nodes: rows, count: rows.length }));
+      // #3665 —— 部门范围管理：被授予「只管某部门」的人，列表里只看得到范围内节点。
+      // 口径：无授权/global ⇒ 原样返回；有 department 授权 ⇒ 按节点 department_id 过滤（含子部门，
+      // 无部门节点不可见——只归 global，拍板口径，见 canUserManageNode）。
+      // 注意：owner/admin 走 manageScopeFrom 的 global 分支，不受影响。
+      //
+      // 2026-11-21 负责人 修：原来判「是不是人的请求」用的是 restAuth.networkId——但人类令牌
+      // （utok_）**恒为 null**（只有节点令牌/network token 才绑网络，见 resolveRestNetworkScope
+      // 「Network tokens are forcibly scoped to their bound network」），这个判据一直是死码，
+      // 部门范围从未真正收窄过列表。改成从 restScope 取单一网络 id；取不到（跨网络 token）就不收窄，
+      // 不是「收窄」的覆盖范围，不强判。
+      const scopedRows = (() => {
+        if (!restAuth?.userId) return rows;
+        const netIdForScope = singleNetworkId(restScope);
+        if (!netIdForScope) return rows;
+        const role = getUserNetworkRole(restAuth.userId, netIdForScope);
+        if (role === "owner" || role === "admin") return rows;
+        const scope = userManageScope(netIdForScope, restAuth.userId);
+        if (scope.kind === "global" || scope.deptIds.size === 0) return rows;   // 没有任何管理授权 ⇒ 保持既有可见性（本 PR 只管「收窄」）
+        return rows.filter((r: any) => canUserManageNode(scope, r.department_id ?? null));
+      })();
+      return withCors(req, Response.json({ ok: true, nodes: scopedRows, count: scopedRows.length }));
     }
 
     // ── REST: single task lookup (V2) ──
@@ -7210,6 +7677,191 @@ return Bun.serve({
     }
 
     // ── REST: tasks table (V2) ──
+    // 机器别名（admin 2026-11-21）：按 hostname 聚合，同一台机器的多个节点共享一个别名。
+    const machineAliasMatch = url.pathname.match(/^\/api\/machines\/([^/]+)$/);
+    if (machineAliasMatch) {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth_required" }, { status: 401 }));
+      const host = decodeURIComponent(machineAliasMatch[1] ?? "");
+      if (!host) return withCors(req, Response.json({ ok: false, error: "hostname_required" }, { status: 400 }));
+      if (req.method === "GET") {
+        const row = getMachineAlias(host);
+        return withCors(req, Response.json({
+          ok: true, hostname: host, alias: row?.alias ?? null, updated_at: row?.updated_at ?? null,
+          nodes_on_host: countNodesOnHost(host),
+        }));
+      }
+      if (req.method === "PUT") {
+        // 只允许人改机器名：节点令牌改名等于允许 agent 伪装机器身份。
+        if (!isHumanToken(restAuth.tokenId)) return userTokenRequired(req);
+        let body: any;
+        try { body = await req.json(); } catch { return withCors(req, Response.json({ ok: false, error: "invalid JSON" }, { status: 400 })); }
+        const alias = normalizeMachineAlias(body?.alias);
+        if (!alias) return withCors(req, Response.json({ ok: false, error: "invalid_machine_alias", max: MACHINE_ALIAS_MAX }, { status: 400 }));
+        const row = setMachineAlias(host, alias, restAuth.username ?? null);
+        return withCors(req, Response.json({ ok: true, hostname: row.hostname, alias: row.alias, updated_at: row.updated_at, nodes_on_host: countNodesOnHost(host) }));
+      }
+      return withCors(req, Response.json({ ok: false, error: "method_not_allowed" }, { status: 405 }));
+    }
+
+    // #4987 —— 收件箱可见入口（只读，只读自己的）。
+    // 背景：Hub 一直能算 inbox_pending=N，但没有任何接口能列出那 N 条；
+    // 运维/用户只能看到计数，无法自证「对方到底发了什么」。
+    // 鉴权与 get_inbox / ack_inbox 用同一个 resolveInboxCaller ⇒ 只能读自己的，
+    // 读别人一律 { ok:false, error:"inbox_identity_mismatch" }（显式拒绝，不是空数组）。
+    if (url.pathname === "/api/inbox" && req.method === "GET") {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth_required" }, { status: 401 }));
+      const requestedAlias = (url.searchParams.get("alias") || "").trim();
+      if (!requestedAlias) return withCors(req, Response.json({ ok: false, error: "alias_required" }, { status: 400 }));
+      const recipient = resolveInboxCaller(requestedAlias, {
+        tokenId: restAuth.tokenId, userId: restAuth.userId ?? null, networkId: restAuth.networkId ?? null,
+        // 🔴 必须用 nodeIdentity 判「是不是节点令牌」：节点令牌同时带 userId（代表其主人），
+        //    用 `!!networkId && !userId` 判会把节点令牌误当成用户令牌 ⇒ owner 角色可读任意 alias（实测踩到）。
+        nodeToken: !!nodeIdentity(restAuth.tokenId, restAuth.networkId), identityRejected: false,
+      });
+      if (!recipient.ok) return withCors(req, Response.json(recipient, { status: 403 }));
+      // #4987 review：跨网络的 owner 令牌必须 403 —— 目标 alias 必须在**调用方自己的网络**里存在。
+      // 否则同名 alias 会把别的网络的收件箱露出来。
+      const inNet = restAuth.networkId && recipient.delegated
+        ? !!db.get<{ node_id: string }>(
+            "SELECT node_id FROM nodes WHERE alias = ?1 AND network_id = ?2 LIMIT 1",
+            recipient.alias, restAuth.networkId,
+          )
+        : true;
+      if (inboxCrossNetworkRejected({ callerNetworkId: restAuth.networkId ?? null, delegated: recipient.delegated, inNetwork: inNet })) {
+        return withCors(req, Response.json({ ok: false, error: "inbox_identity_mismatch" }, { status: 403 }));
+      }
+      const limit = Math.min(Number(url.searchParams.get("limit")) || 50, 200);
+      // preview 口径（与 #4987 判据一致）：按码点截断 ≤200，超长追加单个「…」，换行折叠成空格。
+      // 代读（scope=delegated）时不带出 network_id IS NULL 的旧行，见 inboxNetworkFilter。
+      const netFilter = inboxNetworkFilter(recipient.delegated);
+      const rows = db.all<{ id: string; from_session: string | null; created_at: string; content: string | null; acked: number | null; task_id: string | null }>(
+        `SELECT id, from_session, created_at, content, acked, task_id FROM inbox
+         WHERE session_name = ?1 AND acked = 0 AND ${netFilter}
+         ORDER BY created_at DESC, id DESC LIMIT ?3`,
+        recipient.alias, restAuth.networkId ?? null, limit,
+      );
+      // #4987 复核修正：pending 必须是「未读总数」，不受 limit 影响；返回的条数单列 returned。
+      const total = db.get<{ cnt: number }>(
+        `SELECT COUNT(*) AS cnt FROM inbox WHERE session_name = ?1 AND acked = 0 AND ${netFilter}`,
+        recipient.alias, restAuth.networkId ?? null,
+      )?.cnt ?? 0;
+      // #4987 review：at 输出 ISO-8601 UTC（SQLite 存的是 'YYYY-MM-DD HH:MM:SS'，补 T 与 Z）；
+      // pending 已在上面用单独 COUNT 算成「总积压」，不受 limit 影响。
+      const isoUtc = inboxAtIsoUtc;
+      const preview = (text: string | null): string => {
+        const flat = (text ?? "").replace(/\s+/g, " ").trim();
+        const cps = Array.from(flat);
+        return cps.length > 200 ? cps.slice(0, 200).join("") + "…" : flat;
+      };
+      return withCors(req, Response.json({
+        ok: true,
+        alias: recipient.alias,
+        pending: total,
+        returned: rows.length,
+        // 代读标记：由 resolveInboxCaller 判定后透传（不要在这里用 alias 比较——规范化后恒等，会恒为 self）。
+        scope: inboxScope(recipient.delegated),
+        messages: rows.map((r) => ({
+          id: r.id, from: r.from_session ?? "", at: isoUtc(r.created_at), preview: preview(r.content),
+          acked: r.acked === 1, is_task: r.task_id !== null,
+        })),
+      }));
+    }
+
+    // #4825 —— 某节点 OpenCode Server 上的会话列表（REST，不是 MCP 工具）。
+    // 为什么走 REST：用这个列表的是 App 向导（本来就只读 /api/nodes、/api/inbox），
+    // 做成 MCP 工具会占 tools/list 的按角色字节预算（#476 天花板）；
+    // 也刻意不合并进 get_opencode_catalog —— 会话列表权限比目录更严，
+    // 同一工具里按 action 分派不同权限正是 #3639 那类 bug 的温床。
+    const opencodeSessionsMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/opencode-sessions$/);
+    if (opencodeSessionsMatch && req.method === "GET") {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth_required" }, { status: 401 }));
+      const targetNodeId = decodeURIComponent(opencodeSessionsMatch[1] ?? "");
+      const scopedParams: any[] = [targetNodeId];
+      let scopedSql = "SELECT node_id, alias, network_id, runtime, department_id, config_snapshot FROM nodes WHERE node_id = ?1";
+      scopedSql = addNetworkScope(scopedSql, scopedParams, restScope);
+      scopedSql += " LIMIT 1";
+      const target = db.get<any>(scopedSql, ...scopedParams);
+      if (!target) {
+        return withCors(req, Response.json({ ok: false, error: "node_not_found", node_id: targetNodeId }, { status: 404 }));
+      }
+      // 🔴 节点令牌一律 403：节点令牌同样带着主人的 userId（#3639 踩过），
+      // 不识别它就会拿到主人角色，任何 agent 都能列同网络任意节点的会话。
+      // 这个接口是给**人**用的向导，agent 不需要。
+      // 默认拒绝（负责人 2026-11-19 review）：共用 isHumanToken —— 真节点令牌、身份不明的
+      // 节点令牌（绑定缺失/歧义/别的网络）、以及 name 以 node: 开头的失效绑定，全都不放行。
+      if (!isHumanToken(restAuth.tokenId)) {
+        return withCors(req, Response.json({ ok: false, error: "node_token_forbidden", message: "this endpoint is for humans (app wizard), not nodes" }, { status: 403 }));
+      }
+      // 权限只走这一个判定函数（会话标题与目录本身就是敏感信息）。
+      const viewerRole = restAuth.userId && target.network_id ? getUserNetworkRole(restAuth.userId, target.network_id) : null;
+      const managesTarget = !!(restAuth.userId && target.network_id && target.department_id)
+        && managedDepartmentIds(target.network_id, restAuth.userId).includes(target.department_id);
+      const verdict = canListOpencodeSessions({
+        role: viewerRole ?? null,
+        targetDepartmentId: target.department_id ?? null,
+        managesTargetDepartment: managesTarget,
+      });
+      if (!verdict.ok) return withCors(req, Response.json(verdict, { status: 403 }));
+
+      // 失败码三件套（负责人 2026-11-19 定字面量）
+      // 与 #3641 同一口径（共用 opencode-runtime.ts，不写第二份）：
+      // runtime 为空、或报了代际 / opencode_server 都不能判死。
+      const snapForRuntime: any = (() => {
+        try { return target.config_snapshot ? JSON.parse(target.config_snapshot) : {}; } catch { return {}; }
+      })();
+      const gen = snapForRuntime?.flags?.opencodeGeneration === "v1" || snapForRuntime?.flags?.opencodeGeneration === "v2"
+        ? snapForRuntime.flags.opencodeGeneration : null;
+      const serverUrl = typeof snapForRuntime?.opencode_server === "string" ? snapForRuntime.opencode_server : null;
+      if (!runtimeIsOpencode({ runtime: target.runtime, generation: gen, opencodeServer: serverUrl })) {
+        return withCors(req, Response.json({ ok: false, error: "unsupported_runtime", runtime: target.runtime ?? null }, { status: 409 }));
+      }
+      // #4821 —— 代读已接（请求通道）：Hub 写一条请求行，daemon 拉走、读本地 OpenCode V2、回填原始页，
+      // Hub 统一投影。权限判定仍只走上面 #4825 那套（人 + canListOpencodeSessions + runtime 检查），
+      // 两套实现合并成一条路由：删掉重复注册，避免再有人改错块（2026-11-22）。
+      const cursor = url.searchParams.get("cursor") || null;
+      const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+      const limitN = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 50;
+      const fresh = findFreshResult(db, target.network_id, target.node_id, cursor);
+      if (fresh?.result_json) {
+        let parsed: any = null;
+        try { parsed = JSON.parse(fresh.result_json); } catch { parsed = null; }
+        if (parsed) {
+          return withCors(req, Response.json({
+            ok: true, cached: true, data: parsed.data ?? [], next_cursor: parsed.cursor?.next ?? null,
+            request_id: fresh.request_id, node_id: target.node_id,
+          }));
+        }
+      }
+      const open = findOpenRequest(db, target.network_id, target.node_id, cursor)
+        ?? createSessionRequest(db, { networkId: target.network_id, nodeId: target.node_id, cursor, limit: limitN, createdBy: restAuth.userId ?? null });
+      return withCors(req, Response.json({
+        ok: true, pending: true, request_id: open.request_id,
+        poll: `/api/session-requests/${open.request_id}`, node_id: target.node_id,
+      }));
+    }
+
+    // #4821 —— 轮询会话列表请求的结果（与上面的路由配对；权限仍是 #4825 那套判定的产物：
+    // 只有创建者本人或 owner/admin 能看，其它一律 404 假装不存在）。
+    const sessionReqMatch = url.pathname.match(/^\/api\/session-requests\/([^/]+)$/);
+    if (sessionReqMatch && req.method === "GET") {
+      if (!restAuth) return withCors(req, Response.json({ ok: false, error: "auth required" }, { status: 401 }));
+      if (restAuth.networkId) return userTokenRequired(req);
+      const row = getSessionRequest(db, decodeURIComponent(sessionReqMatch[1]));
+      if (!row) return withCors(req, Response.json({ ok: false, error: "request_not_found" }, { status: 404 }));
+      const role = getUserNetworkRole(restAuth.userId ?? "", row.network_id);
+      const isOwner = !!row.created_by && row.created_by === restAuth.userId;
+      if (!isOwner && !(role === "owner" || role === "admin" || isAdmin)) {
+        return withCors(req, Response.json({ ok: false, error: "request_not_found" }, { status: 404 }));
+      }
+      if (row.status === "succeeded" && row.result_json) {
+        let parsed: any = null;
+        try { parsed = JSON.parse(row.result_json); } catch { parsed = null; }
+        return withCors(req, Response.json({ ok: true, status: row.status, data: parsed?.data ?? [], next_cursor: parsed?.cursor?.next ?? null }));
+      }
+      if (row.status === "failed") return withCors(req, Response.json({ ok: false, status: row.status, error: row.error ?? "failed" }, { status: 502 }));
+      return withCors(req, Response.json({ ok: true, status: row.status, pending: true }));
+    }
+
     if (url.pathname === "/api/tasks") {
       const taskId = url.searchParams.get("task_id");
       const status = url.searchParams.get("status");
@@ -7470,6 +8122,25 @@ export function startHub(opts?: { port?: number; hostname?: string }): ReturnTyp
     }
   };
   setImmediate(sweepEmptyNodes);
+
+  // B 止血（负责人 2026-11-20）：acked 但窗口内没有任何回复 ⇒ 回退未读并留痕。
+  // 口径 ①：以「该 alias 在窗口内是否产生过回复」为投递证据，纯 Hub 侧可算。
+  const ACKED_UNCONFIRMED_WINDOW_MS = 10 * 60 * 1000;
+  const ackedSweep = () => {
+    try {
+      for (const r of sweepUnconfirmed(Date.now(), ACKED_UNCONFIRMED_WINDOW_MS)) {
+        const params: any[] = [r.messageId];
+        let sql = "UPDATE inbox SET acked = 0 WHERE id = ?1 AND acked = 1";
+        sql = addNetworkScope(sql, params, r.networkId ? { kind: "network", networkId: r.networkId } as any : null as any);
+        try { db.run(sql, ...params); } catch { db.run("UPDATE inbox SET acked = 0 WHERE id = ?1 AND acked = 1", r.messageId); }
+        console.log(`[commhub acked-unconfirmed] ${r.alias}: ${r.messageId.slice(0, 8)} 签收后 ${Math.round((Date.now() - r.ackedAtMs) / 60000)} 分钟无回复 ⇒ 已回退未读`);
+        try { pushEvent(r.alias, { type: "acked_unconfirmed", message_id: r.messageId, waited_ms: Date.now() - r.ackedAtMs }, r.networkId); } catch {}
+      }
+    } catch (e: any) {
+      console.log(`[commhub acked-unconfirmed] sweep failed: ${e?.message ?? e}`);
+    }
+  };
+  const ackedSweepTimer = setInterval(ackedSweep, 60 * 1000);
   const emptyNodeGcTimer = setInterval(sweepEmptyNodes, 24 * 60 * 60 * 1000);
 
   // #2614 —— 事件循环停顿监测。放这里是因为 startHub() 才是“真的在跑一个 Hub”
@@ -7718,6 +8389,3 @@ export function hostDiskState(): { path: string; total_gb: number; used_gb: numb
     return null;
   }
 }
-
-
-

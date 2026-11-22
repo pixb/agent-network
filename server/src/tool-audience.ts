@@ -38,13 +38,15 @@ export const TOOL_AUDIENCE: Readonly<Record<string, ToolAudience>> = {
   get_rules_file_request: "protocol", ack_rules_file_request: "protocol",
   list_my_pending_create_requests: "protocol", list_my_pending_lifecycle_requests: "protocol", list_my_children: "protocol",
   get_create_request: "protocol", ack_create_request: "protocol",
+  // #4821 —— 只读会话列表请求通道（daemon 拉/ack），与 create 通道同一受众
+  pull_session_requests: "protocol", ack_session_request: "protocol",
   get_stop_request: "protocol", ack_stop_request: "protocol",
   get_start_request: "protocol", ack_start_request: "protocol",
   get_probe_request: "protocol", ack_probe_request: "protocol",
   get_opencode_catalog_request: "protocol", ack_opencode_catalog: "protocol",
   // ── 人:节点令牌一律 user_token_required(项目管理)/ node_token_cannot_browse_files / node_token_cannot_read_logs ──
   projects_create: "user", projects_update: "user", requirement_tags: "both",
-  read_opencode_catalog: "user", get_opencode_catalog: "user",
+  read_opencode_catalog: "user", get_opencode_catalog: "user", select_opencode_session_model: "user",
   list_node_files: "user", read_node_file: "user", tail_node_logs: "user",
   // ── 两边都能调 ──
   submit_skill: "both", list_skills: "both", get_skill: "both", review_skill: "both",
@@ -57,6 +59,8 @@ export const TOOL_AUDIENCE: Readonly<Record<string, ToolAudience>> = {
   retry_task: "both", get_task: "both", list_tasks: "both", cancel_task: "both", reassign_task: "both",
   send_desktop_message: "both", broadcast: "both", get_completions: "both",
   update_node_config: "both", read_node_rules_file: "both", write_node_rules_file: "both",
+  // 2026-11-20 — agy 登录：只有人（用户令牌）能发起；节点按名直调 get/ack 走 protocol。
+  start_agy_login: "user", submit_agy_login_code: "user",
   list_node_skills: "both", read_node_skill: "both", get_rules_file_result: "both",
   restart_node: "both", list_host_supervisors: "both", create_node: "both", clone_node: "both", stop_node: "both", delete_node: "both", start_node: "both",
   upsert_network_secret: "both", list_network_secrets: "both", upsert_provider: "both", update_provider: "both",
